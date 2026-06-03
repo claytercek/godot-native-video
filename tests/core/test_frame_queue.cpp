@@ -53,6 +53,27 @@ TEST_CASE("FrameQueue pop on empty returns nullopt") {
 	CHECK_FALSE(v.has_value());
 }
 
+TEST_CASE("FrameQueue peek is non-destructive and sees the front") {
+	FrameQueue<int, 8> q;
+	CHECK(q.peek() == nullptr); // empty
+	CHECK(q.peek_next() == nullptr); // empty
+	REQUIRE(q.push(10));
+	REQUIRE(q.peek() != nullptr);
+	CHECK(*q.peek() == 10);
+	CHECK(q.peek_next() == nullptr); // only one item
+	REQUIRE(q.push(20));
+	CHECK(*q.peek() == 10);
+	REQUIRE(q.peek_next() != nullptr);
+	CHECK(*q.peek_next() == 20);
+	// Peeking did not consume anything.
+	CHECK(q.size_approx() == 2);
+	auto v = q.pop();
+	REQUIRE(v.has_value());
+	CHECK(*v == 10);
+	CHECK(*q.peek() == 20);
+	CHECK(q.peek_next() == nullptr);
+}
+
 TEST_CASE("FrameQueue push returns false when full") {
 	FrameQueue<int, 4> q; // capacity == 3 usable slots
 	CHECK(q.push(1));

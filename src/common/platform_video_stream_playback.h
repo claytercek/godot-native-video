@@ -10,21 +10,28 @@
 // and presents it through the zero-copy PresentPipeline. _get_texture() returns
 // the engine-owned RGBA Texture2DRD.
 //
-// SCOPE (this slice, zr2): simple monotonic-clock linear playback. Audio output
-// and audio-master A/V sync, plus sophisticated drop-late / hold-early policy,
-// are the next slice (dte); the present-path boundary is kept clean so dte can
-// slot in without touching the GPU pipeline.
+// SCOPE (dte — this slice): linear playback + audio-master A/V sync. Audio is
+// drained into Godot via mix_audio(); the master clock is derived from the
+// audio samples Godot actually consumes (latency-compensated AudioMasterClock),
+// with a MonotonicClock delta fallback for silent clips. The present step runs
+// the Godot-free drop-late / hold-early present-selector.
+//
+// BOUNDARIES (out of scope here): adaptive keyframe/exact scrubbing is o3h; a
+// shared decode-worker pool is g1c. Decode still happens inline in _update.
 // -----------------------------------------------------------------------
 
-#include <godot_cpp/classes/video_stream_playback.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
+#include <godot_cpp/classes/video_stream_playback.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
 
 #include <memory>
 #include <optional>
 
+#include "../core/audio_ring.h"
 #include "../core/backend.h"
 #include "../core/clock.h"
 #include "../core/frame_queue.h"
+#include "../core/present_selector.h"
 #include "present_pipeline.h"
 
 namespace avf {
@@ -66,22 +73,46 @@ private:
 	// enough for linear playback; dte tunes pool depth alongside A/V sync.
 	static constexpr size_t kQueueCapacity = 8;
 
-	// Pull frames from the backend into the queue until full or EOS.
+	// Pull video frames from the backend into the queue until full or EOS.
 	void fill_queue();
+	// Pull decoded audio chunks from the backend into the audio ring until it is
+	// topped up or EOS. Cheap; called every _update before mixing.
+	void fill_audio();
+	// Drain decoded PCM from the ring into Godot's AudioServer via mix_audio(),
+	// and advance the audio-master clock by the frames Godot actually consumed.
+	void drive_audio();
 	// Release any frames still owned by the queue (e.g. on seek/stop).
 	void drain_queue();
+	// The current master clock (audio-master when audio present, else monotonic).
+	core::Clock *master() const;
 
 	std::unique_ptr<avf::AvfBackend> backend_;
 	std::unique_ptr<core::FrameQueue<core::VideoFrame, kQueueCapacity>> queue_;
-	std::unique_ptr<core::MonotonicClock> clock_;
+
+	// Master-clock implementations. Exactly one is "the master" per clip:
+	//  - audio_clock_ when the clip has an audio track (samples-consumed ÷ rate,
+	//    latency-compensated). Driven by drive_audio() from real consumption.
+	//  - mono_clock_  for silent clips (advanced by _update's render delta).
+	std::unique_ptr<core::AudioMasterClock> audio_clock_;
+	std::unique_ptr<core::MonotonicClock> mono_clock_;
+
+	// PCM staging between the backend's audio chunks and Godot's mix_audio().
+	std::unique_ptr<core::AudioRing> audio_ring_;
+	godot::PackedFloat32Array mix_buffer_; // reused mix scratch (no per-frame alloc)
+
 	platform_media::PresentPipeline present_;
 
 	bool loaded_ = false;
 	bool playing_ = false;
 	bool paused_ = false;
-	bool eos_ = false;
+	bool eos_ = false; // video end-of-stream
+	bool audio_eos_ = false; // audio end-of-stream
+	bool has_audio_ = false; // clip carries an audio track -> audio is master
 	double length_ = 0.0;
 	double position_ = 0.0; // PTS of the most recently presented frame
+
+	int channels_ = 0;
+	int sample_rate_ = 0;
 
 	int width_ = 0;
 	int height_ = 0;

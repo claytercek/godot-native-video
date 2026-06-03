@@ -53,6 +53,34 @@ public:
 		return true;
 	}
 
+	// Peek the front item without removing it (consumer side).
+	// Returns nullptr if the queue is empty. The pointer is valid until the next
+	// pop()/push() that touches this slot — read what you need, then pop(). Only
+	// safe to call from the single consumer thread.
+	T *peek() {
+		const size_t head = head_.load(std::memory_order_relaxed);
+		if (head == tail_.load(std::memory_order_acquire)) {
+			return nullptr; // empty
+		}
+		return &storage_[head];
+	}
+
+	// Peek the item one slot behind the front (the would-be "next" after a pop),
+	// without removing anything. Returns nullptr if fewer than two items exist.
+	// Consumer-thread only.
+	T *peek_next() {
+		const size_t head = head_.load(std::memory_order_relaxed);
+		const size_t tail = tail_.load(std::memory_order_acquire);
+		if (head == tail) {
+			return nullptr; // empty
+		}
+		const size_t second = (head + 1) & mask_;
+		if (second == tail) {
+			return nullptr; // exactly one item
+		}
+		return &storage_[second];
+	}
+
 	// Pop an item from the queue (consumer side).
 	// Returns std::nullopt if the queue is empty.
 	std::optional<T> pop() {
