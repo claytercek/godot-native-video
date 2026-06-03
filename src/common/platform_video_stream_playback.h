@@ -18,8 +18,17 @@
 // with a MonotonicClock delta fallback for silent clips. The present step runs
 // the Godot-free drop-late / hold-early present-selector.
 //
-// BOUNDARIES (out of scope here): adaptive keyframe/exact scrubbing is o3h; a
-// shared decode-worker pool is g1c. Decode still happens inline in _update.
+// SCOPE (g1c — this slice): decode is moved OFF the main thread onto a bounded
+// shared core::DecodeScheduler pool. Each playback registers its core::Backend
+// with the process-wide scheduler and receives a StreamHandle; a pool worker
+// fills that stream's decode-ahead queue while the main/render thread still does
+// the present + GPU pass via next_frame() + PresentPipeline. Many
+// VideoStreamPlayers share one bounded set of worker threads (no thread-per-
+// video). The present/clock/audio logic from dte is unchanged.
+//
+// BOUNDARIES (out of scope here): adaptive keyframe/exact scrubbing is o3h. The
+// scheduler exposes request_seek() as the clean seam the scrubbing slice will
+// use to request a keyframe decode without changing the threading model.
 // -----------------------------------------------------------------------
 
 #include <godot_cpp/classes/texture2d.hpp>
@@ -32,7 +41,7 @@
 #include "../core/audio_ring.h"
 #include "../core/backend.h"
 #include "../core/clock.h"
-#include "../core/frame_queue.h"
+#include "../core/decode_scheduler.h"
 #include "../core/present_selector.h"
 #include "present_pipeline.h"
 
@@ -67,25 +76,21 @@ protected:
 	static void _bind_methods();
 
 private:
-	// Decode-ahead capacity. Power of two for FrameQueue. A handful of frames is
-	// enough for linear playback; dte tunes pool depth alongside A/V sync.
-	static constexpr size_t kQueueCapacity = 8;
-
-	// Pull video frames from the backend into the queue until full or EOS.
-	void fill_queue();
 	// Pull decoded audio chunks from the backend into the audio ring until it is
 	// topped up or EOS. Cheap; called every _update before mixing.
 	void fill_audio();
 	// Drain decoded PCM from the ring into Godot's AudioServer via mix_audio(),
 	// and advance the audio-master clock by the frames Godot actually consumed.
 	void drive_audio();
-	// Release any frames still owned by the queue (e.g. on seek/stop).
-	void drain_queue();
 	// The current master clock (audio-master when audio present, else monotonic).
 	core::Clock *master() const;
 
-	std::unique_ptr<core::Backend> backend_;
-	std::unique_ptr<core::FrameQueue<core::VideoFrame, kQueueCapacity>> queue_;
+	// Handle to this playback's stream registered with the shared decode pool.
+	// The pool owns the Backend and decodes video ahead into the stream's queue;
+	// this object pulls frames via DecodeScheduler::next_frame() on the main
+	// thread. Audio is pumped on the main thread via with_backend() (serialized
+	// against the worker pool so the Backend has a single toucher at a time).
+	core::StreamHandle stream_;
 
 	// Master-clock implementations. Exactly one is "the master" per clip:
 	//  - audio_clock_ when the clip has an audio track (samples-consumed ÷ rate,
@@ -103,7 +108,8 @@ private:
 	bool loaded_ = false;
 	bool playing_ = false;
 	bool paused_ = false;
-	bool eos_ = false; // video end-of-stream
+	// Video end-of-stream is tracked by the shared scheduler (at_end()), so this
+	// object only tracks audio EOS for the end-of-playback condition.
 	bool audio_eos_ = false; // audio end-of-stream
 	bool has_audio_ = false; // clip carries an audio track -> audio is master
 	double length_ = 0.0;

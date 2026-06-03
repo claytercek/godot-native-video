@@ -11,6 +11,7 @@
 
 #include <algorithm>
 
+#include "../core/decode_scheduler.h"
 #include "backend_factory.h"
 
 using namespace godot;
@@ -18,11 +19,14 @@ using namespace godot;
 PlatformVideoStreamPlayback::PlatformVideoStreamPlayback() = default;
 
 PlatformVideoStreamPlayback::~PlatformVideoStreamPlayback() {
-	drain_queue();
-	present_.shutdown();
-	if (backend_) {
-		backend_->close();
+	// Unregister from the shared pool first: this blocks until any in-flight
+	// decode slice for our stream completes and releases every buffered surface,
+	// so no worker can touch our Backend after this returns (no use-after-free).
+	if (stream_) {
+		core::DecodeScheduler::instance().unregister_stream(stream_);
+		stream_.reset();
 	}
+	present_.shutdown();
 }
 
 void PlatformVideoStreamPlayback::_bind_methods() {
@@ -30,26 +34,28 @@ void PlatformVideoStreamPlayback::_bind_methods() {
 }
 
 bool PlatformVideoStreamPlayback::load(const String &path) {
-	backend_ = platform_media::make_backend();
+	std::unique_ptr<core::Backend> backend = platform_media::make_backend();
 
 	// Resolve a Godot res:// / user:// path to an absolute OS path the backend's
 	// AVURLAsset can open. globalize_path leaves absolute OS paths untouched.
 	String os_path = ProjectSettings::get_singleton()->globalize_path(path);
 	const std::string utf8 = os_path.utf8().get_data();
 
-	if (!backend_->open(utf8)) {
-		backend_.reset();
+	if (!backend->open(utf8)) {
 		return false;
 	}
 
-	length_ = backend_->duration_seconds();
-	width_ = backend_->video_width();
-	height_ = backend_->video_height();
-	channels_ = backend_->audio_channel_count();
-	sample_rate_ = backend_->audio_sample_rate();
+	length_ = backend->duration_seconds();
+	width_ = backend->video_width();
+	height_ = backend->video_height();
+	channels_ = backend->audio_channel_count();
+	sample_rate_ = backend->audio_sample_rate();
 	has_audio_ = channels_ > 0 && sample_rate_ > 0;
 
-	queue_ = std::make_unique<core::FrameQueue<core::VideoFrame, kQueueCapacity>>();
+	// Hand the Backend to the process-wide shared decode pool. From here a pool
+	// worker decodes video ahead into stream_'s queue; this object never touches
+	// the Backend directly except via the scheduler (next_frame / with_backend).
+	stream_ = core::DecodeScheduler::instance().register_stream(std::move(backend));
 
 	if (has_audio_) {
 		// Audio-master: derive media time from the samples Godot's AudioServer
@@ -72,7 +78,6 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 
 	loaded_ = true;
 	position_ = 0.0;
-	eos_ = false;
 	audio_eos_ = false;
 	return true;
 }
@@ -84,56 +89,29 @@ core::Clock *PlatformVideoStreamPlayback::master() const {
 	return mono_clock_.get();
 }
 
-void PlatformVideoStreamPlayback::fill_queue() {
-	if (!backend_ || !queue_ || eos_) {
-		return;
-	}
-	while (!queue_->full()) {
-		std::optional<core::VideoFrame> f = backend_->next_video_frame();
-		if (!f.has_value()) {
-			eos_ = true;
-			break;
-		}
-		if (!queue_->push(std::move(*f))) {
-			// Race against capacity: push the frame back by releasing it. With a
-			// single consumer this shouldn't happen, but stay leak-safe.
-			if (f->release) {
-				f->release();
-			}
-			break;
-		}
-	}
-}
-
-void PlatformVideoStreamPlayback::drain_queue() {
-	if (!queue_) {
-		return;
-	}
-	while (auto f = queue_->pop()) {
-		if (f->release) {
-			f->release();
-		}
-	}
-}
-
 void PlatformVideoStreamPlayback::fill_audio() {
-	if (!backend_ || !audio_ring_ || audio_eos_) {
+	if (!stream_ || !audio_ring_ || audio_eos_) {
 		return;
 	}
-	// Top the ring up to roughly half full so there is always a cushion against
-	// decode jitter without buffering an unbounded amount of audio ahead.
-	while (audio_ring_->free_frames() > audio_ring_->available_frames()) {
-		std::optional<core::AudioChunk> chunk = backend_->next_audio_chunk();
-		if (!chunk.has_value()) {
-			audio_eos_ = true;
-			break;
+	// Pump audio from the Backend under the scheduler's per-stream exclusion so we
+	// never race the worker that is decoding video ahead on the same Backend. The
+	// callback runs on THIS (main) thread with sole access to the Backend.
+	core::DecodeScheduler::instance().with_backend(stream_, [this](core::Backend &backend) {
+		// Top the ring up to roughly half full so there is always a cushion against
+		// decode jitter without buffering an unbounded amount of audio ahead.
+		while (audio_ring_->free_frames() > audio_ring_->available_frames()) {
+			std::optional<core::AudioChunk> chunk = backend.next_audio_chunk();
+			if (!chunk.has_value()) {
+				audio_eos_ = true;
+				break;
+			}
+			if (chunk->samples == nullptr || chunk->frame_count <= 0) {
+				continue;
+			}
+			// AudioRing's channel count is fixed at the clip's; backend chunks match.
+			audio_ring_->write(chunk->samples, static_cast<size_t>(chunk->frame_count));
 		}
-		if (chunk->samples == nullptr || chunk->frame_count <= 0) {
-			continue;
-		}
-		// AudioRing's channel count is fixed at the clip's; backend chunks match.
-		audio_ring_->write(chunk->samples, static_cast<size_t>(chunk->frame_count));
-	}
+	});
 }
 
 void PlatformVideoStreamPlayback::drive_audio() {
@@ -196,7 +174,6 @@ void PlatformVideoStreamPlayback::_play() {
 void PlatformVideoStreamPlayback::_stop() {
 	playing_ = false;
 	paused_ = false;
-	eos_ = false;
 	audio_eos_ = false;
 	position_ = 0.0;
 	if (core::Clock *c = master()) {
@@ -205,9 +182,10 @@ void PlatformVideoStreamPlayback::_stop() {
 	if (audio_ring_) {
 		audio_ring_->clear();
 	}
-	drain_queue();
-	if (backend_) {
-		backend_->seek(0.0);
+	// Flush the decode-ahead queue and reseek to the start via the scheduler
+	// (serialized against the worker; releases buffered surfaces).
+	if (stream_) {
+		core::DecodeScheduler::instance().request_seek(stream_, 0.0);
 	}
 }
 
@@ -236,20 +214,20 @@ double PlatformVideoStreamPlayback::_get_playback_position() const {
 
 void PlatformVideoStreamPlayback::_seek(double time) {
 	core::Clock *c = master();
-	if (!backend_ || !c) {
+	if (!stream_ || !c) {
 		return;
 	}
 	if (time < 0.0) {
 		time = 0.0;
 	}
-	drain_queue();
 	if (audio_ring_) {
 		audio_ring_->clear(); // stale audio must not play after a seek
 	}
-	backend_->seek(time);
+	// Flush the decode-ahead queue + reseek the Backend through the scheduler so
+	// the reseek is serialized against the decoding worker (no race / no UAF).
+	core::DecodeScheduler::instance().request_seek(stream_, time);
 	c->set_time(time); // re-anchor the master clock to the seek target
 	position_ = time;
-	eos_ = false;
 	audio_eos_ = false;
 	// NOTE (boundary -> o3h): this is a tolerant keyframe seek. Adaptive
 	// keyframe-on-drag / exact-on-settle scrubbing is the scrubbing slice.
@@ -267,9 +245,10 @@ Ref<Texture2D> PlatformVideoStreamPlayback::_get_texture() const {
 
 void PlatformVideoStreamPlayback::_update(double delta) {
 	core::Clock *clock = master();
-	if (!playing_ || paused_ || !loaded_ || !clock || !queue_) {
+	if (!playing_ || paused_ || !loaded_ || !clock || !stream_) {
 		return;
 	}
+	core::DecodeScheduler &sched = core::DecodeScheduler::instance();
 
 	if (has_audio_) {
 		// Audio-master path: keep the audio ring fed, then drain it into Godot's
@@ -284,8 +263,8 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 	}
 	const double now = clock->media_time();
 
-	// Keep the video decode-ahead queue topped up.
-	fill_queue();
+	// Video decode-ahead is now driven by the shared pool's worker(s); the queue
+	// is topped up off the main thread. The main thread only consumes here.
 
 	// --- Present step: drop-late / hold-early, via the Godot-free selector ---
 	//
@@ -298,22 +277,18 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 	std::optional<core::VideoFrame> chosen;
 
 	for (;;) {
-		const core::VideoFrame *head = queue_->peek();
-		if (head == nullptr) {
+		std::optional<double> head_pts = sched.peek_head_pts(stream_);
+		if (!head_pts.has_value()) {
 			break; // queue empty -> hold the current frame
 		}
-		const core::VideoFrame *next = queue_->peek_next();
-
-		std::optional<double> head_pts = head->pts_seconds;
-		std::optional<double> next_pts =
-				next ? std::optional<double>(next->pts_seconds) : std::nullopt;
+		std::optional<double> next_pts = sched.peek_next_pts(stream_);
 
 		core::PresentAction action =
 				core::select_present_action(head_pts, next_pts, now, frame_interval);
 
 		if (action == core::PresentAction::Drop) {
 			// Head is stale: pop and retire it, then re-evaluate the new head.
-			std::optional<core::VideoFrame> stale = queue_->pop();
+			std::optional<core::VideoFrame> stale = sched.next_frame(stream_);
 			if (stale.has_value() && stale->release) {
 				stale->release();
 			}
@@ -323,7 +298,7 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 		if (action == core::PresentAction::Show) {
 			// Newest due frame: pop and present it. (Drop already collapsed any
 			// backlog, so this is the only due frame.)
-			chosen = queue_->pop();
+			chosen = sched.next_frame(stream_);
 		}
 
 		// Show or Hold both end the present scan for this tick.
@@ -336,9 +311,10 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 		present_.present(std::move(*chosen));
 	}
 
-	// End-of-playback: both streams drained and nothing left to show.
+	// End-of-playback: video stream drained (Backend EOS + empty queue) and audio
+	// fully consumed. at_end() reflects the worker-reported EOS for our stream.
 	const bool audio_done = !has_audio_ || (audio_eos_ && audio_ring_ && audio_ring_->empty());
-	if (eos_ && queue_->empty() && audio_done) {
+	if (sched.at_end(stream_) && audio_done) {
 		playing_ = false;
 	}
 }

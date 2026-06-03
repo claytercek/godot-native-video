@@ -49,7 +49,14 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_present_selector.cpp",
         "tests/core/test_audio_ring.cpp",
         "tests/core/test_av_drift.cpp",
+        "tests/core/test_decode_scheduler.cpp",
+        "src/core/decode_scheduler.cpp",
     ]
+    # The force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG.
+    # Define it for the headless core tests so the force-sync test compiles/runs.
+    core_env.Append(CPPDEFINES=["PLATFORM_MEDIA_DEBUG"])
+    # The scheduler spins up worker threads.
+    core_env.Append(LIBS=["pthread"])
     # Allow an ASan build of the core tests to prove the retire-ring is
     # use-after-free clean:  scons target=core_tests asan=yes
     if ARGUMENTS.get("asan", "") in ("1", "yes", "true"):
