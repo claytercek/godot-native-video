@@ -1,0 +1,15 @@
+; Godot 4.4 demo project for the native media streams GDExtension.
+; Forward+ renderer (RenderingDevice) is required by ADR-0002 — the zero-copy
+; present path has no CPU fallback and does not support Compatibility/OpenGL.
+
+config_version=5
+
+[application]
+
+config/name="Native Media Streams — Smoke Test"
+run/main_scene="res://scenes/smoke.tscn"
+config/features=PackedStringArray("4.4", "Forward Plus")
+
+[rendering]
+
+renderer/rendering_method="forward_plus"

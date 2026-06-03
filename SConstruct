@@ -14,7 +14,13 @@ localEnv = Environment(tools=["default"], PLATFORM="")
 # Modify the example file as needed and uncomment the line below or
 # manually specify the build_profile parameter when running SCons.
 
-localEnv["build_profile"] = "build_profile.json"
+# NOTE: an `enabled_classes` build profile would have to enumerate the full
+# transitive closure of every godot-cpp class the present pipeline touches
+# (RenderingDevice, RenderingServer, Texture2DRD, the RD* descriptor classes,
+# their bases, ...). That is brittle and easy to under-specify, so we build the
+# full bindings. Re-introduce a curated profile only once the API surface is
+# stable and the closure is verified.
+# localEnv["build_profile"] = "build_profile.json"
 
 customs = ["custom.py"]
 customs = [os.path.abspath(path) for path in customs]
@@ -39,7 +45,13 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/main.cpp",
         "tests/core/test_frame_queue.cpp",
         "tests/core/test_clock.cpp",
+        "tests/core/test_retire_ring.cpp",
     ]
+    # Allow an ASan build of the core tests to prove the retire-ring is
+    # use-after-free clean:  scons target=core_tests asan=yes
+    if ARGUMENTS.get("asan", "") in ("1", "yes", "true"):
+        core_env.Append(CXXFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer", "-g"])
+        core_env.Append(LINKFLAGS=["-fsanitize=address"])
     core_tests = core_env.Program("bin/core_tests", core_sources)
     Default(core_tests)
     # Skip the rest — godot-cpp is not needed.
@@ -89,23 +101,34 @@ env.VariantDir("build/src", "src", duplicate=0)
 env.Append(CPPPATH=["src/"])
 sources = ["build/src/register_types.cpp"]
 
-# Add common source files
+# Add Binding source files (src/common — the Godot adapter layer). Both plain
+# C++ (.cpp) and Objective-C++ (.mm, e.g. the Metal surface importer) live here.
 sources.extend(Glob("build/src/common/*.cpp"))
 sources.extend(Glob("build/src/common/**/*.cpp"))
 
 # Platform-specific configurations
 if env["platform"] == "macos" or env["platform"] == "ios":
-    # Add AVFoundation source files (note the .mm extension)
-    sources.extend(Glob("build/src/platforms/avf/*.mm"))
-    sources.extend(Glob("build/src/platforms/avf/*.cpp"))
-    
-    # Add necessary frameworks
-    env.Append(FRAMEWORKS=["AVFoundation", "CoreMedia", "CoreVideo", "MediaToolbox"])
-    
+    # Add the Engine Core AVFoundation Backend (src/backends/avf) and any
+    # Objective-C++ Binding sources (src/common, e.g. the Metal importer).
+    sources.extend(Glob("build/src/backends/avf/*.mm"))
+    sources.extend(Glob("build/src/common/*.mm"))
+
+    # CPPPATH so the binding can include the core + backend headers by relative
+    # path and godot-cpp headers resolve as usual.
+    env.Append(CPPPATH=["src/core", "src/backends/avf"])
+
+    # Frameworks: AVFoundation/CoreMedia for decode; CoreVideo for the
+    # CVPixelBuffer/CVMetalTextureCache zero-copy import; Metal/QuartzCore for the
+    # MTLDevice/MTLTexture present path; CoreFoundation for CF retain/release.
+    env.Append(FRAMEWORKS=[
+        "AVFoundation", "CoreMedia", "CoreVideo", "MediaToolbox",
+        "Metal", "QuartzCore", "CoreFoundation", "Foundation",
+    ])
+
     # Use dynamic symbol lookup
     env.Append(LINKFLAGS=["-Wl,-undefined,dynamic_lookup"])
-    
-    # Enable Objective-C++ compilation
+
+    # Enable Objective-C++ ARC.
     env.Append(CXXFLAGS=["-fobjc-arc"])
 elif env["platform"] == "windows":
     # Add Windows Media Foundation source files

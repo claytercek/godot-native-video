@@ -1,0 +1,12 @@
+[configuration]
+
+entry_symbol = "platform_media_streams_init"
+compatibility_minimum = 4.4
+
+[libraries]
+; Relative paths so the GDExtension can be placed anywhere in the project.
+macos.single.debug = "./macos/libplatform-media-streams.macos.template_debug.dylib"
+macos.single.release = "./macos/libplatform-media-streams.macos.template_release.dylib"
+
+ios.arm64.single.debug = "./ios/libplatform-media-streams.ios.template_debug.arm64.dylib"
+ios.arm64.single.release = "./ios/libplatform-media-streams.ios.template_release.arm64.dylib"
