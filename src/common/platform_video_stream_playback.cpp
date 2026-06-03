@@ -11,7 +11,7 @@
 
 #include <algorithm>
 
-#include "../../backends/avf/avf_backend.h"
+#include "backend_factory.h"
 
 using namespace godot;
 
@@ -30,7 +30,7 @@ void PlatformVideoStreamPlayback::_bind_methods() {
 }
 
 bool PlatformVideoStreamPlayback::load(const String &path) {
-	backend_ = std::make_unique<avf::AvfBackend>();
+	backend_ = platform_media::make_backend();
 
 	// Resolve a Godot res:// / user:// path to an absolute OS path the backend's
 	// AVURLAsset can open. globalize_path leaves absolute OS paths untouched.

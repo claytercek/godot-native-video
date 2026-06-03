@@ -4,8 +4,10 @@
 // platform_video_stream_playback.h — the Binding's VideoStreamPlayback.
 //
 // Adapts the Godot-independent Engine Core to Godot's VideoStreamPlayback so a
-// stock VideoStreamPlayer can play a native clip. It drives an avf::AvfBackend
-// (Decoder mode), buffers decoded NV12 frames in a core::FrameQueue, advances a
+// stock VideoStreamPlayer can play a native clip. It drives a per-platform
+// core::Backend (Decoder mode, chosen by make_backend() — AVFoundation on
+// macOS, Media Foundation on Windows), buffers decoded NV12 frames in a
+// core::FrameQueue, advances a
 // core::Clock from the frame delta, and on _update() picks the frame for "now"
 // and presents it through the zero-copy PresentPipeline. _get_texture() returns
 // the engine-owned RGBA Texture2DRD.
@@ -33,10 +35,6 @@
 #include "../core/frame_queue.h"
 #include "../core/present_selector.h"
 #include "present_pipeline.h"
-
-namespace avf {
-class AvfBackend;
-}
 
 namespace godot {
 
@@ -86,7 +84,7 @@ private:
 	// The current master clock (audio-master when audio present, else monotonic).
 	core::Clock *master() const;
 
-	std::unique_ptr<avf::AvfBackend> backend_;
+	std::unique_ptr<core::Backend> backend_;
 	std::unique_ptr<core::FrameQueue<core::VideoFrame, kQueueCapacity>> queue_;
 
 	// Master-clock implementations. Exactly one is "the master" per clip:

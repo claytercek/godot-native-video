@@ -89,6 +89,43 @@ if ARGUMENTS.get("target", "") == "avf_tests":
     # Skip the rest — godot-cpp is not needed.
     Return()
 
+# -----------------------------------------------------------------------
+# mf_tests target — Media Foundation Backend headless integration test.
+# WINDOWS ONLY. Pure C++ + MF/D3D11; NO godot-cpp, NO RenderingDevice — the
+# decode-to-NV12-D3D11 + PCM contract mirror of avf_tests.
+# Build (on Windows):  scons target=mf_tests platform=windows
+# Run:                 bin\mf_tests.exe
+#
+# STATUS: UNVERIFIED on this (macOS) host — there is no Windows toolchain here,
+# so this target is provided for Windows CI to build + run. It is intentionally
+# guarded so an accidental invocation on a non-Windows host fails loudly with a
+# clear message instead of producing a broken binary.
+# -----------------------------------------------------------------------
+if ARGUMENTS.get("target", "") == "mf_tests":
+    if sys.platform != "win32":
+        print("mf_tests is Windows-only (Media Foundation + D3D11). "
+              "Run it on a Windows host / CI; it cannot be built on this platform.")
+        sys.exit(1)
+    mf_env = Environment(tools=["default"])
+    mf_env.Append(CXXFLAGS=["/std:c++20", "/EHsc"])
+    # Backend sources (#src/core for backend.h), test sources (#tests/core for
+    # the vendored "vendor/doctest.h" include).
+    mf_env.Append(CPPPATH=["#src/core", "#src/backends/mf", "#tests/core"])
+    mf_env.Append(CPPDEFINES=["UNICODE", "_UNICODE"])
+    mf_env.Append(LIBS=[
+        "mfplat", "mf", "mfreadwrite", "mfuuid",
+        "d3d11", "dxgi", "ole32", "shlwapi", "propsys",
+    ])
+    mf_sources = [
+        "tests/mf/main.cpp",
+        "tests/mf/test_mf_backend.cpp",
+        "src/backends/mf/mf_backend.cpp",
+    ]
+    mf_tests = mf_env.Program("bin/mf_tests", mf_sources)
+    Default(mf_tests)
+    # Skip the rest — godot-cpp is not needed.
+    Return()
+
 if not (os.path.isdir("godot-cpp") and os.listdir("godot-cpp")):
     print("""godot-cpp is not available within this folder, as Git submodules haven't been initialized.
 Run the following command to download godot-cpp:
@@ -134,13 +171,36 @@ if env["platform"] == "macos" or env["platform"] == "ios":
     # Enable Objective-C++ ARC.
     env.Append(CXXFLAGS=["-fobjc-arc"])
 elif env["platform"] == "windows":
-    # Add Windows Media Foundation source files
-    sources.extend(Glob("build/src/platform/wmf/*.cpp"))
-    
-    # Add necessary libraries for Windows Media Foundation
-    env.Append(LIBS=["mfplat", "mf", "mfreadwrite", "mfuuid", "d3d11", "ole32", "shlwapi"])
-    
-    # Enable Unicode for Windows API
+    # Add the Engine Core Media Foundation Backend (src/backends/mf). The Binding
+    # sources (src/common/*.cpp) — including the DXGI->Vulkan surface importer and
+    # the Windows backend factory — are already globbed above; their bodies are
+    # guarded by #if _WIN32 so they only emit code on Windows.
+    #
+    # STATUS: UNVERIFIED. This block is authored on a macOS host with no Windows
+    # toolchain; it has not been built. A Windows dev should run
+    #   scons target=template_debug platform=windows
+    # and resolve any include/lib path issues (esp. the Vulkan SDK headers/loader,
+    # which the DXGI importer needs for VK_KHR_external_memory_win32).
+    sources.extend(Glob("build/src/backends/mf/*.cpp"))
+
+    # CPPPATH so the binding can include the core + MF backend headers by relative
+    # path (mirrors the macOS block).
+    env.Append(CPPPATH=["src/core", "src/backends/mf"])
+
+    # Libraries:
+    #   mfplat/mf/mfreadwrite/mfuuid : Media Foundation source reader + decode.
+    #   d3d11/dxgi                   : D3D11 device + DXGI shared-handle interop.
+    #   ole32/propsys/shlwapi        : COM init + PROPVARIANT helpers + path utils.
+    # The Vulkan loader (vulkan-1) is needed by the DXGI->Vulkan importer; it is
+    # provided by the Vulkan SDK. If godot-cpp already links the loader this is
+    # redundant but harmless.
+    env.Append(LIBS=[
+        "mfplat", "mf", "mfreadwrite", "mfuuid",
+        "d3d11", "dxgi", "ole32", "shlwapi", "propsys",
+        "vulkan-1",
+    ])
+
+    # Enable Unicode for Windows API.
     env.Append(CPPDEFINES=["UNICODE", "_UNICODE"])
 
 if env["target"] in ["editor", "template_debug"]:

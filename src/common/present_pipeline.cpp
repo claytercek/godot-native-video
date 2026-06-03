@@ -89,8 +89,13 @@ bool PresentPipeline::build_resources(int width, int height) {
 	ERR_FAIL_NULL_V_MSG(rd_, false,
 			"No RenderingDevice — requires a Forward+/Mobile renderer (ADR-0002).");
 
-	if (!importer_.initialize(rd_)) {
-		ERR_PRINT("Metal surface importer init failed (not a Metal RenderingDevice?).");
+	// Build the per-platform surface importer (Metal on macOS, DXGI->Vulkan on
+	// Windows) lazily, then bind it to Godot's RD.
+	if (!importer_) {
+		importer_ = make_surface_importer();
+	}
+	if (!importer_ || !importer_->initialize(rd_)) {
+		ERR_PRINT("Surface importer init failed (RD backend not supported by importer?).");
 		return false;
 	}
 
@@ -174,8 +179,10 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	retire_ring_.advance();
 
 	// Import the decoder surface zero-copy into two RD plane textures. No CPU
-	// copy happens here — CVMetalTextureCache aliases the IOSurface memory.
-	PlaneTextures planes = importer_.import(frame.native_handle);
+	// copy happens here — the importer aliases the decoder's surface memory
+	// (CVMetalTextureCache on macOS; a Vulkan image opened from the DXGI shared
+	// handle on Windows).
+	PlaneTextures planes = importer_->import(frame.native_handle);
 	if (!planes.valid()) {
 		// Import failed (wrong format / non-Metal). Retire the frame now.
 		if (frame.release) {
@@ -239,6 +246,14 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		memset(w + 8, 0, 8);
 	}
 
+	// On platforms that share the decoder surface across two GPU APIs (Windows:
+	// D3D11 decoder <-> Vulkan present), acquire the DXGI keyed mutex so the
+	// decoder cannot recycle/overwrite the surface while we sample it. No-op on
+	// macOS (acquire is null — one shared Metal device, no cross-API handoff).
+	if (planes.acquire) {
+		planes.acquire();
+	}
+
 	// --- ONE compute dispatch: NV12 -> RGBA into the engine-owned slot. ---
 	const int gx = (width_ + 7) / 8;
 	const int gy = (height_ + 7) / 8;
@@ -249,6 +264,13 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	rd_->compute_list_set_push_constant(cl, pc, pc.size());
 	rd_->compute_list_dispatch(cl, gx, gy, 1);
 	rd_->compute_list_end();
+
+	// Release the keyed mutex back to the decoder (no-op on macOS). The
+	// retire-ring still holds the surface for kFrameLatency frames so the GPU
+	// has finished the dispatch above before the wrappers are torn down.
+	if (planes.release_sync) {
+		planes.release_sync();
+	}
 
 	current_texture_ = slot.tex;
 
