@@ -167,6 +167,14 @@ void PlatformVideoStreamPlayback::drive_audio() {
 	// (non-silence) AND consumed by Godot — so neither underrun silence nor a
 	// full AudioServer buffer inflates media time. The clock therefore tracks
 	// genuine audio consumption, latency-compensated in AudioMasterClock.
+	//
+	// NOTE: read_frames() already drained `real_frames` from the ring. If
+	// mix_audio accepts fewer than that (a near-full AudioServer buffer), the
+	// surplus real frames are dropped — the clock stays honest (we count only
+	// `accepted`), but a tiny amount of audio is lost. In practice mix_audio
+	// accepts the full request, and `request` is capped to what is buffered, so
+	// this only bites under sustained AudioServer back-pressure. Tolerable for
+	// linear playback; the shared decode-pool slice (g1c) can re-offer instead.
 	const int accepted = mix_audio(request, mix_buffer_, 0);
 	const int advance = std::min<int>(accepted, static_cast<int>(real_frames));
 	if (advance > 0) {
