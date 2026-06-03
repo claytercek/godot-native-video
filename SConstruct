@@ -26,6 +26,25 @@ Help(opts.GenerateHelpText(localEnv))
 
 env = localEnv.Clone()
 
+# -----------------------------------------------------------------------
+# core_tests target — Engine Core unit tests with NO godot-cpp dependency.
+# Build:  scons target=core_tests
+# Run:    ./bin/core_tests
+# -----------------------------------------------------------------------
+if ARGUMENTS.get("target", "") == "core_tests":
+    core_env = Environment(tools=["default"])
+    core_env.Append(CXXFLAGS=["-std=c++20", "-Wall", "-Wextra"])
+    core_env.Append(CPPPATH=["#src/core", "#tests/core/vendor"])
+    core_sources = [
+        "tests/core/main.cpp",
+        "tests/core/test_frame_queue.cpp",
+        "tests/core/test_clock.cpp",
+    ]
+    core_tests = core_env.Program("bin/core_tests", core_sources)
+    Default(core_tests)
+    # Skip the rest — godot-cpp is not needed.
+    Return()
+
 if not (os.path.isdir("godot-cpp") and os.listdir("godot-cpp")):
     print("""godot-cpp is not available within this folder, as Git submodules haven't been initialized.
 Run the following command to download godot-cpp:
