@@ -55,3 +55,6 @@ CMakeUserPresets.json
 .dolt/
 *.db
 .beads-credential-key
+
+# Generated test fixtures (produced by tools/gen_test_media.sh)
+tests/fixtures/
