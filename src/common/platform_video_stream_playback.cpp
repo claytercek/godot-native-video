@@ -10,6 +10,8 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
 
 #include "../core/decode_scheduler.h"
 #include "backend_factory.h"
@@ -164,10 +166,17 @@ void PlatformVideoStreamPlayback::_play() {
 	if (!loaded_) {
 		return;
 	}
+	const bool was_playing = playing_;
 	playing_ = true;
 	paused_ = false;
 	if (core::Clock *c = master()) {
 		c->set_paused(false);
+	}
+	// Resuming playback after a scrub: force an exact resolve at the last scrub
+	// target so play starts from the precise frame, not an approximate keyframe one.
+	// Only when transitioning from stopped/paused into play (not a redundant call).
+	if (!was_playing && stream_) {
+		apply_scrub_resolve(scrubber_.on_resume(now_ms()));
 	}
 }
 
@@ -187,6 +196,8 @@ void PlatformVideoStreamPlayback::_stop() {
 	if (stream_) {
 		core::DecodeScheduler::instance().request_seek(stream_, 0.0);
 	}
+	// Reset scrub state so the next seek starts fresh (no stale velocity/settle).
+	scrubber_ = core::Scrubber(scrubber_.config());
 }
 
 bool PlatformVideoStreamPlayback::_is_playing() const {
@@ -212,25 +223,83 @@ double PlatformVideoStreamPlayback::_get_playback_position() const {
 	return position_;
 }
 
-void PlatformVideoStreamPlayback::_seek(double time) {
+double PlatformVideoStreamPlayback::now_ms() {
+	// Monotonic wall clock for scrub velocity/debounce. steady_clock never jumps.
+	using clock = std::chrono::steady_clock;
+	const auto t = clock::now().time_since_epoch();
+	return std::chrono::duration<double, std::milli>(t).count();
+}
+
+void PlatformVideoStreamPlayback::apply_scrub_resolve(const core::ScrubResolve &resolve) {
 	core::Clock *c = master();
 	if (!stream_ || !c) {
+		return;
+	}
+	double target = resolve.target_seconds < 0.0 ? 0.0 : resolve.target_seconds;
+
+	if (audio_ring_) {
+		audio_ring_->clear(); // stale audio must not play after a (re)seek
+	}
+	core::DecodeScheduler &sched = core::DecodeScheduler::instance();
+
+	// Both modes start by flushing the decode-ahead queue and reseeking the Backend
+	// to the preceding keyframe through the scheduler (serialized against the
+	// worker; no race / no UAF).
+	sched.request_seek(stream_, target);
+
+	if (resolve.mode == core::ResolveMode::Exact) {
+		// Precise resolve: decode FORWARD past the keyframe to the exact target,
+		// dropping (releasing) every earlier frame so the precise frame is what the
+		// present step shows. Bounded by the clip — stops at EOS. We drop frames
+		// strictly before the target; the present step then shows the target frame.
+		//
+		// This runs on the main thread only on a settle/resume (not the hot
+		// per-frame path), so a brief wait for the worker to top the queue up is
+		// acceptable. We bound the spin so a stall can never hang the main thread:
+		// if the worker has not advanced after `kMaxSpins`, we give up and let the
+		// normal present step finish converging on the next ticks.
+		const double eps = 1.0 / 120.0; // ~half a frame at 60fps tolerance
+		constexpr int kMaxSpins = 100000;
+		int empty_spins = 0;
+		for (;;) {
+			std::optional<double> head = sched.peek_head_pts(stream_);
+			if (!head.has_value()) {
+				if (sched.at_end(stream_) || ++empty_spins > kMaxSpins) {
+					break; // EOS before the target, or worker stalled — clamp.
+				}
+				std::this_thread::yield(); // queue momentarily empty; worker tops up
+				continue;
+			}
+			empty_spins = 0;
+			if (*head + eps >= target) {
+				break; // head is at/after the target — leave it for the present step
+			}
+			// Head is before the target: drop it and keep decoding forward.
+			std::optional<core::VideoFrame> stale = sched.next_frame(stream_);
+			if (stale.has_value() && stale->release) {
+				stale->release();
+			}
+		}
+	}
+
+	c->set_time(target); // re-anchor the master clock to the resolved target
+	position_ = target;
+	audio_eos_ = false;
+}
+
+void PlatformVideoStreamPlayback::_seek(double time) {
+	if (!stream_ || !master()) {
 		return;
 	}
 	if (time < 0.0) {
 		time = 0.0;
 	}
-	if (audio_ring_) {
-		audio_ring_->clear(); // stale audio must not play after a seek
-	}
-	// Flush the decode-ahead queue + reseek the Backend through the scheduler so
-	// the reseek is serialized against the decoding worker (no race / no UAF).
-	core::DecodeScheduler::instance().request_seek(stream_, time);
-	c->set_time(time); // re-anchor the master clock to the seek target
-	position_ = time;
-	audio_eos_ = false;
-	// NOTE (boundary -> o3h): this is a tolerant keyframe seek. Adaptive
-	// keyframe-on-drag / exact-on-settle scrubbing is the scrubbing slice.
+	// Feed the seek to the adaptive scrubber: a fast drag burst resolves to the
+	// nearest keyframe for instant feedback; a slow/lone seek resolves exactly. A
+	// debounced settle (or playback resume) later upgrades a keyframe scrub to an
+	// exact resolve via poll()/on_resume() in _update()/_play().
+	const core::ScrubResolve resolve = scrubber_.on_seek(time, now_ms());
+	apply_scrub_resolve(resolve);
 }
 
 void PlatformVideoStreamPlayback::_set_audio_track(int /*idx*/) {
@@ -245,7 +314,18 @@ Ref<Texture2D> PlatformVideoStreamPlayback::_get_texture() const {
 
 void PlatformVideoStreamPlayback::_update(double delta) {
 	core::Clock *clock = master();
-	if (!playing_ || paused_ || !loaded_ || !clock || !stream_) {
+	if (!loaded_ || !clock || !stream_) {
+		return;
+	}
+
+	// Settle check runs regardless of play/pause: scrubbing commonly happens while
+	// paused (dragging a timeline). Once a fast drag has gone quiet for the debounce
+	// window, upgrade the approximate keyframe frame to the exact target frame.
+	if (std::optional<core::ScrubResolve> settle = scrubber_.poll(now_ms())) {
+		apply_scrub_resolve(*settle);
+	}
+
+	if (!playing_ || paused_) {
 		return;
 	}
 	core::DecodeScheduler &sched = core::DecodeScheduler::instance();
