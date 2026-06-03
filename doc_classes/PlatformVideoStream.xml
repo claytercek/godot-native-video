@@ -4,8 +4,9 @@
 		[VideoStream] resource for hardware-decoded, zero-copy native video playback.
 	</brief_description>
 	<description>
-		A [VideoStream] that plays a native video clip through the platform's hardware decoder (AVFoundation on macOS) and presents frames to the GPU with no CPU copy. The decoded NV12 surface is imported via [code]RenderingDevice.texture_create_from_extension[/code] and converted to RGB in a single compute pass into an engine-owned [Texture2DRD] returned from the playback's texture; Godot never samples the decoder surface directly.
+		A [VideoStream] that plays a native video clip through the platform's hardware decoder (AVFoundation on macOS, Windows Media Foundation on Windows) and presents frames to the GPU with no CPU copy. The decoded NV12 surface is imported via [code]RenderingDevice.texture_create_from_extension[/code] and converted to RGB in a single compute pass into an engine-owned [Texture2DRD] returned from the playback's texture; Godot never samples the decoder surface directly.
 		Drop a recognised clip ([code].mp4[/code], [code].mov[/code], [code].m4v[/code]) onto a stock [VideoStreamPlayer] to play it. Requires Godot 4.4+ and a [b]Forward+[/b] or [b]Mobile[/b] renderer (RenderingDevice); the Compatibility/OpenGL renderer is not supported.
+		Tested and supported scope (v1) is the 8-bit SDR core matrix: H.264 and HEVC video, MP4/MOV containers, NV12 / BT.709, and AAC stereo audio. 10-bit/HDR, VP9/AV1, and multi-track audio are out of scope for v1.
 	</description>
 	<tutorials>
 	</tutorials>
