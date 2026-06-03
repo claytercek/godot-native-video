@@ -8,8 +8,8 @@
 // +/-1, AAC stereo @ 48 kHz, monotonic PTS, PTS drift within half a frame).
 //
 // WINDOWS-ONLY: the body is under #if _WIN32 and is compiled only by
-// `scons target=mf_tests platform=windows`. Missing / LFS-pointer clips are
-// skipped with a WARN, never a failure.
+// `scons target=mf_tests platform=windows`. Clips missing because
+// tools/gen_clip_matrix.sh hasn't run are skipped with a WARN, never a failure.
 //
 // STATUS: implemented but NOT compiled/run/verified on the authoring host
 // (macOS, no Windows toolchain). A Windows dev / CI runner must build + run it.
@@ -38,11 +38,7 @@ TEST_CASE("MF backend decodes the real-clip format matrix") {
 		const std::string path = clip_matrix::clip_path(clip);
 
 		if (!clip_matrix::file_exists(path)) {
-			WARN_MESSAGE(false, ("matrix clip missing (LFS not pulled / not generated): " + clip.file).c_str());
-			continue;
-		}
-		if (clip_matrix::is_lfs_pointer(path)) {
-			WARN_MESSAGE(false, ("matrix clip is an LFS pointer, run `git lfs pull`: " + clip.file).c_str());
+			WARN_MESSAGE(false, ("matrix clip missing (run tools/gen_clip_matrix.sh): " + clip.file).c_str());
 			continue;
 		}
 
@@ -111,7 +107,7 @@ TEST_CASE("MF backend decodes the real-clip format matrix") {
 	}
 
 	if (decoded_clips == 0) {
-		WARN_MESSAGE(false, "no matrix clips were decodable — run tools/gen_clip_matrix.sh or `git lfs pull`");
+		WARN_MESSAGE(false, "no matrix clips were decodable — run tools/gen_clip_matrix.sh");
 	}
 }
 
