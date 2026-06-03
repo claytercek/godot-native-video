@@ -45,6 +45,35 @@ if ARGUMENTS.get("target", "") == "core_tests":
     # Skip the rest — godot-cpp is not needed.
     Return()
 
+# -----------------------------------------------------------------------
+# avf_tests target — AVFoundation Backend headless integration test.
+# Pure C++/ObjC++ + macOS frameworks; NO godot-cpp, NO RenderingDevice.
+# Build:  scons target=avf_tests
+# Run:    ./bin/avf_tests
+# -----------------------------------------------------------------------
+if ARGUMENTS.get("target", "") == "avf_tests":
+    avf_env = Environment(tools=["default"])
+    avf_env.Append(CXXFLAGS=["-std=c++20", "-Wall", "-Wextra", "-fobjc-arc"])
+    # Backend sources (#src/core for backend.h), test sources (#tests/core for
+    # the vendored "vendor/doctest.h" include).
+    avf_env.Append(CPPPATH=["#src/core", "#src/backends/avf", "#tests/core"])
+    avf_env.Append(FRAMEWORKS=[
+        "Foundation",
+        "AVFoundation",
+        "CoreMedia",
+        "CoreVideo",
+        "CoreFoundation",
+    ])
+    avf_sources = [
+        "tests/avf/main.mm",
+        "tests/avf/test_avf_backend.mm",
+        "src/backends/avf/avf_backend.mm",
+    ]
+    avf_tests = avf_env.Program("bin/avf_tests", avf_sources)
+    Default(avf_tests)
+    # Skip the rest — godot-cpp is not needed.
+    Return()
+
 if not (os.path.isdir("godot-cpp") and os.listdir("godot-cpp")):
     print("""godot-cpp is not available within this folder, as Git submodules haven't been initialized.
 Run the following command to download godot-cpp:

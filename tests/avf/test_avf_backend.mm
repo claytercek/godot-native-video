@@ -1,0 +1,208 @@
+// -----------------------------------------------------------------------
+// test_avf_backend.mm — headless integration test for the AVFoundation
+// Decoder-mode Backend. NO Godot, NO RenderingDevice.
+//
+// It generates (on demand) a synthetic marker clip via tools/gen_test_media.sh
+// and decodes it end-to-end through avf::AvfBackend, asserting:
+//   - NV12 video frames are produced with the expected count (±1 GOP slack);
+//   - the burned-in white frame-index marker is present (mean luma of the
+//     top-left block is bright) on the marked frames, within encode tolerance;
+//   - video PTS and audio PTS are each monotonic non-decreasing;
+//   - PCM float32 audio is extracted with sane PTS;
+//   - no decode errors occur.
+//
+// If ffmpeg is unavailable the fixture cannot be built and the assertions are
+// skipped gracefully (WARN, not fail). On this build machine ffmpeg IS present
+// so the assertions run for real.
+// -----------------------------------------------------------------------
+
+#include "vendor/doctest.h"
+
+#include "avf_backend.h"
+#include "cf_raii.h"
+
+#import <CoreVideo/CoreVideo.h>
+
+#include <sys/stat.h>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+namespace {
+
+// Test-clip parameters. Kept small so the test is fast; the marker block is
+// 80x80 px in the top-left, the burned-in text is black inside it.
+constexpr int kFrames = 30;
+constexpr int kFps = 30;
+constexpr int kWidth = 320;
+constexpr int kHeight = 240;
+constexpr int kBlock = 80; // marker block edge length in pixels
+
+bool file_exists(const std::string &p) {
+	struct stat st;
+	return ::stat(p.c_str(), &st) == 0;
+}
+
+bool ffmpeg_available() {
+	// `command -v` exits 0 when ffmpeg is on PATH.
+	return std::system("command -v ffmpeg >/dev/null 2>&1") == 0;
+}
+
+// Locate the repo root from this test's compile-time directory. We resolve
+// paths relative to the current working directory (scons runs from repo root)
+// and fall back to environment override REPO_ROOT if set.
+std::string repo_root() {
+	if (const char *env = std::getenv("REPO_ROOT")) {
+		return std::string(env);
+	}
+	return "."; // scons invokes ./bin/avf_tests from the repo root
+}
+
+// Generate the fixture if missing. Returns the fixture path, or empty on
+// failure (e.g. ffmpeg missing).
+std::string ensure_fixture() {
+	const std::string root = repo_root();
+	const std::string fixture = root + "/tests/fixtures/synthetic_avf.mp4";
+	if (file_exists(fixture)) {
+		return fixture;
+	}
+	if (!ffmpeg_available()) {
+		return {};
+	}
+	char cmd[1024];
+	std::snprintf(cmd, sizeof(cmd),
+			"%s/tools/gen_test_media.sh --frames %d --fps %d --width %d --height %d --output %s "
+			">/dev/null 2>&1",
+			root.c_str(), kFrames, kFps, kWidth, kHeight, fixture.c_str());
+	if (std::system(cmd) != 0) {
+		return {};
+	}
+	return file_exists(fixture) ? fixture : std::string{};
+}
+
+// Mean luma over the interior of the top-left marker block, read from the NV12
+// luma plane (plane 0). We sample the block interior but skip a margin so the
+// black burned-in text and any block-edge antialiasing don't dominate.
+double mean_block_luma(CVPixelBufferRef pb) {
+	CVReturn lk = CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+	REQUIRE(lk == kCVReturnSuccess);
+
+	const uint8_t *luma =
+			static_cast<const uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pb, 0));
+	const size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+	REQUIRE(luma != nullptr);
+
+	// Sample the bottom-right quadrant of the block to avoid the text glyphs
+	// (text is anchored top-left at x=5,y=5 with fontsize 40).
+	const int x0 = kBlock / 2;
+	const int y0 = kBlock / 2;
+	const int x1 = kBlock - 4;
+	const int y1 = kBlock - 4;
+
+	double sum = 0.0;
+	int n = 0;
+	for (int y = y0; y < y1; ++y) {
+		const uint8_t *row = luma + static_cast<size_t>(y) * stride;
+		for (int x = x0; x < x1; ++x) {
+			sum += row[x];
+			++n;
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+	return n > 0 ? sum / n : 0.0;
+}
+
+} // namespace
+
+TEST_CASE("AVF backend decodes synthetic clip to NV12 + PCM with monotonic PTS") {
+	const std::string fixture = ensure_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed — skipping AVF decode assertions");
+		return;
+	}
+
+	avf::AvfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	CHECK(backend.video_width() == kWidth);
+	CHECK(backend.video_height() == kHeight);
+	CHECK(backend.audio_sample_rate() == 48000);
+	CHECK(backend.audio_channel_count() >= 1);
+
+	// ---- Video: pump every frame, check NV12 + marker + monotonic PTS ----
+	int video_count = 0;
+	double last_video_pts = -1.0;
+	int bright_marker_frames = 0;
+
+	while (auto frame = backend.next_video_frame()) {
+		CHECK(frame->pixel_format == core::PixelFormat::NV12);
+		CHECK(frame->native_handle != nullptr);
+		CHECK(frame->width == kWidth);
+		CHECK(frame->height == kHeight);
+
+		// PTS must be monotonic non-decreasing.
+		CHECK(frame->pts_seconds >= last_video_pts);
+		last_video_pts = frame->pts_seconds;
+
+		// Read back the NV12 luma plane and check the marker block is bright.
+		// Tolerance rationale: the source block is pure white (Y'=235 in
+		// video-range BT.709). H.264 at crf 18 plus 4:2:0 chroma siting and
+		// ringing around the black text drags the mean down a little, so we
+		// require mean luma >= 170 (out of 255) over the text-free quadrant —
+		// comfortably above the black background (~16) and any mid-grey, while
+		// leaving generous headroom for encoder loss.
+		CVPixelBufferRef pb = static_cast<CVPixelBufferRef>(frame->native_handle);
+		double luma = mean_block_luma(pb);
+		if (luma >= 170.0) {
+			++bright_marker_frames;
+		}
+
+		frame->release(); // drop the surface retain
+		++video_count;
+	}
+
+	CHECK_FALSE(backend.had_error());
+
+	// Expected frame count within ±1: libx264 may trim/duplicate a boundary
+	// frame depending on GOP/timebase rounding, so we allow one frame of slack.
+	CHECK(video_count >= kFrames - 1);
+	CHECK(video_count <= kFrames + 1);
+
+	// Every decoded frame carries the white marker block, so essentially all
+	// frames should read bright. Allow the same ±1 slack as the count.
+	CHECK(bright_marker_frames >= video_count - 1);
+
+	// ---- Audio: re-open (the reader is single-pass) and pump PCM ----
+	REQUIRE(backend.open(fixture));
+	int audio_chunks = 0;
+	long audio_frames_total = 0;
+	double last_audio_pts = -1.0;
+
+	while (auto chunk = backend.next_audio_chunk()) {
+		CHECK(chunk->samples != nullptr);
+		CHECK(chunk->frame_count > 0);
+		CHECK(chunk->channel_count >= 1);
+		CHECK(chunk->sample_rate == 48000);
+
+		CHECK(chunk->pts_seconds >= last_audio_pts);
+		last_audio_pts = chunk->pts_seconds;
+
+		audio_frames_total += chunk->frame_count;
+		++audio_chunks;
+	}
+
+	CHECK_FALSE(backend.had_error());
+	CHECK(audio_chunks > 0);
+
+	// Roughly kFrames/kFps seconds of audio at 48 kHz. AAC priming/padding
+	// makes the exact sample count fuzzy, so just sanity-check the magnitude:
+	// at least half the nominal duration was delivered.
+	const long nominal = static_cast<long>(48000.0 * kFrames / kFps);
+	CHECK(audio_frames_total >= nominal / 2);
+}
+
+TEST_CASE("AVF backend reports error on a bogus path") {
+	avf::AvfBackend backend;
+	CHECK_FALSE(backend.open("/no/such/file/really_not_here.mp4"));
+}
