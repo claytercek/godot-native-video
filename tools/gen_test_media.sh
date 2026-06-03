@@ -7,10 +7,12 @@
 #   - Video contains a high-contrast frame-index marker (bright white block
 #     in the top-left corner, with the decimal frame index burned in as
 #     large text) so automated tests can verify which frame was decoded.
-#   - Audio is a 440 Hz * (frame_index + 1) sine tone that changes every
+#   - Audio is a 200 Hz * (frame_index + 1) sine tone that changes every
 #     frame, letting tests verify A/V sync by checking the tone frequency
 #     at each PTS.  (A sync tone whose frequency maps to frame index, as
 #     required by the issue.)
+#     200 Hz base keeps the highest tone (200*N Hz) well below the 24 kHz
+#     Nyquist limit for up to 119 frames at 48 kHz sample rate.
 #
 # Usage:
 #   tools/gen_test_media.sh [--frames N] [--fps FPS] [--width W] [--height H]
@@ -63,7 +65,7 @@ FRAME_DUR=$(awk "BEGIN{printf \"%.10f\", 1 / $FPS}")
 # Build the audio filter_complex string
 AUDIO_FILTER=""
 for ((i=0; i<FRAMES; i++)); do
-    FREQ=$(( 440 * (i + 1) ))
+    FREQ=$(( 200 * (i + 1) ))
     # Each segment: sine at FREQ Hz for one frame duration
     AUDIO_FILTER+="sine=frequency=${FREQ}:sample_rate=${SAMPLE_RATE}:duration=${FRAME_DUR}[a${i}];"
 done
@@ -92,7 +94,7 @@ VIDEO_FILTER+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:
 # -----------------------------------------------------------------------
 echo "Generating ${FRAMES}-frame synthetic clip -> ${OUTPUT}"
 echo "  video: ${WIDTH}x${HEIGHT} @ ${FPS} fps, black+index block"
-echo "  audio: sine per-frame (440*(idx+1) Hz), ${SAMPLE_RATE} Hz"
+echo "  audio: sine per-frame (200*(idx+1) Hz), ${SAMPLE_RATE} Hz"
 
 ffmpeg -y \
     -filter_complex "${VIDEO_FILTER};${AUDIO_FILTER}" \
