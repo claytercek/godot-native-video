@@ -148,6 +148,20 @@ env.VariantDir("build/src", "src", duplicate=0)
 env.Append(CPPPATH=["src/"])
 sources = ["build/src/register_types.cpp"]
 
+# Engine Core C++ sources that are not platform backends (no godot-cpp / RD deps).
+# The shared decode-worker pool lives in src/core and MUST be linked into the
+# library — the binding references DecodeScheduler::instance(). Without this the
+# macOS dylib links under -undefined,dynamic_lookup with the scheduler symbols
+# unresolved and crashes at runtime the moment a video plays.
+env.VariantDir("build/src/core", "src/core", duplicate=0)
+sources.extend(Glob("build/src/core/*.cpp"))
+
+# Force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG; it
+# is compiled in for debug builds only and stays out of template_release so the
+# synchronous decode path can never run in a shipped binary.
+if env["target"] == "template_debug" or env["target"] == "editor":
+    env.Append(CPPDEFINES=["PLATFORM_MEDIA_DEBUG"])
+
 # Add Binding source files (src/common — the Godot adapter layer). Both plain
 # C++ (.cpp) and Objective-C++ (.mm, e.g. the Metal surface importer) live here.
 sources.extend(Glob("build/src/common/*.cpp"))
