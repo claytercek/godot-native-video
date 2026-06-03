@@ -1,0 +1,123 @@
+name: Build GDExtension
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          [
+            # { platform: linux, arch: x86_64, os: ubuntu-22.04 },
+            # { platform: linux, arch: x86_32, os: ubuntu-22.04 },
+            # { platform: linux, arch: arm64, os: ubuntu-22.04-arm },
+            # { platform: linux, arch: arm32, os: ubuntu-22.04-arm },
+            # { platform: windows, arch: x86_64, os: windows-latest },
+            # { platform: windows, arch: x86_32, os: windows-latest },
+            # { platform: windows, arch: arm64, os: windows-latest },
+            { platform: macos, arch: universal, os: macos-latest },
+            # { platform: android, arch: x86_64, os: ubuntu-22.04 },
+            # { platform: android, arch: x86_32, os: ubuntu-22.04 },
+            # { platform: android, arch: arm64, os: ubuntu-22.04 },
+            # { platform: android, arch: arm32, os: ubuntu-22.04 },
+            { platform: ios, arch: arm64, os: macos-latest },
+            # { platform: web, arch: wasm32, os: ubuntu-22.04 },
+          ]
+        target-type: [template_debug, template_release]
+        float-precision: [single, double]
+
+    name: Build ${{ matrix.target.platform }}-${{ matrix.target-type }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      # Clone this repository
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # Add linux x86_32 toolchain
+      - name: Install multilib support
+        if: ${{ matrix.target.platform == 'linux' && matrix.target.arch == 'x86_32' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
+
+      # Setup dependencies
+      - name: Setup godot-cpp
+        uses: ./godot-cpp/.github/actions/setup-godot-cpp
+        with:
+          platform: ${{ matrix.target.platform }}
+          em-version: 3.1.62
+
+      # Build GDExtension (with caches)
+
+      - name: Restore .scons-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.scons-cache/
+            ${{ github.workspace }}/**/.sconsign.dblite
+          key: ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}-${{ github.ref }}
+          restore-keys: |
+            ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}
+            ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-
+
+      - name: Build GDExtension
+        shell: sh
+        env:
+          SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
+        run: |
+          scons target=${{ matrix.target-type }} platform=${{ matrix.target.platform }} arch=${{ matrix.target.arch }} precision=${{ matrix.float-precision }}
+
+      # Clean up compilation files
+      - name: Windows - Delete compilation files
+        if: ${{ matrix.target.platform == 'windows' }}
+        shell: pwsh
+        run: |
+          Remove-Item bin/* -Include *.exp,*.lib,*.pdb -Force
+
+      # Upload the build
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-media-streams-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}
+          path: |
+            ${{ github.workspace }}/bin/**
+
+  # Merges all the build artifacts together into a single platform-media-streams artifact.
+  # If you comment out this step, all the builds will be uploaded individually.
+  merge:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: platform-media-streams-*
+          path: artifacts
+          
+      - name: Create final artifact structure
+        run: |
+          mkdir -p final-artifact/bin
+          # Copy contents of each artifact into final-artifact
+          for dir in artifacts/platform-media-streams-*; do
+            cp -r "$dir"/* final-artifact/
+          done
+          # Copy LICENSE and README.md to root of final artifact
+          cp LICENSE README.md final-artifact/
+          # Copy .gdextension
+          cp demo/bin/platform-media-streams.gdextension final-artifact/
+          
+      - name: Upload final artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-media-streams
+          path: final-artifact/**
+          
+      - name: Delete individual artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: platform-media-streams-*

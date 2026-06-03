@@ -1,0 +1,15 @@
+{
+	"type": "feature_profile",
+	"enabled_classes": [
+    "ImageTexture",
+    "OS",
+    "PlatformVideoStream",
+    "PlatformVideoStreamPlayback",
+    "PlatformMediaResourceFormatLoader",
+    "ResourceFormatLoader",
+    "ResourceLoader",
+    "Texture2D",
+    "VideoStream",
+    "VideoStreamPlayback"
+	]
+}
