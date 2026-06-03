@@ -169,22 +169,34 @@ void DecodeScheduler::request_seek(const StreamHandle &stream, double pts_second
 	}
 	{
 		std::unique_lock<std::mutex> lk(mu_);
-		// Wait out any in-flight slice so the reseek + flush does not race a worker
-		// producing into the queue.
+		// Wait out any in-flight slice, then CLAIM the per-stream guard ourselves so
+		// no worker can start producing into the queue while we flush it. Without
+		// this claim a stream already sitting in ready_ (busy_ == false) could be
+		// picked up by a worker the instant we drop the lock; that worker would seek
+		// + push new frames concurrently with the flush below, corrupting the queue
+		// (post-seek frames partially flushed, pre/post-seek frames intermixed).
 		cv_.wait(lk, [&stream] { return !stream->busy_; });
 		stream->seek_pending_ = true;
 		stream->seek_target_ = pts_seconds < 0.0 ? 0.0 : pts_seconds;
 		stream->eos_ = false;
-		if (!stream->dead_) {
-			stream->wants_more_ = true;
+		if (stream->dead_) {
+			return; // torn down concurrently; nothing to flush/resume.
 		}
+		stream->wants_more_ = true;
+		stream->busy_ = true; // exclude workers for the duration of the flush
 	}
-	// Flush queued frames on the consumer side (single-consumer: the caller).
+	// Flush queued frames on the consumer side (single-consumer: the caller). We
+	// hold busy_, so no worker is producing concurrently.
 	while (auto f = stream->queue_.pop()) {
 		if (f->release) {
 			f->release();
 		}
 	}
+	{
+		std::lock_guard<std::mutex> lk(mu_);
+		stream->busy_ = false;
+	}
+	cv_.notify_all(); // release any unregister/with_backend waiters
 	notify(stream);
 }
 
