@@ -46,6 +46,9 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_frame_queue.cpp",
         "tests/core/test_clock.cpp",
         "tests/core/test_retire_ring.cpp",
+        "tests/core/test_present_selector.cpp",
+        "tests/core/test_audio_ring.cpp",
+        "tests/core/test_av_drift.cpp",
     ]
     # Allow an ASan build of the core tests to prove the retire-ring is
     # use-after-free clean:  scons target=core_tests asan=yes
