@@ -26,9 +26,14 @@
 // VideoStreamPlayers share one bounded set of worker threads (no thread-per-
 // video). The present/clock/audio logic from dte is unchanged.
 //
-// BOUNDARIES (out of scope here): adaptive keyframe/exact scrubbing is o3h. The
-// scheduler exposes request_seek() as the clean seam the scrubbing slice will
-// use to request a keyframe decode without changing the threading model.
+// SCOPE (o3h — this slice): adaptive scrubbing. Godot only signals seeking via
+// repeated _seek(time): a fast burst is a drag, a debounced gap (or playback
+// resume) is a settle. The Godot-free core::Scrubber turns that bare seek stream
+// into a per-seek decision — a fast drag presents the nearest KEYFRAME for
+// instant feedback (cheap request_seek + present the first decoded frame), while
+// a slow/settled/resumed seek resolves the EXACT target (request_seek to the
+// preceding keyframe, then decode FORWARD to the target PTS). The scheduler's
+// request_seek() is the seam; the threading model is unchanged.
 // -----------------------------------------------------------------------
 
 #include <godot_cpp/classes/texture2d.hpp>
@@ -43,6 +48,7 @@
 #include "../core/clock.h"
 #include "../core/decode_scheduler.h"
 #include "../core/present_selector.h"
+#include "../core/scrubber.h"
 #include "present_pipeline.h"
 
 namespace godot {
@@ -85,12 +91,28 @@ private:
 	// The current master clock (audio-master when audio present, else monotonic).
 	core::Clock *master() const;
 
+	// Apply a scrubber decision to the stream. Keyframe -> a tolerant keyframe
+	// reseek (the scheduler flushes + reseeks; the next decoded frame is presented
+	// for instant feedback). Exact -> reseek to the preceding keyframe then decode
+	// FORWARD to the target PTS so the precise frame lands on screen. Re-anchors the
+	// master clock + position to the target either way.
+	void apply_scrub_resolve(const core::ScrubResolve &resolve);
+
+	// Monotonic wall-clock milliseconds for the Scrubber's velocity/debounce timing
+	// (independent of media time, which jumps around during a scrub).
+	static double now_ms();
+
 	// Handle to this playback's stream registered with the shared decode pool.
 	// The pool owns the Backend and decodes video ahead into the stream's queue;
 	// this object pulls frames via DecodeScheduler::next_frame() on the main
 	// thread. Audio is pumped on the main thread via with_backend() (serialized
 	// against the worker pool so the Backend has a single toucher at a time).
 	core::StreamHandle stream_;
+
+	// Adaptive-scrubbing state machine. Fed every _seek() with the target and a
+	// wall-clock timestamp; decides keyframe-on-drag vs exact-on-settle. poll()'d
+	// each _update() to fire the deferred exact resolve once a drag settles.
+	core::Scrubber scrubber_;
 
 	// Master-clock implementations. Exactly one is "the master" per clip:
 	//  - audio_clock_ when the clip has an audio track (samples-consumed ÷ rate,
