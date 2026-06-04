@@ -15,6 +15,6 @@ macos.single.release = "./macos/libplatform-media-streams.macos.template_release
 ios.arm64.single.debug = "./ios/libplatform-media-streams.ios.template_debug.arm64.dylib"
 ios.arm64.single.release = "./ios/libplatform-media-streams.ios.template_release.arm64.dylib"
 
-; Windows — Media Foundation backend (implemented; pending on-device QA).
+; Windows — Media Foundation backend.
 windows.x86_64.single.debug = "./windows/libplatform-media-streams.windows.template_debug.x86_64.dll"
 windows.x86_64.single.release = "./windows/libplatform-media-streams.windows.template_release.x86_64.dll"
