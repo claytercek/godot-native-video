@@ -1,6 +1,10 @@
 [configuration]
 
 entry_symbol = "platform_media_streams_init"
+; Requires Godot 4.4+ and a RenderingDevice renderer (Forward+ or Mobile).
+; The Compatibility / OpenGL renderer is NOT supported — there is no CPU
+; present path. The zero-copy present pipeline imports the decoded NV12 surface
+; via RenderingDevice.texture_create_from_extension.
 compatibility_minimum = 4.4
 
 [libraries]
@@ -10,3 +14,7 @@ macos.single.release = "./macos/libplatform-media-streams.macos.template_release
 
 ios.arm64.single.debug = "./ios/libplatform-media-streams.ios.template_debug.arm64.dylib"
 ios.arm64.single.release = "./ios/libplatform-media-streams.ios.template_release.arm64.dylib"
+
+; Windows — Media Foundation backend (implemented; pending on-device QA).
+windows.x86_64.single.debug = "./windows/libplatform-media-streams.windows.template_debug.x86_64.dll"
+windows.x86_64.single.release = "./windows/libplatform-media-streams.windows.template_release.x86_64.dll"

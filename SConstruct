@@ -78,8 +78,8 @@ if ARGUMENTS.get("target", "") == "avf_tests":
     avf_env = Environment(tools=["default"])
     avf_env.Append(CXXFLAGS=["-std=c++20", "-Wall", "-Wextra", "-fobjc-arc"])
     # Backend sources (#src/core for backend.h), test sources (#tests/core for
-    # the vendored "vendor/doctest.h" include).
-    avf_env.Append(CPPPATH=["#src/core", "#src/backends/avf", "#tests/core"])
+    # the vendored "vendor/doctest.h" include; #tests for "common/clip_matrix.h").
+    avf_env.Append(CPPPATH=["#src/core", "#src/backends/avf", "#tests/core", "#tests"])
     avf_env.Append(FRAMEWORKS=[
         "Foundation",
         "AVFoundation",
@@ -90,6 +90,7 @@ if ARGUMENTS.get("target", "") == "avf_tests":
     avf_sources = [
         "tests/avf/main.mm",
         "tests/avf/test_avf_backend.mm",
+        "tests/avf/test_avf_clip_matrix.mm",
         "src/backends/avf/avf_backend.mm",
     ]
     avf_tests = avf_env.Program("bin/avf_tests", avf_sources)
@@ -117,8 +118,8 @@ if ARGUMENTS.get("target", "") == "mf_tests":
     mf_env = Environment(tools=["default"])
     mf_env.Append(CXXFLAGS=["/std:c++20", "/EHsc"])
     # Backend sources (#src/core for backend.h), test sources (#tests/core for
-    # the vendored "vendor/doctest.h" include).
-    mf_env.Append(CPPPATH=["#src/core", "#src/backends/mf", "#tests/core"])
+    # the vendored "vendor/doctest.h" include; #tests for "common/clip_matrix.h").
+    mf_env.Append(CPPPATH=["#src/core", "#src/backends/mf", "#tests/core", "#tests"])
     mf_env.Append(CPPDEFINES=["UNICODE", "_UNICODE"])
     mf_env.Append(LIBS=[
         "mfplat", "mf", "mfreadwrite", "mfuuid",
@@ -127,6 +128,7 @@ if ARGUMENTS.get("target", "") == "mf_tests":
     mf_sources = [
         "tests/mf/main.cpp",
         "tests/mf/test_mf_backend.cpp",
+        "tests/mf/test_mf_clip_matrix.cpp",
         "src/backends/mf/mf_backend.cpp",
     ]
     mf_tests = mf_env.Program("bin/mf_tests", mf_sources)

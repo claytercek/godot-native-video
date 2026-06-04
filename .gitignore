@@ -56,5 +56,10 @@ CMakeUserPresets.json
 *.db
 .beads-credential-key
 
-# Generated test fixtures (produced by tools/gen_test_media.sh)
-tests/fixtures/
+# Generated test fixtures (produced by tools/gen_test_media.sh).
+# Ignore the contents (not the directory itself, so the matrix subtree below can
+# be re-included — git won't descend into a fully-ignored directory).
+tests/fixtures/*
+# ...but DO track the curated real-clip matrix: its manifest (checked in) and
+# the LFS-stored clips. The synthetic per-frame marker clips stay ignored.
+!tests/fixtures/matrix/

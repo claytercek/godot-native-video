@@ -5,13 +5,17 @@ on:
     branches: ["**"]
     paths:
       - "src/core/**"
-      - "tests/core/**"
+      - "src/backends/**"
+      - "tests/**"
+      - "tools/**"
       - "SConstruct"
       - ".github/workflows/core-tests.yml"
   pull_request:
     paths:
       - "src/core/**"
-      - "tests/core/**"
+      - "src/backends/**"
+      - "tests/**"
+      - "tools/**"
       - "SConstruct"
       - ".github/workflows/core-tests.yml"
   workflow_dispatch:
@@ -47,3 +51,58 @@ jobs:
           # Verify the output file exists and is non-empty
           test -s tests/fixtures/synthetic.mp4 && \
             echo "Synthetic clip generated: $(du -sh tests/fixtures/synthetic.mp4 | cut -f1)"
+
+  avf-coverage:
+    name: AVF Backend + Real-Clip Matrix (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No submodules: the AVFoundation backend + its tests have zero
+        # godot-cpp / RenderingDevice dependency.
+
+      - name: Install SCons
+        run: pip3 install scons
+
+      - name: Install ffmpeg
+        # ffmpeg is a TEST-ONLY tool (never a runtime dependency). It regenerates
+        # the real-clip matrix here so CI does not depend on Git LFS bandwidth.
+        run: brew install ffmpeg
+
+      - name: Generate real-clip matrix
+        run: bash tools/gen_clip_matrix.sh
+
+      - name: Build AVF backend tests
+        run: scons target=avf_tests
+
+      - name: Run AVF backend integration + matrix coverage
+        run: ./bin/avf_tests --reporters=console --no-intro
+
+  mf-coverage:
+    name: MF Backend + Real-Clip Matrix (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No submodules: the Media Foundation backend + its tests have zero
+        # godot-cpp / RenderingDevice dependency.
+
+      - name: Install SCons
+        run: pip3 install scons
+
+      - name: Install ffmpeg
+        # Test-only tool; regenerates the matrix so CI does not depend on LFS.
+        run: choco install ffmpeg -y
+
+      - name: Generate real-clip matrix
+        shell: bash
+        run: bash tools/gen_clip_matrix.sh
+
+      - name: Build MF backend tests
+        # Uses the MSVC toolchain provided by the windows runner.
+        run: scons target=mf_tests platform=windows
+
+      - name: Run MF backend integration + matrix coverage
+        run: bin\mf_tests.exe --reporters=console --no-intro
