@@ -43,6 +43,8 @@ public:
 	int video_height() const override;
 	int audio_channel_count() const override;
 	int audio_sample_rate() const override;
+	int audio_track_count() const override;
+	core::AudioTrackInfo audio_track_info(int index) const override;
 
 	bool seek(double pts_seconds) override;
 	std::optional<core::VideoFrame> next_video_frame() override;

@@ -8,6 +8,22 @@
 		Drop a recognised clip ([code].mp4[/code], [code].mov[/code], [code].m4v[/code]) onto a stock [VideoStreamPlayer] to play it. Requires Godot 4.4+ and a [b]Forward+[/b] or [b]Mobile[/b] renderer (RenderingDevice); the Compatibility/OpenGL renderer is not supported.
 		The v1 decode scope covers H.264 and HEVC (Main/Main10) video, MP4/MOV containers, NV12 / x420 / BT.709 / BT.2020 / PQ / HLG, and AAC stereo audio. 10-bit sources negotiate a matching 10-bit decoder output — [code]x420[/code] biplanar on macOS, [code]P010[/code] on Windows — for full precision; the conversion shader normalises 10-bit payloads in 16-bit GPU words. On Windows, the default CPU-Copy Import Path (stock Vulkan driver) reaches the GPU via a readback rather than the zero-copy import macOS uses. PQ/HLG clips tone-map to watchable SDR by default, or output scene-linear HDR when the stream's output mode is set to HDR. VP9/AV1 and multi-track audio are not in scope.
 	</description>
+	<methods>
+		<method name="get_audio_tracks">
+			<return type="Array" />
+			<description>
+				Returns an [Array] of [Dictionary] objects describing the clip's audio tracks. Each dictionary contains the following string keys:
+				[code]language[/code] — BCP 47 language tag (may be empty),
+				[code]name[/code] — human-readable display name (may be empty),
+				[code]channels[/code] — number of audio channels (int),
+				[code]sample_rate[/code] — sample rate in Hz (int),
+				[code]default[/code] — whether this is the container's default track (bool).
+				Array position corresponds to the track index accepted by [code]VideoStreamPlayer.audio_track[/code].
+				The probe is lazy: the clip is opened on the first call and the result is cached for subsequent queries.
+				Call before [code]play()[/code] to enumerate available tracks and select one via [code]audio_track[/code].
+			</description>
+		</method>
+	</methods>
 	<tutorials>
 	</tutorials>
 	<methods>

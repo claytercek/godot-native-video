@@ -7,6 +7,11 @@
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/object.hpp> // ObjectDB::get_instance
+#include <godot_cpp/classes/project_settings.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
+
+#include "../core/backend.h"
+#include "backend_factory.h"
 
 using namespace godot;
 
@@ -18,6 +23,11 @@ void PlatformVideoStream::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_output_mode"), &PlatformVideoStream::get_output_mode);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "output_mode", PROPERTY_HINT_ENUM, "SDR,HDR"),
 			"set_output_mode", "get_output_mode");
+
+	// Expose the audio-track probe so GDScript can enumerate tracks before
+	// playback. Returns an Array of Dictionaries with per-track metadata;
+	// array position is the track index for VideoStreamPlayer.audio_track.
+	ClassDB::bind_method(D_METHOD("get_audio_tracks"), &PlatformVideoStream::_get_audio_tracks);
 }
 
 bool PlatformVideoStream::hdr_decode_supported() {
@@ -69,6 +79,45 @@ void PlatformVideoStream::set_output_mode(int mode) {
 
 int PlatformVideoStream::get_output_mode() const {
 	return output_mode_;
+}
+
+Array PlatformVideoStream::_get_audio_tracks() {
+	if (!_cached_audio_tracks.is_empty()) {
+		return _cached_audio_tracks;
+	}
+
+	// Lazy probe: open the clip briefly to read audio track metadata, then
+	// close the backend. The result is cached so subsequent queries are free
+	// and the probe only happens on first access.
+	std::unique_ptr<core::Backend> backend = platform_media::make_backend();
+
+	String os_path = ProjectSettings::get_singleton()->globalize_path(get_file());
+	const std::string utf8 = os_path.utf8().get_data();
+
+	if (!backend->open(utf8)) {
+		// Return an empty array on failure (caller checks is_empty()).
+		_cached_audio_tracks = Array();
+		return _cached_audio_tracks;
+	}
+
+	const int count = backend->audio_track_count();
+	Array tracks;
+	tracks.resize(count);
+
+	for (int i = 0; i < count; ++i) {
+		const core::AudioTrackInfo info = backend->audio_track_info(i);
+		Dictionary dict;
+		dict["language"] = String(info.language.c_str());
+		dict["name"] = String(info.name.c_str());
+		dict["channels"] = info.channels;
+		dict["sample_rate"] = info.sample_rate;
+		dict["default"] = info.is_default;
+		tracks[i] = dict;
+	}
+
+	backend->close();
+	_cached_audio_tracks = tracks;
+	return _cached_audio_tracks;
 }
 
 Ref<VideoStreamPlayback> PlatformVideoStream::_instantiate_playback() {

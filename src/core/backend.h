@@ -128,6 +128,19 @@ struct VideoFrame {
 };
 
 // -----------------------------------------------------------------------
+// AudioTrackInfo — per-track metadata returned by audio_track_info().
+// Array position is the index used by the stock VideoStreamPlayer
+// audio_track property.
+// -----------------------------------------------------------------------
+struct AudioTrackInfo {
+	std::string language;	// BCP 47 language tag, may be empty
+	std::string name;	// Human-readable display name, may be empty
+	int channels = 0;
+	int sample_rate = 0;
+	bool is_default = false; // Container's default track flag
+};
+
+// -----------------------------------------------------------------------
 // AudioChunk — one decoded audio packet returned from the Backend.
 // -----------------------------------------------------------------------
 struct AudioChunk {
@@ -180,6 +193,17 @@ public:
 	// Returns the negotiated colorimetry for the stream as a whole.
 	// The per-frame VideoFrame::color field carries the per-sample metadata.
 	virtual Colorimetry colorimetry() const { return Colorimetry::bt709_defaults(); }
+
+	// --- Audio track enumeration (valid after a successful open) ---
+
+	// Number of audio tracks in the media. Returns 0 when no audio is present.
+	// The default implementation returns 1 when audio_channel_count() > 0,
+	// else 0 (single-track compat).
+	virtual int audio_track_count() const;
+
+	// Per-track metadata. Index must be in [0, audio_track_count()); behaviour
+	// is undefined for an out-of-range index.
+	virtual AudioTrackInfo audio_track_info(int index) const;
 
 	// --- Decode pump ---
 

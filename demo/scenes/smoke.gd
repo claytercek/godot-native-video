@@ -21,10 +21,14 @@ extends Control
 #   (player.stream.set_output_mode), which forwards to the live playback.
 #   Stock Godot 4.4/4.5 has no VideoStreamPlayer.get_stream_playback(), so the
 #   playback object is only used opportunistically for richer color info.
+#
+# Additionally enumerates audio tracks from the stream resource and displays
+# their metadata (language, name, channel count, sample rate, default flag).
 
 @onready var player: VideoStreamPlayer = $VideoStreamPlayer
 @onready var status: Label = $Status
 @onready var output_mode_btn: Button = $OutputModeButton
+@onready var track_list: Label = $TrackList
 
 # Point this at any .mp4/.mov/.m4v the OS can decode. The default is the
 # synthetic fixture; copy it into the demo project's res:// to use res://.
@@ -88,6 +92,9 @@ func _load_clip(path: String) -> void:
 	if player.has_method("get_stream_playback"):
 		playback = player.get_stream_playback()
 
+	# Query audio track list before playback begins.
+	display_tracks(stream)
+
 
 func _process(_delta: float) -> void:
 	if player.stream != null and player.is_playing():
@@ -111,6 +118,34 @@ func _process(_delta: float) -> void:
 
 func _toggle_unavailable_msg() -> String:
 	return "Output Mode toggle unavailable: stream is %s, which does not expose set_output_mode" % player.stream.get_class()
+
+
+func display_tracks(stream) -> void:
+	var tracks = stream.get_audio_tracks()
+	if tracks == null or tracks.is_empty():
+		if track_list != null:
+			track_list.text = "No audio tracks"
+		return
+	
+	var lines: PackedStringArray = []
+	lines.append("Audio tracks (%d):" % tracks.size())
+	for i in tracks.size():
+		var t: Dictionary = tracks[i]
+		var lang = t.get("language", "")
+		var name = t.get("name", "")
+		var ch = t.get("channels", 0)
+		var rate = t.get("sample_rate", 0)
+		var is_def = t.get("default", false)
+		lines.append("  [%d] %s %s  %dch  %dHz%s" % [
+			i,
+			lang if lang != "" else "??",
+			name if name != "" else "",
+			ch,
+			rate,
+			"  DEFAULT" if is_def else "",
+		])
+	if track_list != null:
+		track_list.text = "\n".join(lines)
 
 
 func _set_status(msg: String) -> void:

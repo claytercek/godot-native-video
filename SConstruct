@@ -78,6 +78,7 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_hdr_color_math.cpp",
         "tests/core/test_colorimetry.cpp",
         "src/core/decode_scheduler.cpp",
+        "src/core/backend.cpp",
     ]
     # The force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG.
     # Define it for the headless core tests so the force-sync test compiles/runs.
@@ -129,6 +130,7 @@ if ARGUMENTS.get("target", "") == "avf_tests":
         "tests/avf/test_avf_backend.mm",
         "tests/avf/test_avf_clip_matrix.mm",
         "src/backends/avf/avf_backend.mm",
+        "src/core/backend.cpp",
     ]
     avf_tests = avf_env.Program("bin/avf_tests", avf_sources)
     Default(avf_tests)
@@ -165,6 +167,7 @@ if ARGUMENTS.get("target", "") == "mf_tests":
         "tests/mf/test_mf_backend.cpp",
         "tests/mf/test_mf_clip_matrix.cpp",
         "src/backends/mf/mf_backend.cpp",
+        "src/core/backend.cpp",
     ]
     mf_tests = mf_env.Program("bin/mf_tests", mf_sources)
     Default(mf_tests)

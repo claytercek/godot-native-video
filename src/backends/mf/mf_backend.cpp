@@ -49,6 +49,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 // MFTIME / LONGLONG sample times are in 100-nanosecond units (10^7 per second),
@@ -178,6 +179,17 @@ public:
 	bool com_initialized = false;
 	bool mf_started = false;
 
+	// Per-track audio metadata. Populated by configure_video_stream()
+	// during the initial stream scan.
+	struct TrackMeta {
+		std::string language;
+		std::string name;
+		int channels = 0;
+		int sample_rate = 0;
+		bool is_default = false;
+	};
+	std::vector<TrackMeta> audio_tracks;
+
 	// Backing store for the most recent decoded audio chunk. core::AudioChunk
 	// returns a borrowed const float*, so the buffer must outlive the returned
 	// chunk; it stays valid until the next next_audio_chunk() call.
@@ -278,8 +290,12 @@ bool MfBackend::Impl::create_reader() {
 // 10-bit HEVC Main10 sources. We select the first video stream, deselect
 // everything, then re-select the streams we want, exactly like the AVF reader
 // picks one track per type.
+//
+// During the initial stream scan we also enumerate all audio stream indices
+// and collect per-track metadata (channel count, sample rate, language).
 bool MfBackend::Impl::configure_video_stream() {
 	// Find the first video stream by walking native media types.
+	audio_tracks.clear();
 	for (DWORD i = 0;; ++i) {
 		ComPtr<IMFMediaType> native;
 		HRESULT hr = reader->GetNativeMediaType(i, 0, native.put());
@@ -300,8 +316,24 @@ bool MfBackend::Impl::configure_video_stream() {
 			// would always see the unspecified defaults.
 			read_colorimetry(native.get());
 			color_.bit_depth = detect_bit_depth(native.get());
-		} else if (major == MFMediaType_Audio && audio_stream_index < 0) {
-			audio_stream_index = static_cast<int>(i);
+		} else if (major == MFMediaType_Audio) {
+			// Collect per-track metadata from the native audio media type.
+			TrackMeta meta;
+			UINT32 ch = 0, rate = 0;
+			native->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch);
+			native->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
+			meta.channels = static_cast<int>(ch);
+			meta.sample_rate = static_cast<int>(rate);
+			meta.is_default = audio_tracks.empty(); // first track is default
+			// MF stream language (MF_SD_LANGUAGE) is available from the
+			// stream descriptor (presentation descriptor), but that requires
+			// extra IMFMediaSource queries beyond the source reader. We skip
+			// language/name for MF in v1; this is consistent with the
+			// single-track legacy fields below.
+			audio_tracks.push_back(meta);
+			if (audio_stream_index < 0) {
+				audio_stream_index = static_cast<int>(i);
+			}
 		}
 	}
 
@@ -514,6 +546,23 @@ int MfBackend::audio_channel_count() const {
 }
 int MfBackend::audio_sample_rate() const {
 	return impl_ ? impl_->audio_rate : 0;
+}
+int MfBackend::audio_track_count() const {
+	return impl_ ? static_cast<int>(impl_->audio_tracks.size()) : 0;
+}
+core::AudioTrackInfo MfBackend::audio_track_info(int index) const {
+	if (!impl_ || index < 0 ||
+			static_cast<size_t>(index) >= impl_->audio_tracks.size()) {
+		return {};
+	}
+	const auto &t = impl_->audio_tracks[static_cast<size_t>(index)];
+	core::AudioTrackInfo info;
+	info.language = t.language;
+	info.name = t.name;
+	info.channels = t.channels;
+	info.sample_rate = t.sample_rate;
+	info.is_default = t.is_default;
+	return info;
 }
 bool MfBackend::had_error() const {
 	return impl_ && impl_->error;
