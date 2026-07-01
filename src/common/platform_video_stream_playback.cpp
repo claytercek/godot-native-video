@@ -61,10 +61,34 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 	length_ = backend->duration_seconds();
 	width_ = backend->video_width();
 	height_ = backend->video_height();
-	channels_ = backend->audio_channel_count();
-	sample_rate_ = backend->audio_sample_rate();
-	has_audio_ = channels_ > 0 && sample_rate_ > 0;
 	audio_track_count_ = backend->audio_track_count();
+
+	// --- Canonical Mix Format ---
+	// Compute the maximum channel count across all audio tracks at the clip's
+	// shared sample rate. Godot queries channels/mix-rate exactly once at play
+	// start, so these must be stable for the playback's entire lifetime. The
+	// channel mixer converts each backend chunk's native channel layout to the
+	// canonical format before writing to the audio ring.
+	canonical_channels_ = 0;
+	canonical_sample_rate_ = 0;
+	has_audio_ = false;
+	for (int i = 0; i < audio_track_count_; ++i) {
+		const core::AudioTrackInfo info = backend->audio_track_info(i);
+		if (info.channels > canonical_channels_) {
+			canonical_channels_ = info.channels;
+		}
+		if (info.sample_rate > canonical_sample_rate_) {
+			canonical_sample_rate_ = info.sample_rate;
+		}
+		if (info.channels > 0 && info.sample_rate > 0) {
+			has_audio_ = true;
+		}
+	}
+	// Clamp to the max we know how to mix; larger channel counts are passed
+	// through unmixed (the ring still fills and plays).
+	if (canonical_channels_ > core::kMaxMixSourceChannels) {
+		canonical_channels_ = core::kMaxMixSourceChannels;
+	}
 
 	// Hand the Backend to the process-wide shared decode pool. From here a pool
 	// worker decodes video ahead into stream_'s queue; this object never touches
@@ -80,10 +104,10 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 		if (AudioServer *as = AudioServer::get_singleton()) {
 			latency = as->get_output_latency();
 		}
-		audio_clock_ = std::make_unique<core::AudioMasterClock>(sample_rate_, latency);
+		audio_clock_ = std::make_unique<core::AudioMasterClock>(canonical_sample_rate_, latency);
 		// ~0.5 s of head-room so brief decode jitter never underruns the mixer.
-		const size_t ring_frames = static_cast<size_t>(sample_rate_) / 2;
-		audio_ring_ = std::make_unique<core::AudioRing>(channels_, ring_frames);
+		const size_t ring_frames = static_cast<size_t>(canonical_sample_rate_) / 2;
+		audio_ring_ = std::make_unique<core::AudioRing>(canonical_channels_, ring_frames);
 	} else {
 		// No audio track: fall back to a monotonic clock advanced by the render
 		// delta so silent clips still play at the correct rate.
@@ -128,14 +152,23 @@ void PlatformVideoStreamPlayback::fill_audio() {
 			if (chunk->samples == nullptr || chunk->frame_count <= 0) {
 				continue;
 			}
-			// AudioRing's channel count is fixed at the clip's; backend chunks match.
-			audio_ring_->write(chunk->samples, static_cast<size_t>(chunk->frame_count));
+			// Mix from the backend's native channel layout to the canonical format.
+			// The channel mixer is a no-op (memcpy) when channel counts already match.
+			const int nf = chunk->frame_count;
+			const int sc = chunk->channel_count;
+			const int dc = canonical_channels_;
+			const size_t needed = static_cast<size_t>(nf) * static_cast<size_t>(dc);
+			if (mix_scratch_.size() < needed) {
+				mix_scratch_.resize(needed);
+			}
+			core::mix_channels(chunk->samples, sc, mix_scratch_.data(), dc, nf);
+			audio_ring_->write(mix_scratch_.data(), static_cast<size_t>(nf));
 		}
 	});
 }
 
 bool PlatformVideoStreamPlayback::drive_audio() {
-	if (!audio_ring_ || !audio_clock_ || channels_ <= 0) {
+	if (!audio_ring_ || !audio_clock_ || canonical_channels_ <= 0) {
 		return false;
 	}
 
@@ -144,7 +177,7 @@ bool PlatformVideoStreamPlayback::drive_audio() {
 	// with no silence padding; only a genuine underrun pads with zeros.
 	constexpr int kMaxMixFramesPerTick = 4096; // ~85 ms @ 48k — generous head-room
 
-	const int ch = channels_;
+	const int ch = canonical_channels_;
 	const size_t available = audio_ring_->available_frames();
 	// On underrun (available == 0) still offer a small block of silence so the
 	// AudioServer keeps its buffer fed and playback doesn't glitch; the clock is
@@ -440,15 +473,19 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 }
 
 int PlatformVideoStreamPlayback::_get_channels() const {
-	// Real backend channel count (cached at load). Godot sizes its mix buffer
-	// from this, so it must match the PCM we feed mix_audio().
-	return channels_;
+	// Canonical Mix Format channel count (maximum across all audio tracks,
+	// computed at load). Godot sizes its mix buffer from this and queries it
+	// exactly once at play start, so it is stable for the playback's lifetime.
+	// The channel mixer converts each backend chunk's native layout to this
+	// count before writing to the audio ring.
+	return canonical_channels_;
 }
 
 int PlatformVideoStreamPlayback::_get_mix_rate() const {
-	// Real backend sample rate (cached at load). The AudioServer resamples from
-	// this to the device rate; the master clock uses it for samples->seconds.
-	return sample_rate_;
+	// Canonical Mix Format sample rate (the clip's shared sample rate across
+	// all audio tracks). The AudioServer resamples from this to the device
+	// rate; the master clock uses it for samples->seconds.
+	return canonical_sample_rate_;
 }
 
 Dictionary PlatformVideoStreamPlayback::get_color_info() const {

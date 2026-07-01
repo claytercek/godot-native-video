@@ -70,6 +70,8 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_retire_ring.cpp",
         "tests/core/test_present_selector.cpp",
         "tests/core/test_audio_ring.cpp",
+        "tests/core/test_channel_mixer.cpp",
+        "tests/core/test_marker_clip.cpp",
         "tests/core/test_av_drift.cpp",
         "tests/core/test_audio_eos_fallback.cpp",
         "tests/core/test_decode_scheduler.cpp",
