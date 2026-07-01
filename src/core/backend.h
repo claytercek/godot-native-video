@@ -170,6 +170,9 @@ struct AudioChunk {
 // -----------------------------------------------------------------------
 class Backend {
 public:
+	// Namespace for the default-track fallback sentinel used by
+	// select_audio_track when no valid selection has been made.
+	static constexpr int kDefaultAudioTrack = 0;
 	virtual ~Backend() = default;
 
 	// --- Lifecycle ---
@@ -204,6 +207,12 @@ public:
 	// Per-track metadata. Index must be in [0, audio_track_count()); behaviour
 	// is undefined for an out-of-range index.
 	virtual AudioTrackInfo audio_track_info(int index) const;
+
+	// Select which audio track to decode. The index must be in
+	// [0, audio_track_count()); out-of-range indices are clamped to the
+	// nearest valid value. The selection takes effect on the next seek() or
+	// open(). The default implementation is a no-op (single-track compat).
+	virtual void select_audio_track(int index);
 
 	// --- Decode pump ---
 

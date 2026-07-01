@@ -164,6 +164,11 @@ private:
 	// object only tracks audio EOS for the end-of-playback condition.
 	bool audio_eos_ = false; // audio end-of-stream
 	bool has_audio_ = false; // clip carries an audio track -> audio is master
+	// Audio track selection. Set before play via _set_audio_track(). A value
+	// of 0 (the default) selects the first track; values >= audio_track_count_
+	// are clamped to the default by the backend.
+	int audio_track_selection_ = 0;
+	int audio_track_count_ = 0; // cached from backend at load time
 	double length_ = 0.0;
 	double position_ = 0.0; // PTS of the most recently presented frame
 

@@ -25,6 +25,23 @@ offset_bottom = 200.0
 mouse_filter = 2
 text = ""
 
+[node name="TrackSelector" type="OptionButton" parent="."]
+layout_mode = 0
+offset_left = 10.0
+offset_top = 210.0
+offset_right = 400.0
+offset_bottom = 240.0
+text = "Select audio track..."
+item_count = 0
+
+[node name="PlayButton" type="Button" parent="."]
+layout_mode = 0
+offset_left = 410.0
+offset_top = 210.0
+offset_right = 510.0
+offset_bottom = 240.0
+text = "Play"
+
 [node name="Status" type="Label" parent="."]
 layout_mode = 1
 anchors_preset = 2

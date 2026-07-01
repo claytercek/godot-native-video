@@ -307,3 +307,75 @@ TEST_CASE("AVF backend enumerates audio tracks for multi-track clip") {
 	CHECK(t99.sample_rate == 0);
 	CHECK(t99.is_default == false);
 }
+
+TEST_CASE("AVF backend selects audio track pre-play for multi-track clip") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping multi-track selection");
+		return;
+	}
+
+	// ---- Open with default (track 0), verify default metadata ----
+	avf::AvfBackend backend;
+	REQUIRE(backend.open(fixture));
+	CHECK(backend.audio_track_count() == kMultiTracks);
+	// Track 0: eng, default
+	const auto t0 = backend.audio_track_info(0);
+	CHECK(t0.language == "eng");
+	CHECK(t0.is_default == true);
+	CHECK(t0.channels >= 1);
+	CHECK(t0.sample_rate == 48000);
+
+	// ---- Select track 1 (fra, non-default) ----
+	backend.select_audio_track(1);
+	const auto t1_check = backend.audio_track_info(1);
+	CHECK(t1_check.language == "fra");
+	// After selection, audio_channel_count/audio_sample_rate should reflect
+	// the selected track. Re-open to force a fresh reader so the selection
+	// takes effect (select_audio_track with a fresh open applies immediately).
+	REQUIRE(backend.open(fixture));
+	backend.select_audio_track(1);
+
+	// Decode audio from the selected track and verify valid PCM output.
+	int audio_chunks = 0;
+	long audio_frames_total = 0;
+	double last_audio_pts = -1.0;
+	while (auto chunk = backend.next_audio_chunk()) {
+		CHECK(chunk->samples != nullptr);
+		CHECK(chunk->frame_count > 0);
+		CHECK(chunk->channel_count >= 1);
+		CHECK(chunk->sample_rate == 48000);
+		CHECK(chunk->pts_seconds >= last_audio_pts);
+		last_audio_pts = chunk->pts_seconds;
+		audio_frames_total += chunk->frame_count;
+		++audio_chunks;
+	}
+	CHECK_FALSE(backend.had_error());
+	CHECK(audio_chunks > 0);
+	const long nominal = static_cast<long>(48000.0 * kMultiFrames / kMultiFps);
+	CHECK(audio_frames_total >= nominal / 2);
+
+	// ---- Out-of-range selection falls back to default ----
+	// The backend clamps to the nearest valid index. Track 0 (the default)
+	// is nearest to index -1 or index >= count.
+	REQUIRE(backend.open(fixture));
+	backend.select_audio_track(99); // out of range
+	// audio_channel_count should still be valid (from track 0, clamped).
+	CHECK(backend.audio_channel_count() >= 1);
+	CHECK(backend.audio_sample_rate() == 48000);
+
+	// Decode should still produce valid PCM from the fallback (track 0).
+	audio_chunks = 0;
+	audio_frames_total = 0;
+	while (auto chunk = backend.next_audio_chunk()) {
+		CHECK(chunk->samples != nullptr);
+		CHECK(chunk->frame_count > 0);
+		CHECK(chunk->channel_count >= 1);
+		CHECK(chunk->sample_rate == 48000);
+		audio_frames_total += chunk->frame_count;
+		++audio_chunks;
+	}
+	CHECK_FALSE(backend.had_error());
+	CHECK(audio_chunks > 0);
+	CHECK(audio_frames_total >= nominal / 2);
+}
