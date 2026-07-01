@@ -25,4 +25,11 @@ void Backend::select_audio_track(int /*index*/) {
 	// only one audio track to decode. Multi-track backends override this.
 }
 
+bool Backend::reselect_audio_track(int /*index*/, double /*pts_seconds*/) {
+	// Single-track backends have nothing to reselect; multi-track backends
+	// (AVFoundation, MF) override this to tear down and rebuild only the
+	// audio decode path.
+	return false;
+}
+
 } // namespace core

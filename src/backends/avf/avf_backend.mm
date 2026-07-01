@@ -74,6 +74,13 @@ public:
 
 	bool error = false;
 
+	// Dedicated audio-only reader for mid-decode track reselect.
+	// Non-nil only after reselect_audio_track(); nil after open()/seek().
+	// The combined reader (reader) continues providing video undisturbed;
+	// next_audio_chunk() reads from audio_reader when it is non-nil.
+	AVAssetReader *audio_reader = nil;
+	AVAssetReaderTrackOutput *audio_only_out = nil;
+
 	// Backing store for the most recent decoded audio chunk. core::AudioChunk
 	// returns a borrowed `const float*`, so the buffer must outlive the
 	// returned chunk; it stays valid until the next next_audio_chunk() call.
@@ -83,7 +90,35 @@ public:
 	// both open() (start 0) and seek(). Returns false on failure.
 	bool build_reader(double start_time);
 
+	// Build an audio-only AVAssetReader for `track_index` (position in
+	// audio_tracks / all_audio_tracks) starting from the keyframe at or before
+	// `start_time`. Used by reselect_audio_track() to create a dedicated audio
+	// reader without disturbing the video reader. Returns false on failure.
+	bool build_audio_reader(int track_index, double start_time);
+
+	// Build a video-only AVAssetReader (no audio output) starting from
+	// `start_time`. Used by reselect_audio_track() after tearing down the
+	// combined reader so the video reader does not have an unconsumed audio
+	// output that blocks decode. Returns false on failure.
+	bool build_video_reader(double start_time);
+
+	void teardown_audio_reader() {
+		if (audio_reader) {
+			[audio_reader cancelReading];
+		}
+		audio_reader = nil;
+		audio_only_out = nil;
+	}
+
 	void teardown() {
+		teardown_audio_reader();
+		teardown_combined();
+	}
+
+	// Tear down ONLY the combined reader, leaving the dedicated audio-only
+	// reader (audio_reader) intact. Used during reselect_audio_track() so
+	// the combined reader's audio output does not block video decode.
+	void teardown_combined() {
 		if (reader) {
 			[reader cancelReading];
 		}
@@ -284,6 +319,90 @@ bool AvfBackend::Impl::build_reader(double start_time) {
 	return true;
 }
 
+bool AvfBackend::Impl::build_audio_reader(int track_index, double start_time) {
+	// Tear down any prior audio-only reader first.
+	teardown_audio_reader();
+	error = false;
+
+	if (track_index < 0 || !all_audio_tracks ||
+			track_index >= static_cast<int>(all_audio_tracks.count)) {
+		return false;
+	}
+
+	AVAssetTrack *use_audio = all_audio_tracks[track_index];
+	if (!use_audio) {
+		return false;
+	}
+
+	NSError *err = nil;
+	AVAssetReader *ar = [AVAssetReader assetReaderWithAsset:asset error:&err];
+	if (!ar || err) {
+		error = true;
+		return false;
+	}
+
+	// Restrict to [start_time, duration] so we start at the keyframe at or
+	// before the requested position, exactly like build_reader() does for
+	// video+audio on seek. CMTimePositiveInfinity means "read to end."
+	CMTime start = CMTimeMakeWithSeconds(start_time, 600);
+	ar.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
+
+	AVAssetReaderTrackOutput *ao = make_audio_output(use_audio);
+	ao.alwaysCopiesSampleData = NO;
+	if (![ar canAddOutput:ao]) {
+		return false;
+	}
+	[ar addOutput:ao];
+
+	if (![ar startReading]) {
+		error = true;
+		return false;
+	}
+	audio_reader = ar;
+	audio_only_out = ao;
+	return true;
+}
+
+bool AvfBackend::Impl::build_video_reader(double start_time) {
+	// Tear down only the combined reader; leave the dedicated audio-only
+	// reader intact if it exists.
+	teardown_combined();
+
+	if (!video_track) {
+		return false;
+	}
+
+	NSError *err = nil;
+	AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
+	if (!r || err) {
+		error = true;
+		return false;
+	}
+
+	if (start_time > 0.0) {
+		CMTime start = CMTimeMakeWithSeconds(start_time, 600);
+		r.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
+	}
+
+	AVAssetReaderTrackOutput *vo = make_video_output(video_track);
+	vo.alwaysCopiesSampleData = NO;
+	if (![r canAddOutput:vo]) {
+		error = true;
+		return false;
+	}
+	[r addOutput:vo];
+
+	if (![r startReading]) {
+		error = true;
+		return false;
+	}
+	reader = r;
+	video_out = vo;
+	// audio_out stays nil — this reader has no audio output, so its
+	// buffer cannot back up and block video decode.
+	return true;
+}
+
 // -----------------------------------------------------------------------
 // AvfBackend
 // -----------------------------------------------------------------------
@@ -458,6 +577,8 @@ void AvfBackend::close() {
 		impl_->audio_track = nil;
 		impl_->all_audio_tracks = nil;
 		impl_->audio_tracks.clear();
+		impl_->audio_reader = nil;
+		impl_->audio_only_out = nil;
 	}
 }
 
@@ -506,6 +627,38 @@ void AvfBackend::select_audio_track(int index) {
 	impl_->apply_track_selection(clamped);
 }
 
+bool AvfBackend::reselect_audio_track(int index, double pts_seconds) {
+	if (!impl_ || !impl_->asset) {
+		return false;
+	}
+	const int count = static_cast<int>(impl_->audio_tracks.size());
+	if (count == 0) {
+		return false; // no audio tracks to select
+	}
+	// Clamp out-of-range to the nearest valid index.
+	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
+	const double target = pts_seconds < 0.0 ? 0.0 : pts_seconds;
+
+	@autoreleasepool {
+		// Step 1: build a dedicated audio-only reader for the new track.
+		if (!impl_->build_audio_reader(clamped, target)) {
+			return false;
+		}
+
+		// Step 2: tear down the combined reader and rebuild it as video-only
+		// starting from 0 so the first keyframe anchors the new reader. Any
+		// previously-decoded frames are repeated after the rebuild, but the
+		// key invariant holds: video decode keeps flowing uninterrupted.
+		if (!impl_->build_video_reader(0.0)) {
+			impl_->teardown_audio_reader();
+			return false;
+		}
+
+		impl_->apply_track_selection(clamped);
+		return true;
+	}
+}
+
 bool AvfBackend::had_error() const {
 	return impl_ && impl_->error;
 }
@@ -522,6 +675,9 @@ bool AvfBackend::seek(double pts_seconds) {
 		if (pts_seconds < 0.0) {
 			pts_seconds = 0.0;
 		}
+		// Tear down any dedicated audio-only reader so seek builds a fresh
+		// combined reader with both video and the selected audio track.
+		impl_->teardown_audio_reader();
 		return impl_->build_reader(pts_seconds);
 	}
 }
@@ -530,11 +686,9 @@ std::optional<core::VideoFrame> AvfBackend::next_video_frame() {
 	if (!impl_ || !impl_->reader || !impl_->video_out) {
 		return std::nullopt;
 	}
-
 	@autoreleasepool {
 		CMSampleBufferRef sample = [impl_->video_out copyNextSampleBuffer];
 		if (!sample) {
-			// Clean EOS unless the reader reported a failure.
 			if (impl_->reader.status == AVAssetReaderStatusFailed) {
 				impl_->error = true;
 			}
@@ -585,14 +739,22 @@ std::optional<core::VideoFrame> AvfBackend::next_video_frame() {
 }
 
 std::optional<core::AudioChunk> AvfBackend::next_audio_chunk() {
-	if (!impl_ || !impl_->reader || !impl_->audio_out) {
+	if (!impl_) {
+		return std::nullopt;
+	}
+
+	// When a dedicated audio-only reader is active (from reselect_audio_track),
+	// read from it. Otherwise read from the combined reader's audio output.
+	AVAssetReader *active_reader = impl_->audio_reader ? impl_->audio_reader : impl_->reader;
+	AVAssetReaderTrackOutput *active_out = impl_->audio_reader ? impl_->audio_only_out : impl_->audio_out;
+	if (!active_reader || !active_out) {
 		return std::nullopt;
 	}
 
 	@autoreleasepool {
-		CMSampleBufferRef sample = [impl_->audio_out copyNextSampleBuffer];
+		CMSampleBufferRef sample = [active_out copyNextSampleBuffer];
 		if (!sample) {
-			if (impl_->reader.status == AVAssetReaderStatusFailed) {
+			if (active_reader.status == AVAssetReaderStatusFailed) {
 				impl_->error = true;
 			}
 			return std::nullopt;

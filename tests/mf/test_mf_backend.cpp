@@ -385,4 +385,211 @@ TEST_CASE("MF backend selects audio track pre-play for multi-track clip") {
 	CHECK(audio_frames_total >= nominal / 2);
 }
 
+TEST_CASE("MF backend reselects audio track mid-decode without disturbing video") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping reselect test");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+	CHECK(backend.audio_track_count() == kMultiTracks);
+
+	// --- Decode some video + audio frames from track 0 ---
+	double last_video_pts = -1.0;
+	for (int i = 0; i < 4; ++i) {
+		auto frame = backend.next_video_frame();
+		REQUIRE(frame.has_value());
+		CHECK(frame->pts_seconds >= last_video_pts);
+		last_video_pts = frame->pts_seconds;
+		frame->release();
+	}
+
+	int audio_pre = 0;
+	double last_audio_pts = -1.0;
+	while (auto chunk = backend.next_audio_chunk()) {
+		CHECK(chunk->pts_seconds >= last_audio_pts);
+		last_audio_pts = chunk->pts_seconds;
+		++audio_pre;
+		if (audio_pre >= 3) {
+			break;
+		}
+	}
+	CHECK(audio_pre >= 3);
+	CHECK_FALSE(backend.had_error());
+
+	// --- Reselect to track 1 at current position ---
+	double reselect_time = last_video_pts;
+	REQUIRE(backend.reselect_audio_track(1, reselect_time));
+
+	// --- Video keeps flowing after reselect ---
+	int video_post = 0;
+	last_video_pts = -1.0;
+	for (int i = 0; i < 4; ++i) {
+		auto frame = backend.next_video_frame();
+		REQUIRE(frame.has_value());
+		CHECK(frame->pixel_format == core::PixelFormat::NV12);
+		CHECK(frame->native_handle != nullptr);
+		CHECK(frame->pts_seconds >= last_video_pts);
+		last_video_pts = frame->pts_seconds;
+		frame->release();
+		++video_post;
+	}
+	CHECK(video_post >= 3);
+
+	// --- Audio from the new track ---
+	int audio_post = 0;
+	last_audio_pts = -1.0;
+	while (auto chunk = backend.next_audio_chunk()) {
+		CHECK(chunk->samples != nullptr);
+		CHECK(chunk->frame_count > 0);
+		CHECK(chunk->channel_count >= 1);
+		CHECK(chunk->sample_rate == 48000);
+		CHECK(chunk->pts_seconds >= last_audio_pts);
+		last_audio_pts = chunk->pts_seconds;
+		++audio_post;
+		if (audio_post >= 3) {
+			break;
+		}
+	}
+	CHECK(audio_post >= 3);
+	CHECK_FALSE(backend.had_error());
+
+	// --- Drain remaining video + audio to verify no errors ---
+	while (auto frame = backend.next_video_frame()) {
+		CHECK(frame->pts_seconds >= last_video_pts);
+		last_video_pts = frame->pts_seconds;
+		frame->release();
+	}
+	while (auto chunk = backend.next_audio_chunk()) {
+		CHECK(chunk->pts_seconds >= last_audio_pts);
+		last_audio_pts = chunk->pts_seconds;
+	}
+	CHECK_FALSE(backend.had_error());
+}
+
+TEST_CASE("MF backend reselects audio track near end-of-stream") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping end-of-stream reselect test");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	// Drain video to end-of-stream.
+	int video_total = 0;
+	while (auto frame = backend.next_video_frame()) {
+		frame->release();
+		++video_total;
+	}
+	CHECK(video_total >= kMultiFrames - 1);
+	CHECK_FALSE(backend.had_error());
+
+	// Re-open and reselect near end.
+	REQUIRE(backend.open(fixture));
+	const double near_end = static_cast<double>(kMultiFrames) / static_cast<double>(kMultiFps) - 0.5;
+	REQUIRE(backend.seek(near_end));
+
+	// Reselect to track 1 near end-of-stream.
+	REQUIRE(backend.reselect_audio_track(1, near_end));
+
+	// Video still flows after reselect.
+	int video_after = 0;
+	while (auto frame = backend.next_video_frame()) {
+		frame->release();
+		++video_after;
+	}
+	CHECK(video_after >= 1);
+
+	// Audio from the new track.
+	int audio_after = 0;
+	while (auto chunk = backend.next_audio_chunk()) {
+		CHECK(chunk->samples != nullptr);
+		CHECK(chunk->frame_count > 0);
+		++audio_after;
+	}
+	CHECK(audio_after >= 1);
+	CHECK_FALSE(backend.had_error());
+}
+
+TEST_CASE("MF backend reselect to same track is valid") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping same-track reselect test");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	// Decode a few frames.
+	auto frame = backend.next_video_frame();
+	REQUIRE(frame.has_value());
+	frame->release();
+
+	auto chunk = backend.next_audio_chunk();
+	REQUIRE(chunk.has_value());
+
+	// Reselect to the same track at the current position.
+	REQUIRE(backend.reselect_audio_track(0, chunk->pts_seconds));
+
+	// Video still flows.
+	int video_count = 0;
+	while (auto f = backend.next_video_frame()) {
+		f->release();
+		++video_count;
+	}
+	CHECK(video_count >= 1);
+
+	// Audio from the reselected (same) track.
+	int audio_count = 0;
+	while (auto ac = backend.next_audio_chunk()) {
+		CHECK(ac->samples != nullptr);
+		CHECK(ac->frame_count > 0);
+		++audio_count;
+	}
+	CHECK(audio_count >= 1);
+	CHECK_FALSE(backend.had_error());
+}
+
+TEST_CASE("MF backend reselect clamps out-of-range index") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping reselect clamp test");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	// Decode one video frame.
+	auto frame = backend.next_video_frame();
+	REQUIRE(frame.has_value());
+	frame->release();
+
+	// Out-of-range index should clamp and succeed.
+	REQUIRE(backend.reselect_audio_track(99, 0.0));
+
+	// Video still flows.
+	int video_count = 0;
+	while (auto f = backend.next_video_frame()) {
+		f->release();
+		++video_count;
+	}
+	CHECK(video_count >= 1);
+	CHECK_FALSE(backend.had_error());
+
+	// Audio from the clamped track (last valid track, kMultiTracks-1).
+	int audio_count = 0;
+	while (auto ac = backend.next_audio_chunk()) {
+		CHECK(ac->samples != nullptr);
+		++audio_count;
+	}
+	CHECK(audio_count >= 1);
+	CHECK_FALSE(backend.had_error());
+}
+
 #endif // _WIN32
