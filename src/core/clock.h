@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 namespace core {
 
@@ -114,6 +115,116 @@ private:
 	int sample_rate_;
 	double latency_seconds_;
 	double accumulated_seconds_;
+	bool paused_;
+};
+
+// -----------------------------------------------------------------------
+// ClockBridge — runtime-switchable master clock.
+//
+// Wraps both an AudioMasterClock and a MonotonicClock, delegating to whichever
+// is currently the active master. Supports audio-to-monotonic handoff and
+// monotonic-to-audio re-anchor, both seeded from the current position so the
+// reported media_time() remains continuous across the switch.
+//
+// The audio side is optional: `audio` may be nullptr for clips with no audio
+// track. A null audio clock means the bridge is permanently monotonic-master
+// (silent clips) — every audio-facing method becomes a safe no-op instead of
+// requiring callers to construct a dummy AudioMasterClock.
+// -----------------------------------------------------------------------
+class ClockBridge final : public Clock {
+public:
+	// `mono` must be non-null. `audio` may be nullptr for a silent clip, in
+	// which case `audio_master` is forced to false regardless of the
+	// requested value — there is no audio clock to be master of.
+	ClockBridge(std::unique_ptr<AudioMasterClock> audio,
+			std::unique_ptr<MonotonicClock> mono,
+			bool audio_master) :
+			audio_(std::move(audio)),
+			mono_(std::move(mono)),
+			audio_master_(audio_ ? audio_master : false),
+			paused_(false) {}
+
+	// --- Clock interface ---
+
+	double media_time() const override {
+		return audio_master_ ? audio_->media_time() : mono_->media_time();
+	}
+
+	void advance(double delta_seconds) override {
+		if (!paused_ && delta_seconds > 0.0) {
+			if (!audio_master_) {
+				mono_->advance(delta_seconds);
+			}
+			// audio-master: advance() is ignored (same as AudioMasterClock).
+		}
+	}
+
+	void set_time(double time_seconds) override {
+		if (audio_) {
+			audio_->set_time(time_seconds);
+		}
+		mono_->set_time(time_seconds);
+	}
+
+	void set_paused(bool paused) override {
+		paused_ = paused;
+		if (audio_) {
+			audio_->set_paused(paused);
+		}
+		mono_->set_paused(paused);
+	}
+
+	bool is_paused() const override { return paused_; }
+
+	// --- Handoff API ---
+
+	// Hand mastership from audio to monotonic. Seeds the monotonic clock at
+	// the audio clock's current media_time() so the position is continuous.
+	// No-op if already monotonic-master.
+	void handoff_to_monotonic() {
+		if (!audio_master_) {
+			return;
+		}
+		mono_->set_time(audio_->media_time());
+		audio_master_ = false;
+	}
+
+	// Re-anchor back to audio master. Sets the audio clock's accumulated time
+	// so that media_time() continues from the monotonic clock's current position
+	// without a backward jump (forward nudge within sub-frame tolerance).
+	// No-op if already audio-master, and no-op when there is no audio clock
+	// (silent clips are permanently monotonic-master).
+	void reanchor_to_audio() {
+		if (audio_master_ || !audio_) {
+			return;
+		}
+		audio_->set_time(mono_->media_time());
+		audio_master_ = true;
+	}
+
+	// True when the audio-master clock is the active source of media_time().
+	bool is_audio_master() const { return audio_master_; }
+
+	// Report audio sample consumption. Delegates to AudioMasterClock when
+	// audio-master; no-op in monotonic mode (audio samples are not consumed
+	// during a gap, so the clock stays honest for re-anchor). Also a no-op
+	// when there is no audio clock — audio_master_ can never be true in that
+	// case, but the explicit guard keeps this method safe on its own terms.
+	void on_audio_mixed(int frame_count) {
+		if (audio_master_ && audio_) {
+			audio_->on_audio_mixed(frame_count);
+		}
+	}
+
+	// Accessors delegated to the inner audio clock. Return zero when there is
+	// no audio clock (silent clip).
+	int sample_rate() const { return audio_ ? audio_->sample_rate() : 0; }
+	double latency_seconds() const { return audio_ ? audio_->latency_seconds() : 0.0; }
+
+private:
+	std::unique_ptr<AudioMasterClock> audio_;
+	std::unique_ptr<MonotonicClock> mono_;
+	bool audio_master_;
 	bool paused_;
 };
 
