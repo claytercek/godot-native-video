@@ -89,6 +89,34 @@ std::string ensure_fixture() {
 	return file_exists(fixture) ? fixture : std::string{};
 }
 
+// Generate a 3-track multi-track fixture on demand. The fixture is a small
+// clip (6 frames at 3 fps) with 3 audio streams at disjoint frequency bands.
+// Kept small so the test is fast; only track-level metadata is probed, not
+// decoded.
+constexpr int kMultiFrames = 6;
+constexpr int kMultiFps = 3;
+constexpr int kMultiTracks = 3;
+
+std::string ensure_multi_track_fixture() {
+	const std::string root = repo_root();
+	const std::string fixture = root + "/tests/fixtures/synthetic_multitrack_avf.mp4";
+	if (file_exists(fixture)) {
+		return fixture;
+	}
+	if (!ffmpeg_available()) {
+		return {};
+	}
+	char cmd[2048];
+	std::snprintf(cmd, sizeof(cmd),
+			"%s/tools/gen_test_media.sh --frames %d --fps %d --output %s --multi-track %d "
+			">/dev/null 2>&1",
+			root.c_str(), kMultiFrames, kMultiFps, fixture.c_str(), kMultiTracks);
+	if (std::system(cmd) != 0) {
+		return {};
+	}
+	return file_exists(fixture) ? fixture : std::string{};
+}
+
 // Mean luma over the interior of the top-left marker block, read from the NV12
 // luma plane (plane 0). We sample the block interior but skip a margin so the
 // black burned-in text and any block-edge antialiasing don't dominate.
@@ -213,4 +241,69 @@ TEST_CASE("AVF backend decodes synthetic clip to NV12 + PCM with monotonic PTS")
 TEST_CASE("AVF backend reports error on a bogus path") {
 	avf::AvfBackend backend;
 	CHECK_FALSE(backend.open("/no/such/file/really_not_here.mp4"));
+}
+
+TEST_CASE("AVF backend enumerates audio tracks for single-track clip") {
+	const std::string fixture = ensure_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed — skipping single-track audio enumeration");
+		return;
+	}
+
+	avf::AvfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	// Single-track clip: count is 1 when audio is present.
+	CHECK(backend.audio_track_count() == 1);
+
+	// Per-track metadata for the single track.
+	const auto info = backend.audio_track_info(0);
+	CHECK(info.channels >= 1);
+	CHECK(info.sample_rate == 48000);
+	CHECK(info.is_default == true);
+	// Language may be set by gen_test_media.sh ('eng') or empty depending
+	// on AVAssetTrack resolution; accept either.
+	CHECK(info.name.empty()); // name is always empty in v1
+}
+
+TEST_CASE("AVF backend enumerates audio tracks for multi-track clip") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed — skipping multi-track audio enumeration");
+		return;
+	}
+
+	avf::AvfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	CHECK(backend.audio_track_count() == kMultiTracks);
+
+	// Track 0: eng, default
+	const auto t0 = backend.audio_track_info(0);
+	// gen_test_media.sh tags track 0 as 'eng'
+	CHECK(t0.language == "eng");
+	CHECK(t0.is_default == true);
+	CHECK(t0.channels >= 1);
+	CHECK(t0.sample_rate == 48000);
+	CHECK(t0.name.empty());
+
+	// Track 1: fra, non-default
+	const auto t1 = backend.audio_track_info(1);
+	CHECK(t1.language == "fra");
+	CHECK(t1.is_default == false);
+	CHECK(t1.channels >= 1);
+	CHECK(t1.sample_rate == 48000);
+
+	// Track 2: deu, non-default
+	const auto t2 = backend.audio_track_info(2);
+	CHECK(t2.language == "deu");
+	CHECK(t2.is_default == false);
+
+	// Out-of-range index returns empty AudioTrackInfo (defined behaviour
+	// in the concrete backend, not UB per the virtual contract).
+	const auto t99 = backend.audio_track_info(99);
+	CHECK(t99.channels == 0);
+	CHECK(t99.language.empty());
+	CHECK(t99.sample_rate == 0);
+	CHECK(t99.is_default == false);
 }

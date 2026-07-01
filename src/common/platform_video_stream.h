@@ -9,7 +9,7 @@
 // PlatformVideoStreamPlayback bound to it.
 //
 // Additionally, the stream exposes a lazy, cached audio-track probe via
-// _get_audio_tracks() so GDScript can query per-track metadata (language,
+// get_audio_tracks() so GDScript can query per-track metadata (language,
 // name, channel count, sample rate, default flag) before playback.
 // -----------------------------------------------------------------------
 
@@ -52,15 +52,17 @@ public:
 	/// VideoToolbox). On other platforms (Windows, Linux) returns false.
 	static bool hdr_decode_supported();
 
-	// Lazy, cached probe of audio track metadata. Returns an Array of
-	// Dictionaries; each Dictionary has string keys:
+	// Lazy, cached probe of audio track metadata. Probes exactly once; the
+	// result (including an empty Array for a failed probe or a legitimately
+	// audio-less clip) is cached for every subsequent call. Returns an Array
+	// of Dictionaries; each Dictionary has string keys:
 	//   language    — BCP 47 tag (may be empty)
 	//   name        — display name (may be empty)
 	//   channels    — int
 	//   sample_rate — int
 	//   default     — bool (container default flag)
 	// Array position is the track index for VideoStreamPlayer.audio_track.
-	Array _get_audio_tracks();
+	Array get_audio_tracks();
 
 protected:
 	static void _bind_methods();
@@ -77,7 +79,12 @@ private:
 	// whenever the list is walked.
 	std::vector<uint64_t> playback_ids_;
 
-	Array _cached_audio_tracks;
+	// True once get_audio_tracks() has probed the clip, whether or not the
+	// probe succeeded. Distinguishes "not probed yet" from "probed and found
+	// no audio tracks" so a failed probe or a legitimately audio-less clip
+	// doesn't re-open the file on every call.
+	bool audio_tracks_probed_ = false;
+	Array cached_audio_tracks_;
 };
 
 } // namespace godot

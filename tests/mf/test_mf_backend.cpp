@@ -88,6 +88,31 @@ std::string ensure_fixture() {
 	return file_exists(fixture) ? fixture : std::string{};
 }
 
+// Multi-track fixture: 6 frames at 3 fps, 3 audio streams with disjoint freq bands.
+constexpr int kMultiFrames = 6;
+constexpr int kMultiFps = 3;
+constexpr int kMultiTracks = 3;
+
+std::string ensure_multi_track_fixture() {
+	const std::string root = repo_root();
+	const std::string fixture = root + "/tests/fixtures/synthetic_multitrack_mf.mp4";
+	if (file_exists(fixture)) {
+		return fixture;
+	}
+	if (!ffmpeg_available()) {
+		return {};
+	}
+	char cmd[2048];
+	std::snprintf(cmd, sizeof(cmd),
+			"bash %s/tools/gen_test_media.sh --frames %d --fps %d --output %s --multi-track %d "
+			">NUL 2>&1",
+			root.c_str(), kMultiFrames, kMultiFps, fixture.c_str(), kMultiTracks);
+	if (std::system(cmd) != 0) {
+		return {};
+	}
+	return file_exists(fixture) ? fixture : std::string{};
+}
+
 // Mean luma over the bottom-right quadrant of the top-left NV12 marker block,
 // read back from a D3D11 NV12 texture. This is a TEST-ONLY CPU read-back via a
 // staging texture; the present path imports the texture to the GPU zero-copy and
@@ -233,6 +258,62 @@ TEST_CASE("MF backend decodes synthetic clip to NV12 + PCM with monotonic PTS") 
 TEST_CASE("MF backend reports error on a bogus path") {
 	mf::MfBackend backend;
 	CHECK_FALSE(backend.open("C:/no/such/file/really_not_here.mp4"));
+}
+
+TEST_CASE("MF backend enumerates audio tracks for single-track clip") {
+	const std::string fixture = ensure_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed — skipping single-track audio enumeration");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	CHECK(backend.audio_track_count() == 1);
+
+	const auto info = backend.audio_track_info(0);
+	CHECK(info.channels >= 1);
+	CHECK(info.sample_rate == 48000);
+	CHECK(info.is_default == true);
+	// MF v1 skips language/name; accept empty.
+	CHECK(info.language.empty());
+	CHECK(info.name.empty());
+}
+
+TEST_CASE("MF backend enumerates audio tracks for multi-track clip") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed — skipping multi-track audio enumeration");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	CHECK(backend.audio_track_count() == kMultiTracks);
+
+	// Track 0: first audio stream is default
+	const auto t0 = backend.audio_track_info(0);
+	CHECK(t0.is_default == true);
+	CHECK(t0.channels >= 1);
+	CHECK(t0.sample_rate == 48000);
+
+	// Track 1: non-default
+	const auto t1 = backend.audio_track_info(1);
+	CHECK(t1.is_default == false);
+	CHECK(t1.channels >= 1);
+	CHECK(t1.sample_rate == 48000);
+
+	// Track 2: non-default
+	const auto t2 = backend.audio_track_info(2);
+	CHECK(t2.is_default == false);
+
+	// Out-of-range: empty struct.
+	const auto t99 = backend.audio_track_info(99);
+	CHECK(t99.channels == 0);
+	CHECK(t99.sample_rate == 0);
+	CHECK(t99.is_default == false);
 }
 
 #endif // _WIN32

@@ -27,7 +27,7 @@ void PlatformVideoStream::_bind_methods() {
 	// Expose the audio-track probe so GDScript can enumerate tracks before
 	// playback. Returns an Array of Dictionaries with per-track metadata;
 	// array position is the track index for VideoStreamPlayer.audio_track.
-	ClassDB::bind_method(D_METHOD("get_audio_tracks"), &PlatformVideoStream::_get_audio_tracks);
+	ClassDB::bind_method(D_METHOD("get_audio_tracks"), &PlatformVideoStream::get_audio_tracks);
 }
 
 bool PlatformVideoStream::hdr_decode_supported() {
@@ -81,23 +81,25 @@ int PlatformVideoStream::get_output_mode() const {
 	return output_mode_;
 }
 
-Array PlatformVideoStream::_get_audio_tracks() {
-	if (!_cached_audio_tracks.is_empty()) {
-		return _cached_audio_tracks;
+Array PlatformVideoStream::get_audio_tracks() {
+	if (audio_tracks_probed_) {
+		return cached_audio_tracks_;
 	}
+	audio_tracks_probed_ = true;
 
 	// Lazy probe: open the clip briefly to read audio track metadata, then
-	// close the backend. The result is cached so subsequent queries are free
-	// and the probe only happens on first access.
+	// close the backend. The result (including empty, on failure or for a
+	// legitimately audio-less clip) is cached so subsequent queries are free
+	// and the probe only ever happens once.
 	std::unique_ptr<core::Backend> backend = platform_media::make_backend();
 
 	String os_path = ProjectSettings::get_singleton()->globalize_path(get_file());
 	const std::string utf8 = os_path.utf8().get_data();
 
 	if (!backend->open(utf8)) {
-		// Return an empty array on failure (caller checks is_empty()).
-		_cached_audio_tracks = Array();
-		return _cached_audio_tracks;
+		// Cache an empty array on failure (caller checks is_empty()).
+		cached_audio_tracks_ = Array();
+		return cached_audio_tracks_;
 	}
 
 	const int count = backend->audio_track_count();
@@ -116,8 +118,8 @@ Array PlatformVideoStream::_get_audio_tracks() {
 	}
 
 	backend->close();
-	_cached_audio_tracks = tracks;
-	return _cached_audio_tracks;
+	cached_audio_tracks_ = tracks;
+	return cached_audio_tracks_;
 }
 
 Ref<VideoStreamPlayback> PlatformVideoStream::_instantiate_playback() {
