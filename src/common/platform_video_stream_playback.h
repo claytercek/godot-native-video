@@ -79,15 +79,16 @@ public:
 	int _get_channels() const override;
 	int _get_mix_rate() const override;
 
-protected:
-	static void _bind_methods();
-
-public:
 	// --- Colorimetry ---
 	// Returns a Dictionary with the parsed/negotiated colorimetry.
 	// Callable after load() succeeds (i.e. after open but before play).
 	// Untagged clips return BT.709 video-range defaults.
 	godot::Dictionary get_color_info() const;
+
+protected:
+	static void _bind_methods();
+
+private:
 	// Pull decoded audio chunks from the backend into the audio ring until it is
 	// topped up or EOS. Cheap; called every _update before mixing.
 	void fill_audio();

@@ -25,6 +25,12 @@ public:
 
 	Ref<VideoStreamPlayback> _instantiate_playback() override;
 
+	/// True when the platform supports 10-bit and HDR hardware decode output
+	/// (x420 biplanar surfaces) through the zero-copy Metal import path. On
+	/// macOS this is always true (Apple Silicon or Intel with Metal-accelerated
+	/// VideoToolbox). On other platforms (Windows, Linux) returns false.
+	static bool hdr_decode_supported();
+
 protected:
 	static void _bind_methods();
 };
