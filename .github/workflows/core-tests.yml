@@ -32,7 +32,7 @@ jobs:
         # The Engine Core and its tests have zero godot-cpp dependency.
 
       - name: Install SCons
-        run: pip3 install scons
+        run: brew install scons
 
       - name: Build Engine Core tests
         run: scons target=core_tests
@@ -63,7 +63,7 @@ jobs:
         # godot-cpp / RenderingDevice dependency.
 
       - name: Install SCons
-        run: pip3 install scons
+        run: brew install scons
 
       - name: Install ffmpeg
         # ffmpeg is a TEST-ONLY tool (never a runtime dependency). It regenerates
