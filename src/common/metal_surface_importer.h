@@ -53,7 +53,9 @@ public:
 	// failure (e.g. wrong pixel format). The importer does NOT take ownership of
 	// the CVPixelBuffer; the caller's VideoFrame::release still owns it and is
 	// kept alive by the retire-ring alongside the returned release closure.
-	PlaneTextures import(void *cv_pixel_buffer) override;
+	// `plane_slice` is unused on macOS: a CVPixelBuffer is always one surface,
+	// never an array of frames (see surface_importer.h).
+	PlaneTextures import(void *cv_pixel_buffer, uint32_t plane_slice) override;
 
 private:
 	struct Impl;

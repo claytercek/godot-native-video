@@ -140,7 +140,7 @@ static RID import_plane(RenderingDevice *rd, CVMetalTextureCacheRef cache,
 	return rid;
 }
 
-PlaneTextures MetalSurfaceImporter::import(void *cv_pixel_buffer) {
+PlaneTextures MetalSurfaceImporter::import(void *cv_pixel_buffer, uint32_t /*plane_slice*/) {
 	PlaneTextures out;
 	if (!is_initialized() || cv_pixel_buffer == nullptr) {
 		return out;

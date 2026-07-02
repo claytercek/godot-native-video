@@ -40,10 +40,22 @@
 // 0. (A future optimization could request shareable decoder textures and drop
 // even this GPU blit.)
 //
-// STATUS: implemented but NOT compiled/run/verified — no Windows toolchain on
-// the authoring host. This is the Human-in-the-Loop GPU-interop slice; the chain
-// follows documented D3D11/DXGI/Vulkan signatures but has not been exercised. A
-// Windows dev must build it and confirm visual correctness on-device.
+// STATUS: compiles and links on Windows, but BLOCKED AT RUNTIME on stock Godot.
+// initialize() fails at the vkGetMemoryWin32HandlePropertiesKHR resolve because
+// Godot's Vulkan driver does not enable VK_KHR_external_memory_win32 on the
+// device it creates (checked: not enabled in 4.4.1, 4.5-stable, or master, and
+// there is no mechanism for a GDExtension to request extra device extensions).
+// The import chain below is therefore unreachable as designed. Paths forward:
+//   1. Upstream Godot PR enabling VK_KHR_external_memory_win32 (+ external
+//      semaphore/keyed-mutex interop exts) in the Vulkan driver — then this
+//      code runs as designed.
+//   2. Target Godot's D3D12 RD driver instead (Godot 4.5+ implements
+//      texture_create_from_extension for D3D12): D3D11 decoder -> NT shared
+//      handle -> ID3D12Device::OpenSharedHandle needs no extension gating.
+//      Requires a separate D3D12 importer + Windows users selecting the D3D12
+//      rendering driver, and NV12 plane views / fence sync need design work.
+// Everything upstream of this file (MF decode, playback, clock, scheduler) is
+// verified working on Windows via tests/mf and the demo run.
 // -----------------------------------------------------------------------
 
 #include "dxgi_surface_importer.h"
@@ -121,6 +133,7 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 	impl->device = reinterpret_cast<VkDevice>(
 			rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0));
 	if (impl->device == VK_NULL_HANDLE || impl->physical_device == VK_NULL_HANDLE) {
+		ERR_PRINT("DXGI importer init: RD did not yield Vulkan device handles (non-Vulkan RD driver?).");
 		delete impl;
 		return false;
 	}
@@ -132,6 +145,8 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 			reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
 					vkGetDeviceProcAddr(impl->device, "vkGetMemoryWin32HandlePropertiesKHR"));
 	if (impl->get_mem_handle_props == nullptr) {
+		ERR_PRINT("DXGI importer init: vkGetMemoryWin32HandlePropertiesKHR not resolvable — "
+				  "VK_KHR_external_memory_win32 is not enabled on Godot's Vulkan device.");
 		delete impl;
 		return false;
 	}
@@ -148,6 +163,7 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 
 	ComPtr<IDXGIFactory1> factory;
 	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) {
+		ERR_PRINT("DXGI importer init: CreateDXGIFactory1 failed.");
 		delete impl;
 		return false;
 	}
@@ -180,6 +196,7 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 			nullptr, d3d_flags, nullptr, 0, D3D11_SDK_VERSION,
 			impl->d3d_device.put(), &got, impl->d3d_context.put());
 	if (FAILED(hr) || !impl->d3d_device) {
+		ERR_PRINT("DXGI importer init: D3D11CreateDevice failed on the matched adapter.");
 		delete impl;
 		return false;
 	}
@@ -212,7 +229,7 @@ int find_memory_type(VkPhysicalDevice phys, uint32_t type_bits, VkMemoryProperty
 
 } // namespace
 
-PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture) {
+PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_slice) {
 	PlaneTextures out;
 	if (!is_initialized() || d3d11_texture == nullptr) {
 		return out;
@@ -267,15 +284,12 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture) {
 		ERR_PRINT("DXGI importer: D3D keyed AcquireSync(0) failed.");
 		return out;
 	}
-	// Source subresource: the MF decoder may pack frames as array slices, in which
-	// case the slice index for THIS frame is recorded by the backend in
-	// VideoFrame.cpp_pixels_size (a documented backend<->importer contract that
-	// avoids widening the platform-agnostic core::VideoFrame). The importer
-	// signature import(void*) only receives the texture, so for the array-slice
-	// case the present pipeline would need to forward that index; the common path
-	// (one texture per frame) is slice 0. KNOWN LIMITATION (UNVERIFIED): wire the
-	// slice index through if the decoder is observed to emit a texture array.
-	const UINT src_subresource = 0;
+	// Source subresource: DXVA decoder MFTs pack decoded frames as slices of one
+	// shared texture array, so the slice for THIS frame is the plane_slice the
+	// backend recorded in VideoFrame.cpu_pixels_size and the present pipeline
+	// forwarded here. (Verified on real hardware: the MF decoder does emit a
+	// texture array — always blitting slice 0 shows stale/wrong frames.)
+	const UINT src_subresource = static_cast<UINT>(plane_slice);
 	impl->d3d_context->CopySubresourceRegion(
 			shared_tex.get(), 0, 0, 0, 0,
 			decoded.get(), src_subresource, nullptr);
