@@ -142,3 +142,266 @@ TEST_CASE("AudioMasterClock sample_rate and latency accessors") {
 	CHECK(c.sample_rate() == 44100);
 	CHECK(c.latency_seconds() == doctest::Approx(0.05));
 }
+
+// -----------------------------------------------------------------------
+// ClockBridge
+// -----------------------------------------------------------------------
+
+using core::ClockBridge;
+
+// Utility: create a bridge starting in audio-master mode.
+static auto make_audio_bridge(double latency = 0.0) {
+	return std::make_unique<ClockBridge>(
+			std::make_unique<AudioMasterClock>(48000, latency),
+			std::make_unique<MonotonicClock>(0.0),
+			/*audio_master=*/true);
+}
+
+// Utility: create a bridge starting in monotonic-master mode.
+static auto make_mono_bridge(double initial = 0.0) {
+	return std::make_unique<ClockBridge>(
+			std::make_unique<AudioMasterClock>(48000, 0.0),
+			std::make_unique<MonotonicClock>(initial),
+			/*audio_master=*/false);
+}
+
+TEST_CASE("ClockBridge starts as audio-master") {
+	auto b = make_audio_bridge();
+	CHECK(b->is_audio_master());
+	CHECK(b->media_time() == doctest::Approx(0.0));
+}
+
+TEST_CASE("ClockBridge starts as monotonic-master") {
+	auto b = make_mono_bridge(5.0);
+	CHECK_FALSE(b->is_audio_master());
+	CHECK(b->media_time() == doctest::Approx(5.0));
+}
+
+TEST_CASE("ClockBridge audio-master: advance is no-op, on_audio_mixed advances") {
+	auto b = make_audio_bridge();
+	b->advance(1.0);
+	CHECK(b->media_time() == doctest::Approx(0.0));
+	b->on_audio_mixed(48000); // 1 s
+	CHECK(b->media_time() == doctest::Approx(1.0));
+}
+
+TEST_CASE("ClockBridge audio-master: on_audio_mixed accumulates") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(48000);
+	b->on_audio_mixed(24000);
+	CHECK(b->media_time() == doctest::Approx(1.5));
+}
+
+TEST_CASE("ClockBridge handoff seeds monotonic at audio position") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(48000); // 1 s
+	b->handoff_to_monotonic();
+	CHECK_FALSE(b->is_audio_master());
+	// After handoff, the monotonic clock starts at the audio clock's position.
+	CHECK(b->media_time() == doctest::Approx(1.0));
+}
+
+TEST_CASE("ClockBridge handoff is idempotent") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(24000); // 0.5 s
+	b->handoff_to_monotonic();
+	CHECK_FALSE(b->is_audio_master());
+	CHECK(b->media_time() == doctest::Approx(0.5));
+	// Second handoff should be a no-op.
+	b->handoff_to_monotonic();
+	CHECK_FALSE(b->is_audio_master());
+	CHECK(b->media_time() == doctest::Approx(0.5));
+}
+
+TEST_CASE("ClockBridge handoff then advance advances monotonic") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(48000); // 1 s
+	b->handoff_to_monotonic();
+	b->advance(0.5);
+	CHECK(b->media_time() == doctest::Approx(1.5));
+}
+
+TEST_CASE("ClockBridge re-anchor keeps position continuous") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(48000); // 1 s
+	b->handoff_to_monotonic();
+	b->advance(2.0); // 3 s total
+	b->reanchor_to_audio();
+	CHECK(b->is_audio_master());
+	// Position should be 3.0 — no backward jump.
+	CHECK(b->media_time() == doctest::Approx(3.0).epsilon(1e-9));
+}
+
+TEST_CASE("ClockBridge re-anchor is idempotent") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(24000); // 0.5 s
+	b->handoff_to_monotonic();
+	b->reanchor_to_audio();
+	CHECK(b->is_audio_master());
+	CHECK(b->media_time() == doctest::Approx(0.5));
+	// Second re-anchor should be a no-op.
+	b->reanchor_to_audio();
+	CHECK(b->is_audio_master());
+	CHECK(b->media_time() == doctest::Approx(0.5));
+}
+
+TEST_CASE("ClockBridge on_audio_mixed is no-op in monotonic mode") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(24000); // 0.5 s
+	b->handoff_to_monotonic();
+	// on_audio_mixed while in monotonic mode should be ignored.
+	b->on_audio_mixed(48000);
+	CHECK(b->media_time() == doctest::Approx(0.5));
+}
+
+TEST_CASE("ClockBridge re-anchor then on_audio_mixed advances audio") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(48000); // 1 s
+	b->handoff_to_monotonic();
+	b->advance(2.0); // 3 s
+	b->reanchor_to_audio();
+	b->on_audio_mixed(48000); // +1 s
+	CHECK(b->media_time() == doctest::Approx(4.0).epsilon(1e-9));
+}
+
+TEST_CASE("ClockBridge long gap via monotonic") {
+	// Simulates an arbitrarily long silent gap: handoff, advance by a large
+	// delta, re-anchor. Position must be continuous.
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(48000); // 1 s
+	b->handoff_to_monotonic();
+	b->advance(300.0); // 5 minute gap
+	b->reanchor_to_audio();
+	CHECK(b->media_time() == doctest::Approx(301.0).epsilon(1e-9));
+	// Audio clock should now be master and can continue from 301 s.
+	b->on_audio_mixed(48000); // +1 s
+	CHECK(b->media_time() == doctest::Approx(302.0).epsilon(1e-9));
+}
+
+TEST_CASE("ClockBridge set_time synchronizes both clocks") {
+	auto b = make_audio_bridge();
+	b->on_audio_mixed(48000); // 1 s
+	b->set_time(10.0);
+	CHECK(b->media_time() == doctest::Approx(10.0));
+	// Handoff after set_time: monotonic should be at 10.0 too.
+	b->handoff_to_monotonic();
+	CHECK(b->media_time() == doctest::Approx(10.0));
+}
+
+TEST_CASE("ClockBridge set_paused pauses both clocks") {
+	auto b = make_audio_bridge();
+	b->set_paused(true);
+	CHECK(b->is_paused());
+	// Neither audio nor monotonic should advance.
+	b->on_audio_mixed(48000);
+	CHECK(b->media_time() == doctest::Approx(0.0));
+	// Handoff while paused, then advance — should stay put.
+	b->handoff_to_monotonic();
+	b->advance(1.0);
+	CHECK(b->media_time() == doctest::Approx(0.0));
+	// Unpause: monotonic should start advancing.
+	b->set_paused(false);
+	b->advance(0.5);
+	CHECK(b->media_time() == doctest::Approx(0.5));
+}
+
+TEST_CASE("ClockBridge latency compensation works through bridge") {
+	const double latency = 0.02; // 20 ms
+	auto b = make_audio_bridge(latency);
+	CHECK(b->latency_seconds() == doctest::Approx(latency));
+	// Mix exactly the latency worth of audio; should still read 0.
+	b->on_audio_mixed(static_cast<int>(latency * 48000));
+	CHECK(b->media_time() == doctest::Approx(0.0));
+	// Mix another second; reported time is 1 s behind accumulated.
+	b->on_audio_mixed(48000);
+	CHECK(b->media_time() == doctest::Approx(1.0).epsilon(1e-4));
+	// Handoff seeds mono at the latency-compensated position.
+	b->handoff_to_monotonic();
+	CHECK(b->media_time() == doctest::Approx(1.0).epsilon(1e-4));
+}
+
+TEST_CASE("ClockBridge round-trip: audio → mono → audio → mono") {
+	auto b = make_audio_bridge();
+	// Phase 1: audio advances 1s.
+	b->on_audio_mixed(48000);
+	CHECK(b->media_time() == doctest::Approx(1.0));
+	// Phase 2: handoff to mono, advance 2s.
+	b->handoff_to_monotonic();
+	b->advance(2.0);
+	CHECK(b->media_time() == doctest::Approx(3.0));
+	// Phase 3: re-anchor to audio, advance 1s via audio.
+	b->reanchor_to_audio();
+	b->on_audio_mixed(48000);
+	CHECK(b->media_time() == doctest::Approx(4.0));
+	// Phase 4: handoff back to mono, advance 0.5s.
+	b->handoff_to_monotonic();
+	b->advance(0.5);
+	CHECK(b->media_time() == doctest::Approx(4.5));
+}
+
+TEST_CASE("ClockBridge sample_rate delegation") {
+	auto b = make_audio_bridge();
+	CHECK(b->sample_rate() == 48000);
+}
+
+// -----------------------------------------------------------------------
+// ClockBridge — null audio clock (silent clips)
+// -----------------------------------------------------------------------
+
+// Utility: create a bridge with no audio clock at all.
+static auto make_null_audio_bridge(double initial = 0.0, bool request_audio_master = true) {
+	return std::make_unique<ClockBridge>(
+			nullptr,
+			std::make_unique<MonotonicClock>(initial),
+			/*audio_master=*/request_audio_master);
+}
+
+TEST_CASE("ClockBridge with null audio forces monotonic-master") {
+	auto b = make_null_audio_bridge(0.0, /*request_audio_master=*/true);
+	CHECK_FALSE(b->is_audio_master());
+}
+
+TEST_CASE("ClockBridge with null audio: media_time advances via advance()") {
+	auto b = make_null_audio_bridge();
+	CHECK(b->media_time() == doctest::Approx(0.0));
+	b->advance(1.0);
+	CHECK(b->media_time() == doctest::Approx(1.0));
+	b->advance(0.5);
+	CHECK(b->media_time() == doctest::Approx(1.5));
+}
+
+TEST_CASE("ClockBridge with null audio: set_time and set_paused work") {
+	auto b = make_null_audio_bridge();
+	b->set_time(10.0);
+	CHECK(b->media_time() == doctest::Approx(10.0));
+
+	b->set_paused(true);
+	CHECK(b->is_paused());
+	b->advance(5.0);
+	CHECK(b->media_time() == doctest::Approx(10.0));
+
+	b->set_paused(false);
+	b->advance(1.0);
+	CHECK(b->media_time() == doctest::Approx(11.0));
+}
+
+TEST_CASE("ClockBridge with null audio: reanchor_to_audio is a safe no-op") {
+	auto b = make_null_audio_bridge();
+	b->advance(2.0);
+	b->reanchor_to_audio();
+	CHECK_FALSE(b->is_audio_master());
+	CHECK(b->media_time() == doctest::Approx(2.0));
+}
+
+TEST_CASE("ClockBridge with null audio: on_audio_mixed is a safe no-op") {
+	auto b = make_null_audio_bridge();
+	b->advance(1.0);
+	b->on_audio_mixed(48000);
+	CHECK(b->media_time() == doctest::Approx(1.0));
+}
+
+TEST_CASE("ClockBridge with null audio: sample_rate and latency_seconds are zero") {
+	auto b = make_null_audio_bridge();
+	CHECK(b->sample_rate() == 0);
+	CHECK(b->latency_seconds() == doctest::Approx(0.0));
+}
