@@ -1,8 +1,6 @@
 // -----------------------------------------------------------------------
 // backend_factory_mf.cpp — Windows implementation of make_backend().
 // Compiled only on Windows; returns the Media Foundation decoder Backend.
-//
-// STATUS: unverified — see mf_backend.cpp / the commit body.
 // -----------------------------------------------------------------------
 
 // Windows-only: on other platforms this is an empty TU so the common/*.cpp glob
