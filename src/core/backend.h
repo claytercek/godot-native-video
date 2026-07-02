@@ -8,6 +8,43 @@
 namespace core {
 
 // -----------------------------------------------------------------------
+// Colorimetry enums — platform-neutral tags for YCbCr matrix, color
+// primaries, transfer function, and video/full range. These are populated
+// per-frame from the decoder surface's color attachments (e.g. CVImageBuffer
+// attachments on Apple, MF_MT_VIDEO_* attributes on Windows). Unspecified
+// defaults to BT.709 video range (the v1 assumption, matching today's
+// hard-coded shader constants).
+// -----------------------------------------------------------------------
+enum class ColorMatrix : uint8_t {
+	Unspecified = 0,
+	BT709 = 1,  // ITU-R BT.709 (HD)
+	BT601 = 2,  // ITU-R BT.601 (SD)
+	BT2020 = 3, // ITU-R BT.2020 (UHD)
+};
+
+enum class ColorPrimaries : uint8_t {
+	Unspecified = 0,
+	BT709 = 1,
+	BT601_625 = 2, // EBU 3213-E (PAL)
+	BT601_525 = 3, // SMPTE C (NTSC)
+	BT2020 = 4,
+	DCI_P3 = 5,
+};
+
+enum class TransferFunction : uint8_t {
+	Unspecified = 0,
+	BT709 = 1, // Also used for sRGB-ish SDR
+	PQ = 2,    // SMPTE ST 2084 (HDR10)
+	HLG = 3,   // ITU-R BT.2100 HLG
+};
+
+enum class ColorRange : uint8_t {
+	Unspecified = 0,
+	Video = 1, // Limited range: Y [16,235], CbCr [16,240]
+	Full = 2,  // Full range: Y/CbCr [0,255]
+};
+
+// -----------------------------------------------------------------------
 // Pixel format tag — surface types produced by a hardware decoder.
 // Only 8-bit SDR formats are in scope for v1.
 // -----------------------------------------------------------------------
@@ -42,6 +79,16 @@ struct VideoFrame {
 	int width = 0;
 	int height = 0;
 	PixelFormat pixel_format = PixelFormat::Unknown;
+
+	// --- Colorimetry metadata ---
+	// Populated from the decoder surface's color attachments by the Backend.
+	// Unspecified fields are treated as BT.709, video range (the v1 default
+	// that matches today's hard-coded shader constants).
+	ColorMatrix ycbcr_matrix = ColorMatrix::Unspecified;
+	ColorPrimaries primaries = ColorPrimaries::Unspecified;
+	TransferFunction transfer = TransferFunction::Unspecified;
+	ColorRange range = ColorRange::Unspecified;
+	int bit_depth = 8;
 
 	// Call when the consumer is done with this frame so the decode pool can
 	// recycle the surface.
@@ -96,6 +143,15 @@ public:
 	virtual int video_height() const = 0;
 	virtual int audio_channel_count() const = 0;
 	virtual int audio_sample_rate() const = 0;
+
+	// --- Colorimetry (populated after open) ---
+	// These return the negotiated colorimetry for the stream as a whole.
+	// The per-frame VideoFrame fields carry the per-sample metadata.
+	virtual ColorMatrix ycbcr_matrix() const { return ColorMatrix::BT709; }
+	virtual ColorPrimaries color_primaries() const { return ColorPrimaries::BT709; }
+	virtual TransferFunction transfer_function() const { return TransferFunction::BT709; }
+	virtual ColorRange color_range() const { return ColorRange::Video; }
+	virtual int bit_depth() const { return 8; }
 
 	// --- Decode pump ---
 
