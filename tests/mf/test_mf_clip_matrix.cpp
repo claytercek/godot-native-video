@@ -9,7 +9,10 @@
 //
 // WINDOWS-ONLY: the body is under #if _WIN32 and is compiled only by
 // `scons target=mf_tests platform=windows`. Clips missing because
-// tools/gen_clip_matrix.sh hasn't run are skipped with a WARN, never a failure.
+// tools/gen_clip_matrix.sh hasn't run are skipped with a WARN, never a
+// failure. HEVC rows are skipped the same way on hosts with no HEVC decoder
+// MFT registered (e.g. GitHub-hosted Windows runners, which lack the
+// Store-distributed "HEVC Video Extensions" package).
 //
 // STATUS: implemented but NOT compiled/run/verified on the authoring host
 // (macOS, no Windows toolchain). A Windows dev / CI runner must build + run it.
@@ -22,8 +25,49 @@
 #include "common/clip_matrix.h"
 #include "mf_backend.h"
 
+#include <mfapi.h>
+#include <mfidl.h>
+
 #include <cmath>
 #include <string>
+
+namespace {
+
+// GitHub-hosted Windows runners (and many headless Windows Server images) do
+// not ship a Media Foundation HEVC decoder MFT — it is an optional, licensed
+// component ("HEVC Video Extensions") distributed via the Microsoft Store and
+// never present on server SKUs. Probe for one so HEVC rows degrade to a WARN
+// skip on hosts without it, exactly like a missing matrix clip, rather than a
+// hard failure caused by the environment rather than the backend.
+bool hevc_decoder_available() {
+	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+	MFT_REGISTER_TYPE_INFO input_type{ MFMediaType_Video, MFVideoFormat_HEVC };
+	IMFActivate **activations = nullptr;
+	UINT32 count = 0;
+	HRESULT hr = MFTEnumEx(
+			MFT_CATEGORY_VIDEO_DECODER,
+			MFT_ENUM_FLAG_ALL,
+			&input_type,
+			nullptr,
+			&activations,
+			&count);
+
+	const bool available = SUCCEEDED(hr) && count > 0;
+	for (UINT32 i = 0; i < count; ++i) {
+		activations[i]->Release();
+	}
+	CoTaskMemFree(activations);
+
+	CoUninitialize();
+	return available;
+}
+
+bool is_hevc_clip(const clip_matrix::Clip &clip) {
+	return clip.file.find("hevc") != std::string::npos;
+}
+
+} // namespace
 
 TEST_CASE("MF backend decodes the real-clip format matrix") {
 	const auto clips = clip_matrix::load();
@@ -32,6 +76,8 @@ TEST_CASE("MF backend decodes the real-clip format matrix") {
 		return;
 	}
 
+	const bool have_hevc_decoder = hevc_decoder_available();
+
 	int decoded_clips = 0;
 
 	for (const auto &clip : clips) {
@@ -39,6 +85,11 @@ TEST_CASE("MF backend decodes the real-clip format matrix") {
 
 		if (!clip_matrix::file_exists(path)) {
 			WARN_MESSAGE(false, ("matrix clip missing (run tools/gen_clip_matrix.sh): " + clip.file).c_str());
+			continue;
+		}
+
+		if (is_hevc_clip(clip) && !have_hevc_decoder) {
+			WARN_MESSAGE(false, ("no HEVC decoder MFT registered on this host — skipping: " + clip.file).c_str());
 			continue;
 		}
 
