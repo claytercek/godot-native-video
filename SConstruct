@@ -43,7 +43,7 @@ if ARGUMENTS.get("target", "") == "core_tests":
         core_env.Append(CXXFLAGS=["/std:c++20", "/EHsc", "/W4"])
     else:
         core_env.Append(CXXFLAGS=["-std=c++20", "-Wall", "-Wextra"])
-    core_env.Append(CPPPATH=["#src/core", "#tests/core/vendor"])
+    core_env.Append(CPPPATH=["#src/core", "#src/common", "#tests/core/vendor"])
     core_sources = [
         "tests/core/main.cpp",
         "tests/core/test_frame_queue.cpp",
@@ -56,6 +56,7 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_decode_scheduler.cpp",
         "tests/core/test_scrubber.cpp",
         "tests/core/test_color_matrix.cpp",
+        "tests/core/test_hdr_color_math.cpp",
         "src/core/decode_scheduler.cpp",
     ]
     # The force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG.
@@ -166,6 +167,9 @@ env.Command(
     source="src/common/nv12_to_rgb.glsl",
     action="python3 tools/embed_shader.py $SOURCE $TARGET",
 )
+# Track the included hdr_color_math.glsl as a dependency so the shader
+# header is regenerated when it changes.
+env.Depends(shader_header, "src/common/hdr_color_math.glsl")
 
 # Add source files
 env.Append(CPPPATH=["src/", "build/gen/src"])

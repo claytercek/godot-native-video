@@ -71,6 +71,26 @@ static bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) 
 		out.bit_depth = 10;
 		return true;
 	}
+	// HDR10 clip: PQ transfer, BT.2020 primaries, BT.2020 non-constant
+	// luminance matrix. 10-bit.
+	if (file == "hevc_pq_bt2020_30_mp4.mp4") {
+		out.matrix = core::ColorMatrix::BT2020;
+		out.primaries = core::ColorPrimaries::BT2020;
+		out.transfer = core::TransferFunction::PQ;
+		out.range = core::ColorRange::Video;
+		out.bit_depth = 10;
+		return true;
+	}
+	// HLG clip: HLG transfer, BT.2020 primaries, BT.2020 non-constant
+	// luminance matrix. 10-bit.
+	if (file == "hevc_hlg_bt2020_30_mp4.mp4") {
+		out.matrix = core::ColorMatrix::BT2020;
+		out.primaries = core::ColorPrimaries::BT2020;
+		out.transfer = core::TransferFunction::HLG;
+		out.range = core::ColorRange::Video;
+		out.bit_depth = 10;
+		return true;
+	}
 
 	// Untagged — return defaults (which the caller can skip asserting).
 	return false;
@@ -101,7 +121,9 @@ static void check_backend_colorimetry(avf::AvfBackend &backend,
 // defaults) return false; the per-frame CV attachments may carry arbitrary
 // decoder defaults that differ from the open-time negotiated values.
 static bool has_explicit_colorimetry(const std::string &file) {
-	return file == "h264_30_bt601_mp4.mp4";
+	return file == "h264_30_bt601_mp4.mp4" ||
+		file == "hevc_pq_bt2020_30_mp4.mp4" ||
+		file == "hevc_hlg_bt2020_30_mp4.mp4";
 }
 
 // Assert that the per-frame colorimetry matches expectations.
