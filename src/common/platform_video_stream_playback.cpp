@@ -8,7 +8,6 @@
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
-#include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -64,24 +63,42 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 	audio_track_count_ = backend->audio_track_count();
 
 	// --- Canonical Mix Format ---
-	// Compute the maximum channel count across all audio tracks at the clip's
-	// shared sample rate. Godot queries channels/mix-rate exactly once at play
-	// start, so these must be stable for the playback's entire lifetime. The
-	// channel mixer converts each backend chunk's native channel layout to the
-	// canonical format before writing to the audio ring.
+	// canonical_channels_ is the maximum channel count across all audio
+	// tracks. canonical_sample_rate_ is the FIRST audio-bearing track's rate
+	// — NOT a shared rate across tracks. Mixed-sample-rate clips are a
+	// documented limitation: the default track's rate wins, and a later
+	// track with a differing rate only gets one warning here (a mid-stream
+	// switch to it is refused in _set_audio_track()). Godot queries
+	// channels/mix-rate exactly once at play start, so these must be stable
+	// for the playback's entire lifetime. The channel mixer converts each
+	// backend chunk's native channel layout to the canonical format before
+	// writing to the audio ring.
 	canonical_channels_ = 0;
 	canonical_sample_rate_ = 0;
 	has_audio_ = false;
+	track_infos_.clear();
+	bool warned_mixed_sample_rates = false;
 	for (int i = 0; i < audio_track_count_; ++i) {
 		const core::AudioTrackInfo info = backend->audio_track_info(i);
+		track_infos_.push_back(info);
 		if (info.channels > canonical_channels_) {
 			canonical_channels_ = info.channels;
 		}
-		if (info.sample_rate > canonical_sample_rate_) {
-			canonical_sample_rate_ = info.sample_rate;
-		}
 		if (info.channels > 0 && info.sample_rate > 0) {
-			has_audio_ = true;
+			if (!has_audio_) {
+				canonical_sample_rate_ = info.sample_rate;
+				has_audio_ = true;
+			} else if (!warned_mixed_sample_rates && info.sample_rate != canonical_sample_rate_) {
+				print_error(
+						String("Audio track ") + String::num_int64(i) + " sample rate " +
+						String::num_int64(info.sample_rate) +
+						" Hz differs from the canonical rate " +
+						String::num_int64(canonical_sample_rate_) +
+						" Hz. Mixed-sample-rate clips are not supported; this track "
+						"will play at the canonical rate and mid-stream switches to "
+						"it are refused.");
+				warned_mixed_sample_rates = true;
+			}
 		}
 	}
 	// Clamp to the max we know how to mix; larger channel counts are passed
@@ -104,27 +121,44 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 		if (AudioServer *as = AudioServer::get_singleton()) {
 			latency = as->get_output_latency();
 		}
-		audio_clock_ = std::make_unique<core::AudioMasterClock>(canonical_sample_rate_, latency);
+		auto audio = std::make_unique<core::AudioMasterClock>(canonical_sample_rate_, latency);
+		auto mono = std::make_unique<core::MonotonicClock>(0.0);
+		clock_ = std::make_unique<core::ClockBridge>(std::move(audio), std::move(mono), /*audio_master=*/true);
 		// ~0.5 s of head-room so brief decode jitter never underruns the mixer.
 		const size_t ring_frames = static_cast<size_t>(canonical_sample_rate_) / 2;
 		audio_ring_ = std::make_unique<core::AudioRing>(canonical_channels_, ring_frames);
 	} else {
 		// No audio track: fall back to a monotonic clock advanced by the render
-		// delta so silent clips still play at the correct rate.
-		mono_clock_ = std::make_unique<core::MonotonicClock>(0.0);
+		// delta so silent clips still play at the correct rate. A null audio
+		// clock makes the bridge permanently monotonic-master — every
+		// audio-facing ClockBridge method becomes a safe no-op.
+		auto mono = std::make_unique<core::MonotonicClock>(0.0);
+		clock_ = std::make_unique<core::ClockBridge>(nullptr, std::move(mono), /*audio_master=*/false);
 	}
 
 	loaded_ = true;
 	position_ = 0.0;
 	audio_eos_ = false;
+	switch_in_progress_ = false;
+
+	// desired_track_ may already carry a pre-load selection made via
+	// _set_audio_track() before load() ran; it must survive, not be
+	// clobbered. Validate it now that audio_track_count_ is known.
+	if (audio_track_count_ > 0 && (desired_track_ < 0 || desired_track_ >= audio_track_count_)) {
+		print_error(
+				String("Audio track index ") + String::num_int64(desired_track_) +
+				" is out of range. Clip has " + String::num_int64(audio_track_count_) +
+				" track(s). Falling back to default (0).");
+		desired_track_ = 0;
+	}
+	live_track_ = 0;
+	// Cheap-applies any pre-load selection (we are not yet playing_).
+	reconcile_audio_track();
 	return true;
 }
 
 core::Clock *PlatformVideoStreamPlayback::master() const {
-	if (has_audio_) {
-		return audio_clock_.get();
-	}
-	return mono_clock_.get();
+	return clock_.get();
 }
 
 bool PlatformVideoStreamPlayback::audio_exhausted() const {
@@ -146,11 +180,25 @@ void PlatformVideoStreamPlayback::fill_audio() {
 		while (audio_ring_->free_frames() > audio_ring_->available_frames()) {
 			std::optional<core::AudioChunk> chunk = backend.next_audio_chunk();
 			if (!chunk.has_value()) {
+				// EOS. If a switch is still in progress, we simply never re-anchor:
+				// the bridge stays monotonic-master and _update()'s clock->advance()
+				// keeps video moving through what is now a permanent gap.
 				audio_eos_ = true;
 				break;
 			}
 			if (chunk->samples == nullptr || chunk->frame_count <= 0) {
 				continue;
+			}
+			// --- Mid-stream track switch: re-anchor clock when new audio flows ---
+			// During a switch the clock is in monotonic-master mode so video keeps
+			// advancing through the audio silence. reconcile_audio_track() cleared
+			// the ring before this call, so the first chunk to reach this point
+			// (decoded, not merely attempted) is genuinely from the new track: the
+			// audio clock is repositioned to the current monotonic position so
+			// media_time() remains continuous.
+			if (switch_in_progress_) {
+				clock_->reanchor_to_audio();
+				switch_in_progress_ = false;
 			}
 			// Mix from the backend's native channel layout to the canonical format.
 			// The channel mixer is a no-op (memcpy) when channel counts already match.
@@ -168,7 +216,7 @@ void PlatformVideoStreamPlayback::fill_audio() {
 }
 
 bool PlatformVideoStreamPlayback::drive_audio() {
-	if (!audio_ring_ || !audio_clock_ || canonical_channels_ <= 0) {
+	if (!audio_ring_ || !clock_ || canonical_channels_ <= 0) {
 		return false;
 	}
 
@@ -209,7 +257,7 @@ bool PlatformVideoStreamPlayback::drive_audio() {
 	const int accepted = mix_audio(request, mix_buffer_, 0);
 	const int advance = std::min<int>(accepted, static_cast<int>(real_frames));
 	if (advance > 0) {
-		audio_clock_->on_audio_mixed(advance);
+		clock_->on_audio_mixed(advance);
 	}
 	return advance > 0;
 }
@@ -250,6 +298,14 @@ void PlatformVideoStreamPlayback::_stop() {
 	}
 	// Reset scrub state so the next seek starts fresh (no stale velocity/settle).
 	scrubber_ = core::Scrubber(scrubber_.config());
+	switch_in_progress_ = false;
+	// The backend's track selection persists across stop (desired_/live_track_
+	// are NOT reset here), so audio is still live if the clip has any. If the
+	// user stopped mid-switch, the bridge would otherwise stay
+	// monotonic-master forever with no more fill_audio() calls to re-anchor it.
+	if (has_audio_ && clock_) {
+		clock_->reanchor_to_audio();
+	}
 }
 
 bool PlatformVideoStreamPlayback::_is_playing() const {
@@ -337,6 +393,73 @@ void PlatformVideoStreamPlayback::apply_scrub_resolve(const core::ScrubResolve &
 	c->set_time(target); // re-anchor the master clock to the resolved target
 	position_ = target;
 	audio_eos_ = false;
+
+	// Reconcile any pending track switch at the resolved position (position_
+	// == target here) so a new selection is primed at the correct spot.
+	reconcile_audio_track();
+}
+
+void PlatformVideoStreamPlayback::reconcile_audio_track() {
+	if (desired_track_ == live_track_ || !stream_) {
+		return;
+	}
+
+	if (!playing_) {
+		// Stopped / pre-play: apply cheaply. Selection is deferred in the
+		// backend until its next seek — which _play()'s scrub-resume resolve
+		// always issues before resuming.
+		const int target = desired_track_;
+		core::DecodeScheduler::instance().with_backend(
+				stream_, [target](core::Backend &backend) {
+					backend.select_audio_track(target);
+				});
+		live_track_ = desired_track_;
+		return;
+	}
+
+	// Playing (including paused — reselecting now primes the new reader at
+	// position_ so resume is instant).
+	if (!clock_ || !audio_ring_) {
+		return;
+	}
+
+	clock_->handoff_to_monotonic(); // no-op if already monotonic
+	switch_in_progress_ = true;
+
+	const int target = desired_track_;
+	const double prime_seconds = position_;
+
+	// Call reselect_audio_track on the backend under the scheduler's per-stream
+	// exclusion. This tears down and rebuilds ONLY the audio decode path (plus the
+	// video reader in AVF's case, but the FrameQueue still has buffered frames so
+	// the main thread keeps presenting without interruption).
+	bool ok = false;
+	core::DecodeScheduler::instance().with_backend(
+			stream_, [&](core::Backend &backend) {
+				ok = backend.reselect_audio_track(target, prime_seconds);
+			});
+
+	if (!ok) {
+		// Reselect failed: the Backend contract leaves the audio decode path
+		// undefined on failure (on AVF this can even leave no readers at all),
+		// so we cannot assume the old track is still playable. Roll the
+		// desired selection back to what is still live and force a seek to
+		// recover, per the Backend contract.
+		desired_track_ = live_track_;
+		switch_in_progress_ = false;
+		clock_->reanchor_to_audio();
+		print_error(String("Audio track switch to ") + String::num_int64(target) +
+				" failed; recovering via seek.");
+		core::DecodeScheduler::instance().request_seek(stream_, position_);
+		return;
+	}
+
+	// Clear the audio ring so stale samples from the old track don't play into
+	// the new track's first chunks. fill_audio() re-anchors the clock when the
+	// first chunk from the new track arrives.
+	live_track_ = desired_track_;
+	audio_ring_->clear();
+	audio_eos_ = false;
 }
 
 void PlatformVideoStreamPlayback::_seek(double time) {
@@ -364,17 +487,34 @@ void PlatformVideoStreamPlayback::_set_audio_track(int idx) {
 				" track(s). Falling back to default (0).");
 		idx = 0;
 	}
-	audio_track_selection_ = idx;
 
-	// Apply the selection to the backend if it's already registered with the
-	// scheduler. Before play() the backend exists but no audio is flowing, so
-	// the selection takes effect on the next seek (which rebuilds the reader
-	// in AVF, or reconfigures stream selection in MF).
-	if (stream_) {
-		core::DecodeScheduler::instance().with_backend(
-				stream_, [idx](core::Backend &backend) {
-					backend.select_audio_track(idx);
-				});
+	if (idx == desired_track_) {
+		return;
+	}
+
+	// Mid-stream sample-rate refusal: the canonical mix format and
+	// AudioMasterClock are fixed to the clip's canonical rate and cannot
+	// change mid-stream, so a switch to a differing-rate track is refused
+	// outright (while stopped/pre-play there is no live audio path yet to
+	// disturb, so the switch is allowed and validated again at load-derived
+	// canonical-rate time).
+	if (playing_ && has_audio_ && static_cast<size_t>(idx) < track_infos_.size() &&
+			track_infos_[static_cast<size_t>(idx)].sample_rate != canonical_sample_rate_) {
+		print_error(
+				String("Cannot switch to audio track ") + String::num_int64(idx) +
+				": sample rate " + String::num_int64(track_infos_[static_cast<size_t>(idx)].sample_rate) +
+				" Hz differs from the canonical rate " + String::num_int64(canonical_sample_rate_) +
+				" Hz. Rejecting switch.");
+		return;
+	}
+
+	desired_track_ = idx;
+
+	// Stopped / pre-play: apply immediately (cheap — deferred in the backend
+	// until its next seek). While playing or paused, _update() reconciles on
+	// its next tick (it already runs while paused).
+	if (!playing_) {
+		reconcile_audio_track();
 	}
 }
 
@@ -397,22 +537,37 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 		apply_scrub_resolve(*settle);
 	}
 
+	// Reconcile any pending track switch. This runs even while paused so a
+	// switch requested mid-pause (or during a scrub) is picked up promptly.
+	reconcile_audio_track();
+
 	if (!playing_ || paused_) {
 		return;
 	}
 	core::DecodeScheduler &sched = core::DecodeScheduler::instance();
 
+	// Always advance the clock bridge: when audio-master this is a no-op
+	// (AudioMasterClock ignores advance()), but in monotonic-master mode — a
+	// silent clip, or the handoff window during a track switch — it keeps video
+	// advancing through the silence.
+	clock->advance(delta);
+
 	// One clock rule: advance from real audio samples when any exist; once no
-	// more can ever come (silent clip, or a shorter audio track fully drained —
-	// legitimate in real-world files), advance by the render delta instead. The
-	// gate on !advanced_from_audio keeps the last partial ring drain from
-	// double-advancing (real leftover frames + delta on the same tick).
+	// more can ever come (a shorter audio track fully drained — legitimate in
+	// real-world files), advance by the render delta instead. The gate on
+	// !advanced_from_audio keeps the last partial ring drain from
+	// double-advancing (real leftover frames + delta on the same tick). The
+	// is_audio_master() gate keeps this from stacking on top of the bridge
+	// advance() above while in monotonic-master mode.
 	bool advanced_from_audio = false;
 	if (has_audio_) {
+		// drive_audio() calls clock_->on_audio_mixed() from the samples actually
+		// consumed — the ClockBridge delegates to AudioMasterClock when
+		// audio-master and is a no-op during the monotonic handoff.
 		fill_audio();
 		advanced_from_audio = drive_audio();
 	}
-	if (!advanced_from_audio && audio_exhausted()) {
+	if (clock_->is_audio_master() && !advanced_from_audio && audio_exhausted()) {
 		clock->set_time(clock->media_time() + delta);
 	}
 	const double now = clock->media_time();
@@ -482,9 +637,10 @@ int PlatformVideoStreamPlayback::_get_channels() const {
 }
 
 int PlatformVideoStreamPlayback::_get_mix_rate() const {
-	// Canonical Mix Format sample rate (the clip's shared sample rate across
-	// all audio tracks). The AudioServer resamples from this to the device
-	// rate; the master clock uses it for samples->seconds.
+	// Canonical Mix Format sample rate: the FIRST audio-bearing track's rate
+	// (mixed-sample-rate clips are a documented limitation — see load()). The
+	// AudioServer resamples from this to the device rate; the master clock
+	// uses it for samples->seconds.
 	return canonical_sample_rate_;
 }
 

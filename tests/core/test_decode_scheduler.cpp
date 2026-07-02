@@ -4,10 +4,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <vector>
 
+using core::AudioChunk;
 using core::Backend;
 using core::DecodeScheduler;
 using core::PixelFormat;
@@ -333,3 +335,192 @@ TEST_CASE("force-synchronous mode: no workers, deterministic in-order decode") {
 	CHECK(released.load() == static_cast<long>(total));
 }
 #endif
+
+// -----------------------------------------------------------------------
+// ReselectFakeBackend — a multi-track FakeBackend for testing reselect.
+//
+// Has two audio "tracks" (0 and 1) with different sample counts per-frame.
+// reselect_audio_track() switches between them, and next_audio_chunk()
+// produces frames whose frame_count identifies the active track. The audio
+// scratch buffer is shared so the returned pointer is valid across calls.
+// -----------------------------------------------------------------------
+class ReselectFakeBackend : public FakeBackend {
+public:
+	ReselectFakeBackend(int stream_id, int frame_count,
+			std::atomic<int> *live, std::atomic<long> *released,
+			int decode_micros = 0) :
+			FakeBackend(stream_id, frame_count, live, released, decode_micros),
+			active_track_(0) {}
+
+	int audio_track_count() const override { return 2; }
+
+	core::AudioTrackInfo audio_track_info(int index) const override {
+		core::AudioTrackInfo info;
+		info.channels = 2;
+		info.sample_rate = 48000;
+		info.is_default = (index == 0);
+		return info;
+	}
+
+	void select_audio_track(int index) override {
+		if (index >= 0 && index < 2) {
+			active_track_ = index;
+		}
+	}
+
+	bool reselect_audio_track(int index, double /*pts_seconds*/) override {
+		if (index < 0 || index >= 2) {
+			return false;
+		}
+		active_track_ = index;
+		reselect_count_++;
+		return true;
+	}
+
+	std::optional<core::AudioChunk> next_audio_chunk() override {
+		// Produce a frame whose frame_count encodes the active track (0 or 1) so
+		// the caller can verify which track is flowing. Track 0 produces 512-frame
+		// chunks; track 1 produces 256-frame chunks.
+		const int frames_per_chunk = (active_track_ == 0) ? 512 : 256;
+		const int channels = 2;
+		const size_t n = static_cast<size_t>(frames_per_chunk * channels);
+		if (audio_scratch_.size() < n) {
+			audio_scratch_.resize(n);
+		}
+		std::memset(audio_scratch_.data(), 0, n * sizeof(float));
+		// Tag the first sample with the active track so a test can assert.
+		audio_scratch_[0] = static_cast<float>(active_track_);
+
+		core::AudioChunk chunk;
+		chunk.samples = audio_scratch_.data();
+		chunk.frame_count = frames_per_chunk;
+		chunk.channel_count = channels;
+		chunk.sample_rate = 48000;
+		return chunk;
+	}
+
+	int reselect_count() const { return reselect_count_; }
+	int active_track() const { return active_track_; }
+
+private:
+	int active_track_ = 0;
+	int reselect_count_ = 0;
+	std::vector<float> audio_scratch_;
+};
+
+// -----------------------------------------------------------------------
+// reselect_audio_track: verify that a reselect switches audio tracks and
+// does NOT break the video decode pipeline (frames continue flowing).
+// -----------------------------------------------------------------------
+TEST_CASE("reselect_audio_track switches audio and preserves video flow") {
+	std::atomic<int> live{ 0 };
+	std::atomic<long> released{ 0 };
+
+	DecodeScheduler sched(2);
+	auto s = sched.register_stream(
+			std::make_unique<ReselectFakeBackend>(0, 200, &live, &released));
+
+	// Let video decode-ahead start filling the queue.
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+	// Verify video frames flow (checking the present path works).
+	auto vf = sched.next_frame(s);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (!vf.has_value()) {
+		std::this_thread::sleep_for(std::chrono::microseconds(50));
+		vf = sched.next_frame(s);
+		REQUIRE(std::chrono::steady_clock::now() < deadline);
+	}
+	CHECK(vf->width == 0); // stream 0
+	if (vf->release) {
+		vf->release();
+	}
+
+	// Verify the initial audio track is 0.
+	int initial_track = 0;
+	sched.with_backend(s, [&](core::Backend &b) {
+		auto ch = b.next_audio_chunk();
+		REQUIRE(ch.has_value());
+		CHECK(ch->frame_count == 512); // track 0 = 512 frames/chunk
+		initial_track = static_cast<int>(ch->samples[0]);
+	});
+	CHECK(initial_track == 0);
+
+	// Reselect to track 1.
+	bool reselect_ok = false;
+	sched.with_backend(s, [&](core::Backend &b) {
+		reselect_ok = b.reselect_audio_track(1, 0.0);
+	});
+	CHECK(reselect_ok);
+
+	// Verify video still flows post-reselect (the video decode pipeline was not
+	// broken by the reselect).
+	vf = sched.next_frame(s);
+	while (!vf.has_value()) {
+		std::this_thread::sleep_for(std::chrono::microseconds(50));
+		vf = sched.next_frame(s);
+		REQUIRE(std::chrono::steady_clock::now() < deadline);
+	}
+	CHECK(vf->width == 0); // still stream 0, not corrupted
+	if (vf->release) {
+		vf->release();
+	}
+
+	// Verify the active audio track is now 1.
+	int switched_track = -1;
+	sched.with_backend(s, [&](core::Backend &b) {
+		auto ch = b.next_audio_chunk();
+		REQUIRE(ch.has_value());
+		CHECK(ch->frame_count == 256); // track 1 = 256 frames/chunk
+		switched_track = static_cast<int>(ch->samples[0]);
+	});
+	CHECK(switched_track == 1);
+
+	sched.unregister_stream(s);
+	CHECK(live.load() == 0);
+}
+
+// -----------------------------------------------------------------------
+// with_backend serialization: verify that reselect via with_backend is
+// serialized against worker decode (the stream is busy_ during reselect).
+// -----------------------------------------------------------------------
+TEST_CASE("with_backend is serialized against worker decode during reselect") {
+	std::atomic<int> live{ 0 };
+	std::atomic<long> released{ 0 };
+
+	DecodeScheduler sched(2);
+	auto s = sched.register_stream(
+			std::make_unique<ReselectFakeBackend>(0, 100, &live, &released));
+
+	// Let the worker start decoding ahead.
+	std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+	// Call with_backend while the worker may be decoding. The test passes if
+	// the reselect succeeds and video still flows afterwards (no deadlock).
+	bool reselect_ok = false;
+	sched.with_backend(s, [&](core::Backend &b) {
+		reselect_ok = b.reselect_audio_track(1, 0.0);
+	});
+	CHECK(reselect_ok);
+
+	// Consume a few video frames to verify the worker woke up after our
+	// with_backend released the busy claim.
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	int consumed = 0;
+	while (consumed < 3) {
+		auto vf = sched.next_frame(s);
+		if (vf.has_value()) {
+			if (vf->release) {
+				vf->release();
+			}
+			++consumed;
+		} else {
+			std::this_thread::sleep_for(std::chrono::microseconds(50));
+		}
+		REQUIRE(std::chrono::steady_clock::now() < deadline);
+	}
+	CHECK(consumed == 3);
+
+	sched.unregister_stream(s);
+	CHECK(live.load() == 0);
+}

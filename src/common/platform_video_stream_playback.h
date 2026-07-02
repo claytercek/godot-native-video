@@ -42,7 +42,7 @@
 #include <godot_cpp/variant/packed_float32_array.hpp>
 
 #include <memory>
-#include <optional>
+#include <vector>
 
 #include "../core/audio_ring.h"
 #include "../core/backend.h"
@@ -121,6 +121,16 @@ private:
 	// The current master clock (audio-master when audio present, else monotonic).
 	core::Clock *master() const;
 
+	// Reconcile the live (backend-decoding) audio track with the desired
+	// (user-requested) one. A no-op when they already agree or when there is
+	// no stream. Stopped/pre-play: applies cheaply via select_audio_track
+	// (deferred in the backend until its next seek). Playing or paused:
+	// hands the clock off to monotonic, reselects at `position_` through the
+	// scheduler, and either converges live_track_ to desired_track_ on
+	// success or rolls desired_track_ back to live_track_ and forces a
+	// recovery seek on failure.
+	void reconcile_audio_track();
+
 	// Apply a scrubber decision to the stream. Keyframe -> a tolerant keyframe
 	// reseek (the scheduler flushes + reseeks; the next decoded frame is presented
 	// for instant feedback). Exact -> reseek to the preceding keyframe then decode
@@ -144,13 +154,12 @@ private:
 	// each _update() to fire the deferred exact resolve once a drag settles.
 	core::Scrubber scrubber_;
 
-	// Master-clock implementations. Exactly one is "the master" per clip:
-	//  - audio_clock_ when the clip has an audio track (samples-consumed ÷ rate,
-	//    latency-compensated), driven by drive_audio() from real consumption.
-	//  - mono_clock_  for silent clips.
+	// ClockBridge wraps both an AudioMasterClock and a MonotonicClock, delegating
+	// to whichever is currently the active master. During a mid-stream track switch
+	// the bridge hands off from audio to monotonic so video keeps advancing through
+	// the silence gap, then re-anchors to audio when the new track's samples flow.
 	// Either way, once audio_exhausted() the master advances by render delta.
-	std::unique_ptr<core::AudioMasterClock> audio_clock_;
-	std::unique_ptr<core::MonotonicClock> mono_clock_;
+	std::unique_ptr<core::ClockBridge> clock_;
 
 	// PCM staging between the backend's audio chunks and Godot's mix_audio().
 	std::unique_ptr<core::AudioRing> audio_ring_;
@@ -165,19 +174,20 @@ private:
 	// object only tracks audio EOS for the end-of-playback condition.
 	bool audio_eos_ = false; // audio end-of-stream
 	bool has_audio_ = false; // clip carries an audio track -> audio is master
-	// Audio track selection. Set before play via _set_audio_track(). A value
-	// of 0 (the default) selects the first track; values >= audio_track_count_
-	// are clamped to the default by the backend.
-	int audio_track_selection_ = 0;
 	int audio_track_count_ = 0; // cached from backend at load time
 	double length_ = 0.0;
 	double position_ = 0.0; // PTS of the most recently presented frame
 
-	// Canonical Mix Format: the maximum channel count across all audio tracks
-	// at the clip's shared sample rate. Godot queries these exactly once at play
-	// start (_get_channels / _get_mix_rate), so they must be stable for the
-	// playback's entire lifetime. The channel mixer converts each backend chunk's
-	// native channel layout to the canonical format before writing to the ring.
+	// Canonical Mix Format: canonical_channels_ is the maximum channel count
+	// across all audio tracks (clamped to kMaxMixSourceChannels).
+	// canonical_sample_rate_ is the FIRST audio-bearing track's rate, NOT a
+	// shared rate across tracks — mixed-sample-rate clips are a documented
+	// limitation (load() warns once if a later track differs; a mid-stream
+	// switch to a differing rate is refused). Godot queries these exactly
+	// once at play start (_get_channels / _get_mix_rate), so they must be
+	// stable for the playback's entire lifetime. The channel mixer converts
+	// each backend chunk's native channel layout to the canonical format
+	// before writing to the ring.
 	int canonical_channels_ = 0;
 	int canonical_sample_rate_ = 0;
 
@@ -191,6 +201,30 @@ private:
 	// Cached colorimetry from the backend. Default-constructed (all Unspecified,
 	// 8-bit) until load() overwrites it with the backend's negotiated values.
 	core::Colorimetry color_;
+
+	// --- Audio track reconcile state ---
+	//
+	// desired_track_ and live_track_ converge by construction via
+	// reconcile_audio_track(): desired_track_ is what the user asked for
+	// (via _set_audio_track()), live_track_ is what the backend is actually
+	// decoding. They can disagree only between a _set_audio_track() call and
+	// the next reconcile; a failed reselect rolls desired_track_ back to
+	// live_track_ instead of leaving the two permanently out of sync.
+
+	// What the user asked for, via _set_audio_track().
+	int desired_track_ = 0;
+	// What the backend is currently decoding.
+	int live_track_ = 0;
+
+	// True between a mid-stream reselect and the first audio chunk from the
+	// new track. During this window the ClockBridge is in monotonic-master
+	// mode so video keeps advancing while audio is silent.
+	bool switch_in_progress_ = false;
+
+	// Per-track audio metadata cached at load time for sample-rate validation
+	// during mid-stream track switches (the backend is behind the scheduler's
+	// per-stream exclusion, so we cache the info we need for the fast path).
+	std::vector<core::AudioTrackInfo> track_infos_;
 };
 
 } // namespace godot
