@@ -41,7 +41,11 @@ jobs:
         run: ./bin/core_tests --reporters=console --no-intro
 
       - name: Install ffmpeg (for synthetic media generator smoke-test)
-        run: brew install ffmpeg
+        # ffmpeg-full (not the plain ffmpeg formula) is required for drawtext
+        # filter support (libfreetype/fontconfig), used to stamp frame numbers.
+        run: |
+          brew install ffmpeg-full
+          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
 
       - name: Generate synthetic test media
         run: |
@@ -68,7 +72,11 @@ jobs:
       - name: Install ffmpeg
         # ffmpeg is a TEST-ONLY tool (never a runtime dependency). It regenerates
         # the real-clip matrix here so CI does not depend on Git LFS bandwidth.
-        run: brew install ffmpeg
+        # ffmpeg-full (not the plain ffmpeg formula) is required for drawtext
+        # filter support (libfreetype/fontconfig), used to stamp frame numbers.
+        run: |
+          brew install ffmpeg-full
+          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
 
       - name: Generate real-clip matrix
         run: bash tools/gen_clip_matrix.sh
