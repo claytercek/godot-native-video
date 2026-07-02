@@ -53,6 +53,16 @@ command -v ffmpeg >/dev/null 2>&1 || {
 
 mkdir -p "${OUTPUT_DIR}"
 
+# drawtext font selection. On Windows, fontconfig-enabled ffmpeg builds crash
+# resolving a font *family* (no fontconfig config file ships with the binary),
+# so point freetype at a concrete font file instead. Elsewhere the family
+# lookup works and stays font-installation agnostic.
+if [[ "${OS:-}" == "Windows_NT" ]]; then
+    DRAWTEXT_FONT="fontfile='C\\:/Windows/Fonts/consola.ttf'"
+else
+    DRAWTEXT_FONT="font=monospace"
+fi
+
 SAMPLE_RATE=48000
 WIDTH=320
 HEIGHT=240
@@ -146,7 +156,7 @@ gen_clip() {
 
     local video_filter="color=black:size=${WIDTH}x${HEIGHT}:rate=${fps}:duration=${duration}[base];"
     video_filter+="[base]drawbox=x=0:y=0:w=80:h=80:color=white:t=fill,"
-    video_filter+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:font=monospace[video_out]"
+    video_filter+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:${DRAWTEXT_FONT}[video_out]"
 
     local vcodec
     case "${codec}" in
