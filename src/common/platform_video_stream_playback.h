@@ -46,6 +46,7 @@
 
 #include "../core/audio_ring.h"
 #include "../core/backend.h"
+#include "../core/channel_mixer.h"
 #include "../core/clock.h"
 #include "../core/decode_scheduler.h"
 #include "../core/present_selector.h"
@@ -172,8 +173,17 @@ private:
 	double length_ = 0.0;
 	double position_ = 0.0; // PTS of the most recently presented frame
 
-	int channels_ = 0;
-	int sample_rate_ = 0;
+	// Canonical Mix Format: the maximum channel count across all audio tracks
+	// at the clip's shared sample rate. Godot queries these exactly once at play
+	// start (_get_channels / _get_mix_rate), so they must be stable for the
+	// playback's entire lifetime. The channel mixer converts each backend chunk's
+	// native channel layout to the canonical format before writing to the ring.
+	int canonical_channels_ = 0;
+	int canonical_sample_rate_ = 0;
+
+	// Scratch buffer for the channel mixer; resized as needed in fill_audio().
+	// Kept as a member to avoid per-call allocations on the decode path.
+	std::vector<float> mix_scratch_;
 
 	int width_ = 0;
 	int height_ = 0;
