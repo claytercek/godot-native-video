@@ -94,6 +94,18 @@ float bt709_oetf(float L) {
 }
 
 // -----------------------------------------------------------------------
+// BT.709 EOTF (inverse OETF) — BT.709-6 §2.1 / sRGB.
+//
+// Maps non-linear signal V ∈ [0, 1] → linear luminance L ∈ [0, 1].
+// -----------------------------------------------------------------------
+float bt709_eotf(float V) {
+	if (V < 0.04045) {
+		return V / 12.92;
+	}
+	return pow((V + 0.055) / 1.055, 2.4);
+}
+
+// -----------------------------------------------------------------------
 // Per-channel HDR → SDR conversion for one rgb triple.
 //
 // Input:  rgb — non-linear PQ or HLG encoded in BT.2020 primaries.

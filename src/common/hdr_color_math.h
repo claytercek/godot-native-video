@@ -143,6 +143,18 @@ inline double bt709_oetf(double L) noexcept {
 }
 
 // =======================================================================
+// BT.709 EOTF (inverse OETF) — BT.709-6 §2.1 / sRGB.
+//
+// Maps non-linear signal V ∈ [0, 1] → linear luminance L ∈ [0, 1].
+// =======================================================================
+inline double bt709_eotf(double V) noexcept {
+	if (V < 0.04045) {
+		return V / 12.92;
+	}
+	return std::pow((V + 0.055) / 1.055, 2.4);
+}
+
+// =======================================================================
 // Convenience: full HDR → SDR pixel conversion for one RGB triple.
 //
 // Input:  R, G, B in non-linear PQ or HLG encoded domain, BT.2020 primaries.

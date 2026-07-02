@@ -34,6 +34,11 @@ PlatformVideoStreamPlayback::~PlatformVideoStreamPlayback() {
 
 void PlatformVideoStreamPlayback::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_color_info"), &PlatformVideoStreamPlayback::get_color_info);
+
+	ClassDB::bind_method(D_METHOD("set_output_mode", "mode"), &PlatformVideoStreamPlayback::set_output_mode);
+	ClassDB::bind_method(D_METHOD("get_output_mode"), &PlatformVideoStreamPlayback::get_output_mode);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "output_mode", PROPERTY_HINT_ENUM, "SDR,HDR"),
+			"set_output_mode", "get_output_mode");
 }
 
 bool PlatformVideoStreamPlayback::load(const String &path) {
@@ -436,5 +441,21 @@ Dictionary PlatformVideoStreamPlayback::get_color_info() const {
 	info["transfer"] = color_transfer_;
 	info["range"] = color_range_;
 	info["bit_depth"] = color_bit_depth_;
+	// Report the effective output mode so callers can distinguish between
+	// an SDR clip in HDR viewport vs a native HDR clip.
+	info["output_mode"] = static_cast<int>(present_.output_mode());
 	return info;
+}
+
+void PlatformVideoStreamPlayback::set_output_mode(int mode) {
+	if (mode < 0 || mode > 1) {
+		return;
+	}
+	auto om = (mode == 1) ? platform_media::OutputMode::HDR
+						  : platform_media::OutputMode::SDR;
+	present_.set_output_mode(om);
+}
+
+int PlatformVideoStreamPlayback::get_output_mode() const {
+	return static_cast<int>(present_.output_mode());
 }
