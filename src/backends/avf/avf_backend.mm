@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace avf {
@@ -40,6 +41,16 @@ public:
 
 	AVAssetTrack *video_track = nil;
 	AVAssetTrack *audio_track = nil;
+
+	// Per-track audio metadata. Populated during open().
+	struct TrackMeta {
+		std::string language;
+		std::string name;
+		int channels = 0;
+		int sample_rate = 0;
+		bool is_default = false;
+	};
+	std::vector<TrackMeta> audio_tracks;
 
 	std::string path;
 
@@ -351,9 +362,46 @@ bool AvfBackend::open(const std::string &url_or_path) {
 				}
 			}
 		}
-		if (atracks.count > 0) {
-			impl_->audio_track = atracks[0];
-			// Pull channel count + sample rate from the format description.
+		// Enumerate all audio tracks with per-track metadata.
+	impl_->audio_tracks.clear();
+	for (AVAssetTrack *at in atracks) {
+		Impl::TrackMeta meta;
+
+		// Language: use the extended language tag (BCP 47) when available,
+		// falling back to the ISO 639-2 language code.
+		if (NSString *lang = at.extendedLanguageTag) {
+			meta.language = std::string([lang UTF8String]);
+		} else if (NSString *code = at.languageCode) {
+			meta.language = std::string([code UTF8String]);
+		}
+
+		// Name: not directly available on all macOS deployments; we leave it
+		// empty in v1. The language code serves as a surrogate identifier.
+
+		// The first audio track is the container default when no explicit
+		// default flag is present in the container metadata.
+		meta.is_default = (impl_->audio_tracks.empty());
+
+		// Channel count and sample rate from the format description.
+		NSArray *fmts = at.formatDescriptions;
+		if (fmts.count > 0) {
+			CMAudioFormatDescriptionRef afd =
+					(__bridge CMAudioFormatDescriptionRef)fmts[0];
+			const AudioStreamBasicDescription *asbd =
+					CMAudioFormatDescriptionGetStreamBasicDescription(afd);
+			if (asbd) {
+				meta.channels = static_cast<int>(asbd->mChannelsPerFrame);
+				meta.sample_rate = static_cast<int>(asbd->mSampleRate);
+			}
+		}
+		impl_->audio_tracks.push_back(meta);
+	}
+
+	// Set the single-track legacy fields from the first audio track.
+	if (atracks.count > 0) {
+		impl_->audio_track = atracks[0];
+		if (impl_->audio_tracks.empty()) {
+			// Fallback: read format directly from the track.
 			NSArray *fmts = impl_->audio_track.formatDescriptions;
 			if (fmts.count > 0) {
 				CMAudioFormatDescriptionRef afd =
@@ -365,7 +413,11 @@ bool AvfBackend::open(const std::string &url_or_path) {
 					impl_->audio_rate = static_cast<int>(asbd->mSampleRate);
 				}
 			}
+		} else {
+			impl_->audio_channels = impl_->audio_tracks[0].channels;
+			impl_->audio_rate = impl_->audio_tracks[0].sample_rate;
 		}
+	}
 
 		if (!impl_->video_track && !impl_->audio_track) {
 			impl_->error = true;
@@ -399,6 +451,23 @@ int AvfBackend::audio_channel_count() const {
 }
 int AvfBackend::audio_sample_rate() const {
 	return impl_ ? impl_->audio_rate : 0;
+}
+int AvfBackend::audio_track_count() const {
+	return impl_ ? static_cast<int>(impl_->audio_tracks.size()) : 0;
+}
+core::AudioTrackInfo AvfBackend::audio_track_info(int index) const {
+	if (!impl_ || index < 0 ||
+			static_cast<size_t>(index) >= impl_->audio_tracks.size()) {
+		return {};
+	}
+	const auto &t = impl_->audio_tracks[static_cast<size_t>(index)];
+	core::AudioTrackInfo info;
+	info.language = t.language;
+	info.name = t.name;
+	info.channels = t.channels;
+	info.sample_rate = t.sample_rate;
+	info.is_default = t.is_default;
+	return info;
 }
 bool AvfBackend::had_error() const {
 	return impl_ && impl_->error;
