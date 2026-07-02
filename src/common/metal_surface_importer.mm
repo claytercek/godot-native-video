@@ -12,6 +12,8 @@
 
 #include "metal_surface_importer.h"
 
+#include "../core/backend.h" // core::PixelFormat
+
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 
@@ -86,7 +88,8 @@ bool MetalSurfaceImporter::is_initialized() const {
 // CVMetalTextureRef the caller must release after the RD texture is freed.
 static RID import_plane(RenderingDevice *rd, CVMetalTextureCacheRef cache,
 		CVPixelBufferRef pb, size_t plane,
-		RenderingDevice::DataFormat fmt, CVMetalTextureRef *out_cv_tex) {
+		RenderingDevice::DataFormat fmt, MTLPixelFormat mtl_fmt,
+		CVMetalTextureRef *out_cv_tex) {
 	*out_cv_tex = nullptr;
 
 	const size_t w = CVPixelBufferGetWidthOfPlane(pb, plane);
@@ -95,11 +98,8 @@ static RID import_plane(RenderingDevice *rd, CVMetalTextureCacheRef cache,
 		return RID();
 	}
 
-	// The Metal pixel format MUST match the RD DataFormat we declare below.
-	MTLPixelFormat mtl_fmt = MTLPixelFormatR8Unorm;
-	if (fmt == RenderingDevice::DATA_FORMAT_R8G8_UNORM) {
-		mtl_fmt = MTLPixelFormatRG8Unorm;
-	}
+	// The caller passes the MTLPixelFormat so 8-bit (R8/RG8) and 10-bit
+	// (R16Unorm/RG16Unorm) planes are both handled by this helper.
 
 	CVMetalTextureRef cv_tex = nullptr;
 	CVReturn cr = CVMetalTextureCacheCreateTextureFromImage(
@@ -149,12 +149,19 @@ PlaneTextures MetalSurfaceImporter::import(void *cv_pixel_buffer, uint32_t /*pla
 	CVPixelBufferRef pb = reinterpret_cast<CVPixelBufferRef>(cv_pixel_buffer);
 
 	const OSType pf = CVPixelBufferGetPixelFormatType(pb);
-	const bool is_nv12 =
+	const bool is_supported =
 			pf == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-			pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-	if (!is_nv12 || CVPixelBufferGetPlaneCount(pb) < 2) {
+			pf == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+			pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+			pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+	if (!is_supported || CVPixelBufferGetPlaneCount(pb) < 2) {
 		return out;
 	}
+
+	// Detect 10-bit vs 8-bit from the pixel format type.
+	const bool is_10bit =
+			pf == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+			pf == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
 
 	RenderingDevice *rd = impl_->rd;
 	CVMetalTextureCacheRef cache = impl_->texture_cache;
@@ -162,13 +169,32 @@ PlaneTextures MetalSurfaceImporter::import(void *cv_pixel_buffer, uint32_t /*pla
 	CVMetalTextureRef cv_luma = nullptr;
 	CVMetalTextureRef cv_chroma = nullptr;
 
-	RID luma = import_plane(rd, cache, pb, 0, RenderingDevice::DATA_FORMAT_R8_UNORM, &cv_luma);
+	RID luma;
+	RID chroma;
+
+	if (is_10bit) {
+		// 10-bit biplanar: each sample stored in 16 bits (lower 10 bits valid).
+		// Metal texture: R16Unorm luma, RG16Unorm interleaved chroma.
+		luma = import_plane(rd, cache, pb, 0,
+				RenderingDevice::DATA_FORMAT_R16_UNORM,
+				MTLPixelFormatR16Unorm, &cv_luma);
+		chroma = import_plane(rd, cache, pb, 1,
+				RenderingDevice::DATA_FORMAT_R16G16_UNORM,
+				MTLPixelFormatRG16Unorm, &cv_chroma);
+	} else {
+		// 8-bit NV12: each sample a single byte. R8 + RG8.
+		luma = import_plane(rd, cache, pb, 0,
+				RenderingDevice::DATA_FORMAT_R8_UNORM,
+				MTLPixelFormatR8Unorm, &cv_luma);
+		chroma = import_plane(rd, cache, pb, 1,
+				RenderingDevice::DATA_FORMAT_R8G8_UNORM,
+				MTLPixelFormatRG8Unorm, &cv_chroma);
+	}
+
 	if (!luma.is_valid()) {
 		return out;
 	}
-	RID chroma = import_plane(rd, cache, pb, 1, RenderingDevice::DATA_FORMAT_R8G8_UNORM, &cv_chroma);
 	if (!chroma.is_valid()) {
-		// Roll back the luma import to avoid a leak.
 		rd->free_rid(luma);
 		if (cv_luma) {
 			CFRelease(cv_luma);

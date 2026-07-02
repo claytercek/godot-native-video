@@ -6,7 +6,7 @@
 	<description>
 		A [VideoStream] that plays a native video clip through the platform's hardware decoder (AVFoundation on macOS, Windows Media Foundation on Windows) and presents frames to the GPU with no CPU copy. The decoded NV12 surface is imported via [code]RenderingDevice.texture_create_from_extension[/code] and converted to RGB in a single compute pass into an engine-owned [Texture2DRD] returned from the playback's texture; Godot never samples the decoder surface directly.
 		Drop a recognised clip ([code].mp4[/code], [code].mov[/code], [code].m4v[/code]) onto a stock [VideoStreamPlayer] to play it. Requires Godot 4.4+ and a [b]Forward+[/b] or [b]Mobile[/b] renderer (RenderingDevice); the Compatibility/OpenGL renderer is not supported.
-		Tested and supported scope (v1) is the 8-bit SDR core matrix: H.264 and HEVC video, MP4/MOV containers, NV12 / BT.709, and AAC stereo audio. 10-bit/HDR, VP9/AV1, and multi-track audio are out of scope for v1.
+		The v1 decode scope covers 8-bit and 10-bit SDR: H.264 and HEVC (Main/Main10) video, MP4/MOV containers, NV12 / x420 / BT.709, and AAC stereo audio. 10-bit sources on macOS negotiate the 10-bit biplanar decoder output ([code]x420[/code]) for full precision; the conversion shader normalises 10-bit payloads in 16-bit GPU words. HDR (PQ/HLG), VP9/AV1, and multi-track audio are not in scope.
 	</description>
 	<tutorials>
 	</tutorials>
@@ -19,10 +19,19 @@
 				[code]primaries[/code] (int): Color primaries — 0=Unspecified, 1=BT.709, 2=BT.601-625 (PAL), 3=BT.601-525 (NTSC), 4=BT.2020, 5=DCI-P3.
 				[code]transfer[/code] (int): Transfer function — 0=Unspecified, 1=BT.709, 2=PQ (SMPTE ST 2084), 3=HLG.
 				[code]range[/code] (int): Video range — 0=Unspecified, 1=Video (limited), 2=Full.
-				[code]bit_depth[/code] (int): Bits per channel (8 for the v1 SDR scope).
+				[code]bit_depth[/code] (int): Bits per channel (8 for 8-bit sources, 10 for 10-bit sources).
 				Untagged clips (no embedded colorimetry metadata) return BT.709, video-range defaults, which is pixel-identical to the legacy hard-coded conversion shader.
 				Must be called after [method VideoStreamPlayback.play] has started, i.e. after the stream has been opened by [VideoStreamPlayer].
 			</description>
 		</method>
 	</methods>
+	<methods_static>
+		<method name="hdr_decode_supported" qualifiers="static const">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] when the current platform supports hardware decoding of 10-bit (and HDR) video through the zero-copy pipeline. On macOS, [method hdr_decode_supported] always returns [code]true[/code] because the Metal-accelerated VideoToolbox can produce 10-bit biplanar surfaces (x420) that the Metal surface importer imports directly. On Windows and Linux, this returns [code]false[/code] — only 8-bit NV12 decode is supported on those platforms in this release.
+				Call this before loading a clip to decide whether to offer HDR playback options in the UI, or to present an informative message when the clip's bit depth exceeds the platform's decode capability.
+			</description>
+		</method>
+	</methods_static>
 </class>

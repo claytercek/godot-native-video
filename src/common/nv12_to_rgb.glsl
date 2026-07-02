@@ -4,20 +4,20 @@
 // -----------------------------------------------------------------------
 // nv12_to_rgb.glsl — the single GPU pass of the zero-copy present pipeline.
 //
-// Inputs are the two planes of a hardware-decoded NV12 surface, imported
-// zero-copy from the decoder's CVPixelBuffer/IOSurface via
+// Inputs are the two planes of a hardware-decoded biplanar Y'CbCr surface,
+// imported zero-copy from the decoder's CVPixelBuffer/IOSurface via
 // RenderingDevice::texture_create_from_extension (no CPU upload):
-//   - binding 0: luma plane  Y   — R8   (full resolution, value in .r)
-//   - binding 1: chroma plane CbCr — RG8 (half resolution, Cb in .r, Cr in .g)
+//   - binding 0: luma plane  Y   — R8 or R16   (full resolution, value in .r)
+//   - binding 1: chroma plane CbCr — RG8 or RG16 (half res, Cb in .r, Cr in .g)
 //
 // Output is an engine-owned RGBA8 storage image that Godot samples through a
 // Texture2DRD. Godot never samples the decoder planes directly.
 //
 // Colour math: the YCbCr matrix and video/full-range normalisation are
 // selected by the push constants from per-frame metadata (matrix_select,
-// range_select), so BT.601 SD clips and P3-tagged content decode correctly.
-// Untagged clips default to BT.709 video range (matching the old hard-coded
-// behaviour).
+// range_select, bit_depth), so BT.601 SD clips, BT.2020 UHD clips, and 10-bit
+// sources all decode correctly. Untagged clips default to BT.709 video range
+// 8-bit (matching the old hard-coded behaviour).
 // -----------------------------------------------------------------------
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -25,8 +25,8 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // Sampled image bindings (combined sampler + texture). We sample with
 // normalised coordinates so the half-resolution chroma plane is bilinearly
 // upsampled for free by the sampler.
-layout(set = 0, binding = 0) uniform sampler2D luma_plane;   // Y
-layout(set = 0, binding = 1) uniform sampler2D chroma_plane; // CbCr
+layout(set = 0, binding = 0) uniform sampler2D luma_plane;   // Y  (R8 or R16)
+layout(set = 0, binding = 1) uniform sampler2D chroma_plane; // CbCr (RG8 or RG16)
 
 // Engine-owned output. rgba8 storage image.
 layout(set = 0, binding = 2, rgba8) uniform restrict writeonly image2D rgba_out;
@@ -36,6 +36,7 @@ layout(push_constant, std430) uniform Params {
 	uint out_height;
 	uint matrix_select; // 0=Unspecified, 1=BT.709, 2=BT.601, 3=BT.2020 (core::ColorMatrix)
 	uint range_select;  // 0=Unspecified, 1=Video, 2=Full (core::ColorRange)
+	uint bit_depth;     // 8 or 10
 } params;
 
 void main() {
@@ -52,28 +53,54 @@ void main() {
 	float y = texture(luma_plane, uv).r;
 	vec2 cbcr = texture(chroma_plane, uv).rg;
 
-	// Range normalisation — selects video or full range scaling.
-	//   Video range: Y' in [16,235], Cb/Cr in [16,240]  (9 dB headroom)
-	//   Full range:  Y' in [0,255],  Cb/Cr in [0,255]
-	float y_scale, y_offset;
-	float c_scale, c_offset;
-	if (params.range_select <= 1u) {
-		// Video (limited) range — also handles Unspecified (0) and Video (1)
-		y_scale  = 255.0 / 219.0;
-		y_offset = -16.0 / 219.0;
-		c_scale  = 255.0 / 224.0;
-		c_offset = -128.0 / 224.0;
+	// Range normalisation — selects video or full range scaling, adjusted for
+	// the bit depth of the source. 8-bit samples are R8Unorm (stored as single
+	// byte, GPU normalises by /255); 10-bit samples are R16Unorm/RG16Unorm
+	// (stored as 16-bit uint with the 10-bit value in the low bits, GPU
+	// normalises by /65535). We rescale the GPU read back to the actual code
+	// value and apply the bit-depth-correct range limits.
+	//
+	//     8-bit video: Y [16,235], Cb/Cr [16,240]
+	//    10-bit video: Y [64,940], Cb/Cr [64,960]
+	//     8-bit full:  Y [0,255],  Cb/Cr [0,255]
+	//    10-bit full:  Y [0,1023], Cb/Cr [0,1023]
+	float yf, cb, cr;
+	if (params.bit_depth == 10u) {
+		// 10-bit: R16Unorm gives us stored_value / 65535 in [0,1]. The 10-bit
+		// value occupies the low 10 bits of the 16-bit container, so the actual
+		// code value is stored_value = gpu_read * 65535 (resulting in [0,1023]).
+		float y10 = y * 65535.0;
+		float cb10 = cbcr.r * 65535.0;
+		float cr10 = cbcr.g * 65535.0;
+		if (params.range_select <= 1u) {
+			// Video (limited) range — also handles Unspecified (0) and Video (1)
+			yf = (y10 - 64.0) / 876.0;
+			cb = (cb10 - 512.0) / 896.0;
+			cr = (cr10 - 512.0) / 896.0;
+		} else {
+			// Full range (2): 10-bit [0,1023]
+			yf = y10 / 1023.0;
+			cb = (cb10 - 512.0) / 1023.0;
+			cr = (cr10 - 512.0) / 1023.0;
+		}
 	} else {
-		// Full range
-		y_scale  = 1.0;
-		y_offset = 0.0;
-		c_scale  = 1.0;
-		c_offset = -128.0 / 255.0;
+		// 8-bit: R8Unorm gives us stored_value / 255 in [0,1]; the code value
+		// is gpu_read * 255 (resulting in [0,255]).
+		float y8 = y * 255.0;
+		float cb8 = cbcr.r * 255.0;
+		float cr8 = cbcr.g * 255.0;
+		if (params.range_select <= 1u) {
+			// Video (limited) range — also handles Unspecified (0) and Video (1)
+			yf = (y8 - 16.0) / 219.0;
+			cb = (cb8 - 128.0) / 224.0;
+			cr = (cr8 - 128.0) / 224.0;
+		} else {
+			// Full range (2): 8-bit [0,255]
+			yf = y8 / 255.0;
+			cb = (cb8 - 128.0) / 255.0;
+			cr = (cr8 - 128.0) / 255.0;
+		}
 	}
-
-	float yf  = y  * y_scale  + y_offset;
-	float cb  = cbcr.r * c_scale + c_offset;
-	float cr  = cbcr.g * c_scale + c_offset;
 
 	// YCbCr -> RGB matrix selection.
 	//
