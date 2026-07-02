@@ -223,7 +223,10 @@ public:
 	// On AVFoundation this creates a dedicated audio-only AVAssetReader
 	// (since a shared reader cannot reseek audio without destroying the
 	// video decode session). On Media Foundation this toggles per-stream
-	// selection on the existing IMFSourceReader.
+	// selection on the existing IMFSourceReader — the shared reader's
+	// position is unchanged, so `pts_seconds` is advisory (the audio
+	// starts from wherever the reader currently is, which should be at
+	// the same position as the video stream).
 	//
 	// Returns true on success. On failure the audio decode path is left in
 	// an undefined state; the caller should seek() to recover.

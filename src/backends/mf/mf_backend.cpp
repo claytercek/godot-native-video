@@ -644,7 +644,7 @@ void MfBackend::select_audio_track(int index) {
 	impl_->switch_audio_track(clamped);
 }
 
-bool MfBackend::reselect_audio_track(int index, double pts_seconds) {
+bool MfBackend::reselect_audio_track(int index, double /*pts_seconds*/) {
 	if (!impl_ || impl_->audio_stream_indices.empty()) {
 		return false;
 	}
@@ -656,12 +656,14 @@ bool MfBackend::reselect_audio_track(int index, double pts_seconds) {
 	// MF supports per-stream selection on the existing IMFSourceReader.
 	// switch_audio_track deselects the old audio stream and selects the new
 	// one, applying float PCM output on the new stream. The reader's current
-	// position is left unchanged so video decode is undisturbed; audio from
-	// the new track starts at the video stream's current position.
-	// switch_audio_track handles the actual stream toggle and PCM
-	// reconfiguration. The reader's current position is unchanged so video
-	// decode is undisturbed; audio from the new track starts at the reader's
-	// current position (within one chunk of `pts_seconds`).
+	// position is left unchanged (video decode stays undisturbed), so the new
+	// audio track starts from wherever the reader currently is — the caller
+	// is expected to pass the current video position as `pts_seconds`.
+	//
+	// Unlike AVFoundation, MF cannot seek the shared reader's audio position
+	// without also disturbing the video side, so `pts_seconds` is intentionally
+	// advisory: it documents the intended prime position but the actual start
+	// depends on the reader's interleaved position.
 	if (!impl_->switch_audio_track(clamped)) {
 		return false;
 	}
