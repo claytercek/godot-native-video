@@ -93,6 +93,7 @@ MATRIX=(
     "hevc_24_mov hevc 24 mov 24"
     "h264_30_m4v h264 30 m4v 30"
     "h264_30_bt601_mp4 h264_bt601 30 mp4 30"
+    "hevc_main10_30_mp4 hevc10 30 mp4 30"
 )
 
 # Write the manifests the coverage tests consume, derived from MATRIX so the
@@ -171,6 +172,7 @@ gen_clip() {
         h264_bt601) vcodec=(-c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
             -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m) ;;
         hevc) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p -tag:v hvc1) ;;
+        hevc10) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p10le -tag:v hvc1) ;;
         *) echo "ERROR: unknown codec ${codec}" >&2; return 1 ;;
     esac
 
@@ -206,7 +208,7 @@ for row in "${MATRIX[@]}"; do
     # shellcheck disable=SC2086
     set -- ${row}
     name="$1" codec="$2"
-    if [[ "${codec}" == "hevc" && "${have_x265}" -eq 0 ]]; then
+    if [[ ( "${codec}" == "hevc" || "${codec}" == "hevc10" ) && "${have_x265}" -eq 0 ]]; then
         echo "WARN: libx265 not available; skipping ${name}" >&2
         continue
     fi

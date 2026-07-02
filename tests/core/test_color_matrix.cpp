@@ -64,6 +64,18 @@ struct Bt709Coeffs {
 	static constexpr double g_cr = -2.0 * Kr * (1.0 - Kr) / Kg; // -2*0.2126*0.7874/0.7152 = -0.4681
 };
 
+// BT.2020 coefficients (UHD, ITU-R BT.2020-2)
+struct Bt2020Coeffs {
+	static constexpr double Kr = 0.2627;
+	static constexpr double Kb = 0.0593;
+	static constexpr double Kg = 1.0 - Kr - Kb; // 0.6780
+
+	static constexpr double r_cr = 2.0 * (1.0 - Kr);   // 2 * 0.7373 = 1.4746
+	static constexpr double b_cb = 2.0 * (1.0 - Kb);   // 2 * 0.9407 = 1.8814
+	static constexpr double g_cb = -2.0 * Kb * (1.0 - Kb) / Kg; // -2*0.0593*0.9407/0.6780 = -0.1645
+	static constexpr double g_cr = -2.0 * Kr * (1.0 - Kr) / Kg; // -2*0.2627*0.7373/0.6780 = -0.5714
+};
+
 // Convert Y'CbCr to R'G'B' using the given coefficients.
 // All values in nominal [0,1]/[-0.5,0.5] linear range.
 static void ycbcr_to_rgb(double y, double cb, double cr,
@@ -110,6 +122,14 @@ TEST_CASE("BT.709 matrix coefficients match ITU-R BT.709-6") {
 	CHECK(std::fabs(Bt709Coeffs::g_cr - (-0.46812)) < kTol);
 }
 
+TEST_CASE("BT.2020 matrix coefficients match ITU-R BT.2020-2") {
+	// Verify derived coefficients are within 0.001 of the standard values.
+	CHECK(std::fabs(Bt2020Coeffs::r_cr - 1.4746) < kTol);  // R = Y + 1.4746*Cr
+	CHECK(std::fabs(Bt2020Coeffs::b_cb - 1.8814) < kTol);  // B = Y + 1.8814*Cb
+	CHECK(std::fabs(Bt2020Coeffs::g_cb - (-0.16455)) < kTol); // G = Y - 0.16455*Cb - 0.57135*Cr
+	CHECK(std::fabs(Bt2020Coeffs::g_cr - (-0.57135)) < kTol);
+}
+
 TEST_CASE("White reference: BT.601 video-range YCbCr maps to RGB=1,1,1") {
 	// Video-range white: Y=235, Cb=128, Cr=128
 	double y = y_video_to_linear(235); // → 1.0
@@ -139,6 +159,60 @@ TEST_CASE("Black reference: BT.709 video-range YCbCr maps to RGB=0,0,0") {
 	CHECK(std::fabs(r - 0.0) < kTol);
 	CHECK(std::fabs(g - 0.0) < kTol);
 	CHECK(std::fabs(b - 0.0) < kTol);
+}
+
+TEST_CASE("BT.2020 black reference: video-range YCbCr maps to RGB=0,0,0") {
+	double y = y_video_to_linear(16);
+	double cb = c_video_to_linear(128);
+	double cr = c_video_to_linear(128);
+
+	double r, g, b;
+	ycbcr_to_rgb(y, cb, cr, r, g, b,
+			Bt2020Coeffs::r_cr, Bt2020Coeffs::g_cb,
+			Bt2020Coeffs::g_cr, Bt2020Coeffs::b_cb);
+
+	CHECK(std::fabs(r - 0.0) < kTol);
+	CHECK(std::fabs(g - 0.0) < kTol);
+	CHECK(std::fabs(b - 0.0) < kTol);
+}
+
+TEST_CASE("BT.2020 white reference: video-range YCbCr maps to RGB=1,1,1") {
+	double y = y_video_to_linear(235);
+	double cb = c_video_to_linear(128);
+	double cr = c_video_to_linear(128);
+
+	double r, g, b;
+	ycbcr_to_rgb(y, cb, cr, r, g, b,
+			Bt2020Coeffs::r_cr, Bt2020Coeffs::g_cb,
+			Bt2020Coeffs::g_cr, Bt2020Coeffs::b_cb);
+
+	CHECK(std::fabs(r - 1.0) < kTol);
+	CHECK(std::fabs(g - 1.0) < kTol);
+	CHECK(std::fabs(b - 1.0) < kTol);
+}
+
+TEST_CASE("BT.2020 and BT.709 produce different RGB for the same YCbCr (UHD vs HD)") {
+	constexpr uint8_t y_samp = 30;
+	constexpr uint8_t cb_samp = 240;
+	constexpr uint8_t cr_samp = 110;
+
+	double y = y_video_to_linear(y_samp);
+	double cb = c_video_to_linear(cb_samp);
+	double cr = c_video_to_linear(cr_samp);
+
+	double r2020, g2020, b2020;
+	double r709, g709, b709;
+
+	ycbcr_to_rgb(y, cb, cr, r2020, g2020, b2020,
+			Bt2020Coeffs::r_cr, Bt2020Coeffs::g_cb,
+			Bt2020Coeffs::g_cr, Bt2020Coeffs::b_cb);
+
+	ycbcr_to_rgb(y, cb, cr, r709, g709, b709,
+			Bt709Coeffs::r_cr, Bt709Coeffs::g_cb,
+			Bt709Coeffs::g_cr, Bt709Coeffs::b_cb);
+
+	const double diff = std::fabs(b2020 - b709) + std::fabs(g2020 - g709);
+	CHECK(diff > 0.01);
 }
 
 TEST_CASE("Red-dominant YCbCr decodes to R-heavy RGB: BT.601") {

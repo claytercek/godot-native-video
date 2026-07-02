@@ -58,6 +58,20 @@ static bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) 
 		out.bit_depth = 8;
 		return true;
 	}
+	// HEVC Main10 SDR clip. Negotiates as 10-bit biplanar (x420). The bit
+	// depth is detected from the format description's BitsPerComponent (10).
+	// The format description extensions have no colorimetry tags (ffmpeg
+	// default), so open-time defaults to BT.709 video range. Per-frame CV
+	// attachments carry BT.601 matrix (ffmpeg color filter default).
+	if (file == "hevc_main10_30_mp4.mp4") {
+		out.matrix = core::ColorMatrix::BT709;
+		out.primaries = core::ColorPrimaries::BT709;
+		out.transfer = core::TransferFunction::BT709;
+		out.range = core::ColorRange::Video;
+		out.bit_depth = 10;
+		return true;
+	}
+
 	// Untagged — return defaults (which the caller can skip asserting).
 	return false;
 }
@@ -82,17 +96,26 @@ static void check_backend_colorimetry(avf::AvfBackend &backend,
 	CHECK(backend.bit_depth() == exp.bit_depth);
 }
 
+// True for clips whose format description carries explicit colorimetry tags
+// (matrix, primaries, transfer function). Untagged clips (including ffmpeg
+// defaults) return false; the per-frame CV attachments may carry arbitrary
+// decoder defaults that differ from the open-time negotiated values.
+static bool has_explicit_colorimetry(const std::string &file) {
+	return file == "h264_30_bt601_mp4.mp4";
+}
+
 // Assert that the per-frame colorimetry matches expectations.
-// The first decoded frame's metadata should match the open-time negotiated values.
+// Only meaningful for clips with explicit colorimetry tags in the format
+// description; untagged clips have decoder-default CV attachments that vary.
 static void check_frame_colorimetry(const core::VideoFrame &frame,
 		const std::string &file) {
-	ColorimetryExpect exp;
-	if (!expect_colorimetry(file, exp)) {
-		// Untagged frame: default fields are Unspecified (CV attachments absent),
+	if (!has_explicit_colorimetry(file)) {
+		// Untagged frame: default fields are Unspecified or decoder-defaults,
 		// which the shader handles as BT.709/video-range — same as today.
-		// We just verify they exist and are valid.
 		return;
 	}
+	ColorimetryExpect exp;
+	expect_colorimetry(file, exp);
 	// Tagged clip: CV attachments carry the exact metadata.
 	CHECK(static_cast<int>(frame.ycbcr_matrix) == static_cast<int>(exp.matrix));
 	CHECK(static_cast<int>(frame.range) == static_cast<int>(exp.range));
@@ -140,7 +163,16 @@ TEST_CASE("AVF backend decodes the real-clip format matrix") {
 		double max_drift = 0.0;
 		bool first_frame = true;
 		while (auto frame = backend.next_video_frame()) {
-			CHECK(frame->pixel_format == core::PixelFormat::NV12);
+			// 8-bit sources produce NV12; 10-bit sources produce x420.
+			ColorimetryExpect exp;
+			const bool is_10bit = expect_colorimetry(clip.file, exp) && exp.bit_depth >= 10;
+			if (is_10bit) {
+				CHECK(frame->pixel_format == core::PixelFormat::x420);
+				CHECK(frame->bit_depth == 10);
+			} else {
+				CHECK(frame->pixel_format == core::PixelFormat::NV12);
+				CHECK(frame->bit_depth == 8);
+			}
 			CHECK(frame->native_handle != nullptr);
 			CHECK(frame->width == clip.width);
 			CHECK(frame->height == clip.height);

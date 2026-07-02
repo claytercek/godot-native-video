@@ -81,12 +81,26 @@ public:
 	}
 };
 
-// Configure the NV12 video output. BT.709 8-bit per D12: NV12 is
-// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange (video-range Y'CbCr).
-static AVAssetReaderTrackOutput *make_video_output(AVAssetTrack *track) {
+// Configure the biplanar Y'CbCr video output. Selects the pixel format based
+// on the source's bit depth (NV12 for 8-bit, x420 for 10-bit) and range
+// (video/full) matching the source. Requests an IOSurface-backed
+// buffer so the decode stays on the GPU path; the zero-copy present slice
+// imports the surface directly without a CPU copy.
+static AVAssetReaderTrackOutput *make_video_output(AVAssetTrack *track,
+		int bit_depth, core::ColorRange range) {
+	OSType pixel_format;
+	if (bit_depth >= 10) {
+		pixel_format = (range == core::ColorRange::Full)
+				? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange   // 'x42F'
+				: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange; // 'x420'
+	} else {
+		pixel_format = (range == core::ColorRange::Full)
+				? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange     // 'a420'
+				: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;   // '420v'
+	}
+
 	NSDictionary *settings = @{
-		(NSString *)kCVPixelBufferPixelFormatTypeKey :
-				@(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+		(NSString *)kCVPixelBufferPixelFormatTypeKey : @(pixel_format),
 		// Request an IOSurface-backed buffer so the decode stays on the GPU
 		// path; the zero-copy present slice will import this surface directly.
 		(NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{},
@@ -166,16 +180,23 @@ static void populate_colorimetry(CVPixelBufferRef pb, core::VideoFrame &frame) {
 		frame.transfer = parse_transfer_function(static_cast<CFStringRef>(val));
 		CFRelease(val);
 	}
-	// Range: determine from the pixel format type.
+	// Range: determine from the pixel format type (handles both 8-bit and 10-bit
+	// biplanar formats).
 	OSType fmt = CVPixelBufferGetPixelFormatType(pb);
-	if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+	if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+			fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
 		frame.range = core::ColorRange::Full;
 	} else {
-		// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange and all other formats
-		// are treated as video (limited) range.
+		// Video-range variants and all other formats are treated as video range.
 		frame.range = core::ColorRange::Video;
 	}
-	frame.bit_depth = 8; // All CVPixelBuffer formats we request are 8 bpc.
+	// Bit depth from the pixel format.
+	if (fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+			fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
+		frame.bit_depth = 10;
+	} else {
+		frame.bit_depth = 8;
+	}
 }
 
 bool AvfBackend::Impl::build_reader(double start_time) {
@@ -198,7 +219,8 @@ bool AvfBackend::Impl::build_reader(double start_time) {
 	}
 
 	if (video_track) {
-		AVAssetReaderTrackOutput *vo = make_video_output(video_track);
+		AVAssetReaderTrackOutput *vo = make_video_output(video_track,
+				bit_depth_, range_);
 		vo.alwaysCopiesSampleData = NO; // hand out the decoder's own surface
 		if ([r canAddOutput:vo]) {
 			[r addOutput:vo];
@@ -311,9 +333,27 @@ bool AvfBackend::open(const std::string &url_or_path) {
 					impl_->transfer_ = parse_transfer_function(val);
 				}
 
-				// Bit depth: default 8; read from the format description if available.
-				// kCMPixelFormat_420YpCbCr8BiPlanarVideoRange is what we request.
+				// Bit depth: detect from the format description's BitsPerComponent
+				// extension. 8-bit sources return 8, 10-bit sources (HEVC Main10)
+				// return 10. Default to 8 if absent (legacy behaviour).
 				impl_->bit_depth_ = 8;
+				CFNumberRef bpc_ref = (CFNumberRef)CMFormatDescriptionGetExtension(vfd,
+						kCMFormatDescriptionExtension_BitsPerComponent);
+				if (bpc_ref) {
+					int32_t bpc;
+					if (CFNumberGetValue(bpc_ref, kCFNumberSInt32Type, &bpc)) {
+						impl_->bit_depth_ = (bpc >= 10) ? 10 : 8;
+					}
+				}
+				// Source range: read from the format description extension. Default to
+				// video range (legacy behaviour).
+				CFBooleanRef full_range = (CFBooleanRef)CMFormatDescriptionGetExtension(vfd,
+						kCMFormatDescriptionExtension_FullRangeVideo);
+				if (full_range && CFBooleanGetValue(full_range)) {
+					impl_->range_ = core::ColorRange::Full;
+				} else {
+					impl_->range_ = core::ColorRange::Video;
+				}
 			}
 		}
 		if (atracks.count > 0) {
@@ -435,7 +475,14 @@ std::optional<core::VideoFrame> AvfBackend::next_video_frame() {
 		frame.native_handle = static_cast<void *>(owner.get());
 		frame.width = static_cast<int>(CVPixelBufferGetWidth(pb));
 		frame.height = static_cast<int>(CVPixelBufferGetHeight(pb));
-		frame.pixel_format = core::PixelFormat::NV12;
+		// Detect the pixel format from the actual CVPixelBuffer type.
+		OSType pb_fmt = CVPixelBufferGetPixelFormatType(pb);
+		if (pb_fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+				pb_fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
+			frame.pixel_format = core::PixelFormat::x420;
+		} else {
+			frame.pixel_format = core::PixelFormat::NV12;
+		}
 
 		// Move the owner into the release closure; when the consumer calls
 		// release() the buffer is dropped exactly once. shared_ptr lets the

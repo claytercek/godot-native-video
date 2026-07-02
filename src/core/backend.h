@@ -50,7 +50,8 @@ enum class ColorRange : uint8_t {
 // -----------------------------------------------------------------------
 enum class PixelFormat : uint8_t {
 	Unknown = 0,
-	NV12, // YUV 4:2:0 semi-planar (luma plane + interleaved UV plane)
+	NV12, // YUV 4:2:0 semi-planar, 8-bit (luma plane + interleaved UV plane)
+	x420, // YUV 4:2:0 semi-planar, 10-bit (16-bit containers: R16 + RG16)
 	BGRA8, // Packed BGRA, 8 bpc — fallback software path
 };
 
