@@ -79,6 +79,9 @@ HEIGHT=240
 #   hevc_24_mov : HEVC / 24 fps / mov container
 #   h264_30_m4v : H.264 / 30 fps / m4v container
 #
+#   h264_30_bt601_mp4 : H.264 / 30 fps / mp4, tagged BT.601 NTSC colorimetry
+#     (ffmpeg -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m)
+#
 # This array is the single source of truth; the matrix.list / matrix.json
 # manifests the tests read are generated from it (see write_manifests below).
 # -----------------------------------------------------------------------
@@ -89,6 +92,7 @@ MATRIX=(
     "hevc_30_mp4 hevc 30 mp4 30"
     "hevc_24_mov hevc 24 mov 24"
     "h264_30_m4v h264 30 m4v 30"
+    "h264_30_bt601_mp4 h264_bt601 30 mp4 30"
 )
 
 # Write the manifests the coverage tests consume, derived from MATRIX so the
@@ -164,6 +168,8 @@ gen_clip() {
     local vcodec
     case "${codec}" in
         h264) vcodec=(-c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p) ;;
+        h264_bt601) vcodec=(-c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p \
+            -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m) ;;
         hevc) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p -tag:v hvc1) ;;
         *) echo "ERROR: unknown codec ${codec}" >&2; return 1 ;;
     esac

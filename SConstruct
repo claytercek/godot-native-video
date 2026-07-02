@@ -55,6 +55,7 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_audio_eos_fallback.cpp",
         "tests/core/test_decode_scheduler.cpp",
         "tests/core/test_scrubber.cpp",
+        "tests/core/test_color_matrix.cpp",
         "src/core/decode_scheduler.cpp",
     ]
     # The force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG.

@@ -7,6 +7,7 @@
 #include <godot_cpp/classes/audio_server.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
 #include <godot_cpp/core/class_db.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include <algorithm>
@@ -32,7 +33,7 @@ PlatformVideoStreamPlayback::~PlatformVideoStreamPlayback() {
 }
 
 void PlatformVideoStreamPlayback::_bind_methods() {
-	// No script-facing API beyond the VideoStreamPlayback contract.
+	ClassDB::bind_method(D_METHOD("get_color_info"), &PlatformVideoStreamPlayback::get_color_info);
 }
 
 bool PlatformVideoStreamPlayback::load(const String &path) {
@@ -46,6 +47,15 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 	if (!backend->open(utf8)) {
 		return false;
 	}
+
+	// Cache colorimetry from the backend. These are populated at open time
+	// from the track's format descriptions; per-frame CV attachments may
+	// provide more accurate metadata at decode time.
+	color_matrix_ = static_cast<int>(backend->ycbcr_matrix());
+	color_primaries_ = static_cast<int>(backend->color_primaries());
+	color_transfer_ = static_cast<int>(backend->transfer_function());
+	color_range_ = static_cast<int>(backend->color_range());
+	color_bit_depth_ = backend->bit_depth();
 
 	length_ = backend->duration_seconds();
 	width_ = backend->video_width();
@@ -417,4 +427,14 @@ int PlatformVideoStreamPlayback::_get_mix_rate() const {
 	// Real backend sample rate (cached at load). The AudioServer resamples from
 	// this to the device rate; the master clock uses it for samples->seconds.
 	return sample_rate_;
+}
+
+Dictionary PlatformVideoStreamPlayback::get_color_info() const {
+	Dictionary info;
+	info["matrix"] = color_matrix_;
+	info["primaries"] = color_primaries_;
+	info["transfer"] = color_transfer_;
+	info["range"] = color_range_;
+	info["bit_depth"] = color_bit_depth_;
+	return info;
 }

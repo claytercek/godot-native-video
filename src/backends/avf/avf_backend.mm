@@ -49,6 +49,17 @@ public:
 	int audio_channels = 0;
 	int audio_rate = 0;
 
+	// Negotiated colorimetry (parsed from the video track's format descriptions
+	// at open time). Defaults: BT.709, video range (same as today's hard-coded
+	// shader constants). Per-frame values from CV attachments may differ from
+	// these per-sample metadata (e.g. a tagged clip that has attachments on the
+	// actual pixel buffers but empty format-description extensions).
+	core::ColorMatrix ycbcr_matrix_ = core::ColorMatrix::BT709;
+	core::ColorPrimaries primaries_ = core::ColorPrimaries::BT709;
+	core::TransferFunction transfer_ = core::TransferFunction::BT709;
+	core::ColorRange range_ = core::ColorRange::Video;
+	int bit_depth_ = 8;
+
 	bool error = false;
 
 	// Backing store for the most recent decoded audio chunk. core::AudioChunk
@@ -96,6 +107,75 @@ static AVAssetReaderTrackOutput *make_audio_output(AVAssetTrack *track) {
 	};
 	return [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track
 													  outputSettings:settings];
+}
+
+// -----------------------------------------------------------------------
+// Colorimetry helpers — parse CVImageBuffer attachment keys to our enums.
+// -----------------------------------------------------------------------
+
+// Parse YCbCr matrix from a CV attachment CFString.
+// Returns Unspecified (defaults to BT.709) when the tag is absent or unrecognised.
+static core::ColorMatrix parse_ycbcr_matrix(CFStringRef val) {
+	if (!val) return core::ColorMatrix::Unspecified;
+	if (CFEqual(val, kCVImageBufferYCbCrMatrix_ITU_R_709_2)) return core::ColorMatrix::BT709;
+	if (CFEqual(val, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) return core::ColorMatrix::BT601;
+	if (CFEqual(val, kCVImageBufferYCbCrMatrix_ITU_R_2020)) return core::ColorMatrix::BT2020;
+	return core::ColorMatrix::Unspecified;
+}
+
+// Parse color primaries from a CV attachment CFString.
+static core::ColorPrimaries parse_color_primaries(CFStringRef val) {
+	if (!val) return core::ColorPrimaries::Unspecified;
+	if (CFEqual(val, kCVImageBufferColorPrimaries_ITU_R_709_2)) return core::ColorPrimaries::BT709;
+	if (CFEqual(val, kCVImageBufferColorPrimaries_EBU_3213)) return core::ColorPrimaries::BT601_625;
+	if (CFEqual(val, kCVImageBufferColorPrimaries_SMPTE_C)) return core::ColorPrimaries::BT601_525;
+	if (CFEqual(val, kCVImageBufferColorPrimaries_ITU_R_2020)) return core::ColorPrimaries::BT2020;
+	if (CFEqual(val, kCVImageBufferColorPrimaries_DCI_P3)) return core::ColorPrimaries::DCI_P3;
+	return core::ColorPrimaries::Unspecified;
+}
+
+// Parse transfer function from a CV attachment CFString.
+static core::TransferFunction parse_transfer_function(CFStringRef val) {
+	if (!val) return core::TransferFunction::Unspecified;
+	if (CFEqual(val, kCVImageBufferTransferFunction_ITU_R_709_2)) return core::TransferFunction::BT709;
+	if (CFEqual(val, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)) return core::TransferFunction::PQ;
+	if (CFEqual(val, kCVImageBufferTransferFunction_ITU_R_2100_HLG)) return core::TransferFunction::HLG;
+	if (CFEqual(val, kCVImageBufferTransferFunction_sRGB)) return core::TransferFunction::BT709;
+	return core::TransferFunction::Unspecified;
+}
+
+// Read colorimetry from a CVPixelBuffer's CV attachment dictionary.
+static void populate_colorimetry(CVPixelBufferRef pb, core::VideoFrame &frame) {
+	// Read from CV attachment dictionary (the most reliable source for per-frame
+	// metadata). These are set by the decoder and reflect the actual encoded
+	// colour metadata.
+	CFTypeRef val;
+
+	val = CVBufferCopyAttachment(pb, kCVImageBufferYCbCrMatrixKey, nullptr);
+	if (val) {
+		frame.ycbcr_matrix = parse_ycbcr_matrix(static_cast<CFStringRef>(val));
+		CFRelease(val);
+	}
+	val = CVBufferCopyAttachment(pb, kCVImageBufferColorPrimariesKey, nullptr);
+	if (val) {
+		frame.primaries = parse_color_primaries(static_cast<CFStringRef>(val));
+		CFRelease(val);
+	}
+	val = CVBufferCopyAttachment(pb, kCVImageBufferTransferFunctionKey, nullptr);
+	if (val) {
+		frame.transfer = parse_transfer_function(static_cast<CFStringRef>(val));
+		CFRelease(val);
+	}
+	// Range: determine from the pixel format type.
+	OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+	if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+		frame.range = core::ColorRange::Full;
+	} else {
+		// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange and all other formats
+		// are treated as video (limited) range.
+		frame.range = core::ColorRange::Video;
+	}
+	frame.bit_depth = 8; // All CVPixelBuffer formats we request are 8 bpc.
 }
 
 bool AvfBackend::Impl::build_reader(double start_time) {
@@ -201,6 +281,40 @@ bool AvfBackend::open(const std::string &url_or_path) {
 			CGSize disp = CGSizeApplyAffineTransform(sz, impl_->video_track.preferredTransform);
 			impl_->width = static_cast<int>(std::abs(disp.width));
 			impl_->height = static_cast<int>(std::abs(disp.height));
+
+			// Parse colorimetry from the video track's format description extensions.
+			// These fields may be empty for untagged clips; in that case the
+			// defaults (BT.709, video range) stay in effect — pixel-identical to
+			// the old hard-coded behaviour. Per-frame CV attachments (which are
+			// more reliable) override these at decode time.
+			NSArray *vfmts = impl_->video_track.formatDescriptions;
+			if (vfmts.count > 0) {
+				CMVideoFormatDescriptionRef vfd =
+						(__bridge CMVideoFormatDescriptionRef)vfmts[0];
+				CFStringRef val;
+
+				val = (CFStringRef)CMFormatDescriptionGetExtension(vfd,
+						kCMFormatDescriptionExtension_YCbCrMatrix);
+				if (val) {
+					impl_->ycbcr_matrix_ = parse_ycbcr_matrix(val);
+				}
+
+				val = (CFStringRef)CMFormatDescriptionGetExtension(vfd,
+						kCMFormatDescriptionExtension_ColorPrimaries);
+				if (val) {
+					impl_->primaries_ = parse_color_primaries(val);
+				}
+
+				val = (CFStringRef)CMFormatDescriptionGetExtension(vfd,
+						kCMFormatDescriptionExtension_TransferFunction);
+				if (val) {
+					impl_->transfer_ = parse_transfer_function(val);
+				}
+
+				// Bit depth: default 8; read from the format description if available.
+				// kCMPixelFormat_420YpCbCr8BiPlanarVideoRange is what we request.
+				impl_->bit_depth_ = 8;
+			}
 		}
 		if (atracks.count > 0) {
 			impl_->audio_track = atracks[0];
@@ -253,6 +367,26 @@ int AvfBackend::audio_sample_rate() const {
 }
 bool AvfBackend::had_error() const {
 	return impl_ && impl_->error;
+}
+
+core::ColorMatrix AvfBackend::ycbcr_matrix() const {
+	return impl_ ? impl_->ycbcr_matrix_ : core::ColorMatrix::BT709;
+}
+
+core::ColorPrimaries AvfBackend::color_primaries() const {
+	return impl_ ? impl_->primaries_ : core::ColorPrimaries::BT709;
+}
+
+core::TransferFunction AvfBackend::transfer_function() const {
+	return impl_ ? impl_->transfer_ : core::TransferFunction::BT709;
+}
+
+core::ColorRange AvfBackend::color_range() const {
+	return impl_ ? impl_->range_ : core::ColorRange::Video;
+}
+
+int AvfBackend::bit_depth() const {
+	return impl_ ? impl_->bit_depth_ : 8;
 }
 
 bool AvfBackend::seek(double pts_seconds) {
@@ -308,6 +442,10 @@ std::optional<core::VideoFrame> AvfBackend::next_video_frame() {
 		// std::function (copyable) hold the move-only owner.
 		auto owner_holder = std::make_shared<PixelBufferRef>(std::move(owner));
 		frame.release = [owner_holder]() mutable { owner_holder->reset(); };
+
+		// Populate per-frame colorimetry from CVImageBuffer attachments.
+		// This is the most reliable source — the decoder sets these per-sample.
+		populate_colorimetry(pb, frame);
 
 		CFRelease(sample);
 		return frame;
