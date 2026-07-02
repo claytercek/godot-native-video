@@ -85,12 +85,14 @@ HEIGHT=240
 #   hevc_pq_bt2020_30_mp4 : HEVC Main10 PQ (ST 2084) / BT.2020 / 30 fps / mp4
 #     HDR10 test: PQ transfer, BT.2020 colour primaries, BT.2020 non-constant
 #     luminance matrix
-#     (ffmpeg -color_trc smpte2084 -color_primaries bt2020 -colorspace bt2020nc)
+#     (ffmpeg -colorspace bt2020nc -x265-params colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc —
+#      the generic -color_primaries/-color_trc flags don't reach libx265's VUI output, so primaries/transfer
+#      are set via -x265-params instead)
 #
 #   hevc_hlg_bt2020_30_mp4 : HEVC Main10 HLG / BT.2020 / 30 fps / mp4
 #     HLG test: HLG transfer, BT.2020 colour primaries, BT.2020 non-constant
 #     luminance matrix
-#     (ffmpeg -color_trc arib-std-b67 -color_primaries bt2020 -colorspace bt2020nc)
+#     (ffmpeg -colorspace bt2020nc -x265-params colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc)
 #
 # This array is the single source of truth; the matrix.list / matrix.json
 # manifests the tests read are generated from it (see write_manifests below).
@@ -185,10 +187,16 @@ gen_clip() {
             -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m) ;;
         hevc) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p -tag:v hvc1) ;;
         hevc10) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p10le -tag:v hvc1) ;;
+        # Note: libx265's ffmpeg wrapper does not forward the generic
+        # -color_primaries/-color_trc options into the encoded VUI (only
+        # -colorspace makes it through), so PQ/HLG tagging goes via
+        # -x265-params directly.
         hevc10_pq) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p10le -tag:v hvc1 \
-            -color_trc smpte2084 -color_primaries bt2020 -colorspace bt2020nc) ;;
+            -colorspace bt2020nc \
+            -x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc") ;;
         hevc10_hlg) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p10le -tag:v hvc1 \
-            -color_trc arib-std-b67 -color_primaries bt2020 -colorspace bt2020nc) ;;
+            -colorspace bt2020nc \
+            -x265-params "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc") ;;
         *) echo "ERROR: unknown codec ${codec}" >&2; return 1 ;;
     esac
 
