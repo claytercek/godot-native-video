@@ -214,6 +214,23 @@ public:
 	// open(). The default implementation is a no-op (single-track compat).
 	virtual void select_audio_track(int index);
 
+	// Reselect the audio track mid-decode without disturbing video decode.
+	// Tears down and rebuilds ONLY the audio decode path for the given
+	// audio track index, priming it from the keyframe at or before
+	// `pts_seconds`. Video frames continue to flow uninterrupted from the
+	// existing video decode session.
+	//
+	// On AVFoundation this creates a dedicated audio-only AVAssetReader
+	// (since a shared reader cannot reseek audio without destroying the
+	// video decode session). On Media Foundation this toggles per-stream
+	// selection on the existing IMFSourceReader.
+	//
+	// Returns true on success. On failure the audio decode path is left in
+	// an undefined state; the caller should seek() to recover.
+	// The default implementation returns false (unimplemented for
+	// single-track backends).
+	virtual bool reselect_audio_track(int index, double pts_seconds);
+
 	// --- Decode pump ---
 
 	// Seek to the nearest keyframe at or before `pts_seconds`.

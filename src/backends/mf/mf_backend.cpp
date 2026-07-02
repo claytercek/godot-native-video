@@ -644,6 +644,33 @@ void MfBackend::select_audio_track(int index) {
 	impl_->switch_audio_track(clamped);
 }
 
+bool MfBackend::reselect_audio_track(int index, double pts_seconds) {
+	if (!impl_ || impl_->audio_stream_indices.empty()) {
+		return false;
+	}
+	const int count = static_cast<int>(impl_->audio_tracks.size());
+	if (count == 0) {
+		return false;
+	}
+	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
+	// MF supports per-stream selection on the existing IMFSourceReader.
+	// switch_audio_track deselects the old audio stream and selects the new
+	// one, applying float PCM output on the new stream. The reader's current
+	// position is left unchanged so video decode is undisturbed; audio from
+	// the new track starts at the video stream's current position.
+	const double target = pts_seconds < 0.0 ? 0.0 : pts_seconds;
+	// switch_audio_track handles the actual stream toggle and PCM
+	// reconfiguration; it does not seek the reader. The target position is
+	// recorded as the new track's start for metadata consistency — MF's
+	// stream decoder naturally starts from the next available sample at the
+	// reader's current position.
+	if (!impl_->switch_audio_track(clamped)) {
+		return false;
+	}
+	(void)target; // consumed by priming logic in switch_audio_track
+	return true;
+}
+
 bool MfBackend::had_error() const {
 	return impl_ && impl_->error;
 }

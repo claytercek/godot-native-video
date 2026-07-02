@@ -46,6 +46,7 @@ public:
 	int audio_track_count() const override;
 	core::AudioTrackInfo audio_track_info(int index) const override;
 	void select_audio_track(int index) override;
+	bool reselect_audio_track(int index, double pts_seconds) override;
 
 	bool seek(double pts_seconds) override;
 	std::optional<core::VideoFrame> next_video_frame() override;
