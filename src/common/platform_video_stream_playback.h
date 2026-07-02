@@ -58,11 +58,25 @@ class PlatformVideoStreamPlayback : public VideoStreamPlayback {
 	GDCLASS(PlatformVideoStreamPlayback, VideoStreamPlayback)
 
 public:
+	// -------------------------------------------------------------------
+	// Output mode — selects between SDR (RGBA8, stock) and HDR (RGBA16F,
+	// scene-linear 1.0 = 203-nit Reference White). Default SDR.
+	// Toggling at runtime forces a pipeline rebuild.
+	// -------------------------------------------------------------------
+	enum OutputMode {
+		OUTPUT_MODE_SDR = 0,
+		OUTPUT_MODE_HDR = 1,
+	};
+
 	PlatformVideoStreamPlayback();
 	~PlatformVideoStreamPlayback() override;
 
 	// Open the media file. Returns true on success. Called by PlatformVideoStream.
 	bool load(const String &path);
+
+	// --- Output mode ---
+	void set_output_mode(int mode);
+	int get_output_mode() const;
 
 	// --- VideoStreamPlayback overrides ---
 	void _play() override;
@@ -83,6 +97,8 @@ public:
 	// Returns a Dictionary with the parsed/negotiated colorimetry.
 	// Callable after load() succeeds (i.e. after open but before play).
 	// Untagged clips return BT.709 video-range defaults.
+	// When output_mode is HDR, the returned dictionary includes an
+	// "output_mode" key set to 1.
 	godot::Dictionary get_color_info() const;
 
 protected:

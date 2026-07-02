@@ -251,6 +251,44 @@ TEST_CASE("BT.709 OETF: power segment") {
 }
 
 // =====================================================================
+// BT.709 EOTF (inverse OETF) — BT.709-6 §2.1 / sRGB
+//
+//   V (non-linear signal)   L (linear luminance)
+//   0.0                      0.0
+//   0.04045                  0.0031308
+//   0.5                      0.214041
+//   1.0                      1.0
+// =====================================================================
+TEST_CASE("BT.709 EOTF: anchors") {
+	CHECK(std::fabs(bt709_eotf(0.0)) < 1e-10);
+	CHECK(std::fabs(bt709_eotf(1.0) - 1.0) < kRefTol);
+}
+
+TEST_CASE("BT.709 EOTF: linear segment below threshold") {
+	// V = 0.04045 → L = 0.0031308
+	double L = bt709_eotf(0.04045);
+	CHECK(std::fabs(L - 0.0031308) < 1e-6);
+	double L2 = bt709_eotf(0.02);
+	CHECK(std::fabs(L2 - 0.02 / 12.92) < 1e-6);
+}
+
+TEST_CASE("BT.709 EOTF: power segment") {
+	// V = 0.5 → L ≈ 0.214041
+	double L = bt709_eotf(0.5);
+	CHECK(L > 0.20);
+	CHECK(L < 0.23);
+}
+
+TEST_CASE("BT.709 EOTF is inverse of OETF") {
+	// Round-trip: OETF then EOTF should recover the original value.
+	for (double L = 0.001; L <= 1.0; L += 0.05) {
+		double V = bt709_oetf(L);
+		double L_rt = bt709_eotf(V);
+		CHECK(std::fabs(L_rt - L) < 0.001);
+	}
+}
+
+// =====================================================================
 // End-to-end: HDR → SDR conversion invariants
 // =====================================================================
 TEST_CASE("hdr_to_sdr: zero input stays zero") {

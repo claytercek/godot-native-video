@@ -158,8 +158,8 @@ env = SConscript("godot-cpp/SConstruct", {"env": env, "customs": customs}, varia
 env.VariantDir("build/src", "src", duplicate=0)
 
 # -----------------------------------------------------------------------
-# Embed the authored NV12->RGB compute shader into a C++ header at build
-# time so the .glsl file is the single source of truth (ADR-0003).
+# Embed the authored NV12->RGB compute shaders into C++ headers at build
+# time so the .glsl files are the single source of truth.
 # -----------------------------------------------------------------------
 shader_header = "build/gen/src/common/nv12_to_rgb_shader.h"
 env.Command(
@@ -170,6 +170,15 @@ env.Command(
 # Track the included hdr_color_math.glsl as a dependency so the shader
 # header is regenerated when it changes.
 env.Depends(shader_header, "src/common/hdr_color_math.glsl")
+
+# HDR variant (RGBA16F output, scene-linear, no tone-map).
+shader_hdr_header = "build/gen/src/common/nv12_to_rgb_hdr_shader.h"
+env.Command(
+    target=shader_hdr_header,
+    source="src/common/nv12_to_rgb_hdr.glsl",
+    action="python3 tools/embed_shader.py $SOURCE $TARGET kNv12ToRgbHdrCompute",
+)
+env.Depends(shader_hdr_header, "src/common/hdr_color_math.glsl")
 
 # Add source files
 env.Append(CPPPATH=["src/", "build/gen/src"])

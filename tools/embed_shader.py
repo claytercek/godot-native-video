@@ -18,13 +18,13 @@ import re
 import sys
 
 
-def resolve_includes(lines: list[str], base_dir: str, depth: int = 0) -> list[str]:
+def resolve_includes(lines, base_dir, depth=0):
     """Replace all ``#include "..."`` lines with the referenced file's
     contents (recursively).  Max depth 10 to catch circular includes."""
     if depth > 10:
-        raise RuntimeError("include depth > 10 — circular include?")
+        raise RuntimeError("include depth > 10 -- circular include?")
 
-    out: list[str] = []
+    out = []
     pattern = re.compile(r'^\s*#include\s+"([^"]+)"\s*$')
     for line in lines:
         m = pattern.match(line)
@@ -35,7 +35,7 @@ def resolve_includes(lines: list[str], base_dir: str, depth: int = 0) -> list[st
         inc_path = os.path.normpath(inc_path)
         if not os.path.isfile(inc_path):
             raise FileNotFoundError(
-                f"include not found: {m.group(1)} (resolved: {inc_path})"
+                "include not found: {} (resolved: {})".format(m.group(1), inc_path)
             )
         with open(inc_path, "r") as f:
             inc_lines = f.readlines()
@@ -43,7 +43,7 @@ def resolve_includes(lines: list[str], base_dir: str, depth: int = 0) -> list[st
     return out
 
 
-def embed_shader(glsl_path: str, header_path: str) -> None:
+def embed_shader(glsl_path, header_path, var_name="kNv12ToRgbCompute"):
     glsl_path = os.path.normpath(glsl_path)
     base_dir = os.path.dirname(glsl_path)
 
@@ -63,10 +63,10 @@ def embed_shader(glsl_path: str, header_path: str) -> None:
     # Verify the content doesn't contain ``)GLSL"``; if it does, append
     # underscores until the delimiter is unique.
     delimiter = "GLSL"
-    close_token = f"){delimiter}\""
+    close_token = ")" + delimiter + '"'
     while close_token in source:
         delimiter += "_"
-        close_token = f"){delimiter}\""
+        close_token = ")" + delimiter + '"'
 
     os.makedirs(os.path.dirname(header_path), exist_ok=True)
 
@@ -76,7 +76,7 @@ def embed_shader(glsl_path: str, header_path: str) -> None:
         f.write(" -- do not edit by hand.\n")
         f.write("#pragma once\n")
         f.write("\n")
-        f.write('static const char *kNv12ToRgbCompute = R"')
+        f.write('static const char *{} = R"'.format(var_name))
         f.write(delimiter)
         f.write("(")
         f.write(source)
@@ -85,11 +85,13 @@ def embed_shader(glsl_path: str, header_path: str) -> None:
         f.write('";\n')
 
     # Log to stdout so SCons can capture it if needed.
-    print(f"  embed  {glsl_path} -> {header_path}")
+    print("  embed  {} -> {}".format(glsl_path, header_path))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <input.glsl> <output.h>", file=sys.stderr)
+    argc = len(sys.argv)
+    if argc not in (3, 4):
+        print("Usage: {} <input.glsl> <output.h> [var_name]".format(sys.argv[0]), file=sys.stderr)
         sys.exit(1)
-    embed_shader(sys.argv[1], sys.argv[2])
+    var_name = sys.argv[3] if argc >= 4 else "kNv12ToRgbCompute"
+    embed_shader(sys.argv[1], sys.argv[2], var_name)

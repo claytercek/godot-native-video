@@ -5,14 +5,28 @@
 //
 // Owns, on Godot's RenderingDevice:
 //   - the NV12->RGB compute shader + pipeline + sampler,
-//   - an N-buffered ring of engine-owned RGBA8 storage textures, exposed
-//     through ONE stable Texture2DRD that Godot samples (see get_texture()),
+//   - an N-buffered ring of engine-owned RGBA storage textures (rgba8 in SDR
+//     mode, rgba16f in HDR mode), exposed through ONE stable Texture2DRD that
+//     Godot samples (see get_texture()),
 //   - a SurfaceImporter (Metal on macOS; one of three Windows Import Paths
 //     chosen by the make_surface_importer() factory, see surface_importer.h)
 //     that turns a decoder surface into two RD plane textures — zero-copy on
 //     every path except the Windows CPU-Copy Import Path,
 //   - a RetireRing<N> that holds each frame's transient surfaces for N
 //     rendered frames so the GPU never reads a freed surface.
+//
+// HDR output mode:
+//   When output_mode_ is HDR, the ring textures are RGBA16F and the compute
+//   shader emits scene-linear values scaled so 1.0 = 203-nit Reference White
+//   (BT.2408). PQ/HLG EOTFs decode to nits/203; SDR content is linearized via
+//   the BT.709 EOTF onto the same scale. Values > 1.0 survive the fp16 texture
+//   and Godot's use_hdr_2d compositor owns the final display transfer.
+//
+//   Spike verified (2026-07, macOS Metal / Forward+): a compute shader writing
+//   >1.0 fp16 texels into a RGBA16F storage image followed by a Texture2DRD
+//   produces values > 1.0 in a canvas_item shader with use_hdr_2d enabled.
+//   Without use_hdr_2d the values are clamped at 1.0 by the sRGB framebuffer.
+//   See the spike test in smoke.gd's HDR toggle.
 //
 // present(frame) runs ONE compute dispatch (NV12->RGB) into the next ring
 // slot and returns the matching Texture2DRD via get_texture(). On the two
@@ -36,6 +50,14 @@
 
 namespace platform_media {
 
+// -----------------------------------------------------------------------
+// OutputMode — present-pipeline output format.
+// -----------------------------------------------------------------------
+enum class OutputMode : uint8_t {
+	SDR = 0, // RGBA8, non-linear (tone-mapped / clamped), Godot's standard 2D
+	HDR = 1, // RGBA16F, scene-linear, 1.0 = 203-nit Reference White (BT.2408)
+};
+
 class PresentPipeline {
 public:
 	// Number of rendered frames a decoder surface is held before retirement,
@@ -56,6 +78,17 @@ public:
 	bool ensure_ready(int width, int height);
 
 	bool is_ready() const { return ready_; }
+
+	// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
+	// next ensure_ready() call. Default SDR.
+	void set_output_mode(OutputMode mode) {
+		if (mode != output_mode_) {
+			output_mode_ = mode;
+			ready_ = false; // force rebuild on next ensure_ready
+		}
+	}
+
+	OutputMode output_mode() const { return output_mode_; }
 
 	// Present one decoded frame: import its NV12 planes zero-copy, run the
 	// NV12->RGB compute pass into the next RGBA ring slot, and retire surfaces
@@ -92,7 +125,7 @@ public:
 
 private:
 	struct RingSlot {
-		godot::RID rgba_rid; // RD storage texture (rgba8)
+		godot::RID rgba_rid; // RD storage texture (rgba8 or rgba16f)
 	};
 
 	bool build_resources(int width, int height);
@@ -102,8 +135,13 @@ private:
 	// Per-platform importer chosen at link time by make_surface_importer().
 	std::unique_ptr<SurfaceImporter> importer_;
 
-	godot::RID shader_;
-	godot::RID pipeline_;
+	// SDR shader (rgba8 output, current behavior).
+	godot::RID shader_sdr_;
+	godot::RID pipeline_sdr_;
+	// HDR shader (rgba16f output, scene-linear).
+	godot::RID shader_hdr_;
+	godot::RID pipeline_hdr_;
+
 	godot::RID sampler_;
 
 	RingSlot ring_[kRingDepth];
@@ -121,7 +159,17 @@ private:
 	int height_ = 0;
 	bool ready_ = false;
 
+	OutputMode output_mode_ = OutputMode::SDR;
+
 	uint64_t cpu_copy_count_ = 0; // invariant: 0 on the two zero-copy Import Paths
+
+	// Which pipeline is active (selected by output_mode_).
+	godot::RID active_shader() const {
+		return output_mode_ == OutputMode::HDR ? shader_hdr_ : shader_sdr_;
+	}
+	godot::RID active_pipeline() const {
+		return output_mode_ == OutputMode::HDR ? pipeline_hdr_ : pipeline_sdr_;
+	}
 };
 
 } // namespace platform_media
