@@ -577,8 +577,6 @@ void AvfBackend::close() {
 		impl_->audio_track = nil;
 		impl_->all_audio_tracks = nil;
 		impl_->audio_tracks.clear();
-		impl_->audio_reader = nil;
-		impl_->audio_only_out = nil;
 	}
 }
 
@@ -646,10 +644,11 @@ bool AvfBackend::reselect_audio_track(int index, double pts_seconds) {
 		}
 
 		// Step 2: tear down the combined reader and rebuild it as video-only
-		// starting from 0 so the first keyframe anchors the new reader. Any
-		// previously-decoded frames are repeated after the rebuild, but the
-		// key invariant holds: video decode keeps flowing uninterrupted.
-		if (!impl_->build_video_reader(0.0)) {
+		// starting from `target` so the video resumes near the requested
+		// position rather than repeating from the beginning of the clip.
+		// The new reader primes from the keyframe at or before `target`,
+		// which matches the audio-only reader's start position.
+		if (!impl_->build_video_reader(target)) {
 			impl_->teardown_audio_reader();
 			return false;
 		}
