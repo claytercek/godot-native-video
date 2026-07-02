@@ -42,6 +42,11 @@ public:
 	AVAssetTrack *video_track = nil;
 	AVAssetTrack *audio_track = nil;
 
+	// All audio track objects from the asset, indexed by track position
+	// in the audio_tracks metadata vector. Selected by select_audio_track().
+	NSArray<AVAssetTrack *> *all_audio_tracks = nil;
+	int selected_audio_track_index = 0;
+
 	// Per-track audio metadata. Populated during open().
 	struct TrackMeta {
 		std::string language;
@@ -85,6 +90,22 @@ public:
 		reader = nil;
 		video_out = nil;
 		audio_out = nil;
+	}
+
+	// Select the \(i)th audio track (position in audio_tracks) and update
+	// the audio_track object and channels/rate from its metadata.
+	// The selection is applied on the next build_reader() call.
+	bool apply_track_selection(int i) {
+		if (i < 0 || static_cast<size_t>(i) >= audio_tracks.size()) {
+			return false;
+		}
+		selected_audio_track_index = i;
+		if (all_audio_tracks && i < static_cast<int>(all_audio_tracks.count)) {
+			audio_track = all_audio_tracks[i];
+		}
+		audio_channels = audio_tracks[i].channels;
+		audio_rate = audio_tracks[i].sample_rate;
+		return true;
 	}
 };
 
@@ -210,6 +231,19 @@ bool AvfBackend::Impl::build_reader(double start_time) {
 	teardown();
 	error = false;
 
+	// Resolve the audio track to use: selected index or fallback to default.
+	AVAssetTrack *use_audio = nil;
+	if (audio_tracks.empty()) {
+		use_audio = nil;
+	} else if (selected_audio_track_index >= 0 &&
+			static_cast<size_t>(selected_audio_track_index) < audio_tracks.size() &&
+			all_audio_tracks &&
+			selected_audio_track_index < static_cast<int>(all_audio_tracks.count)) {
+		use_audio = all_audio_tracks[selected_audio_track_index];
+	} else if (all_audio_tracks && all_audio_tracks.count > 0) {
+		use_audio = all_audio_tracks[0];
+	}
+
 	NSError *err = nil;
 	AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
 	if (!r || err) {
@@ -233,8 +267,8 @@ bool AvfBackend::Impl::build_reader(double start_time) {
 			video_out = vo;
 		}
 	}
-	if (audio_track) {
-		AVAssetReaderTrackOutput *ao = make_audio_output(audio_track);
+	if (use_audio) {
+		AVAssetReaderTrackOutput *ao = make_audio_output(use_audio);
 		ao.alwaysCopiesSampleData = NO;
 		if ([r canAddOutput:ao]) {
 			[r addOutput:ao];
@@ -397,29 +431,17 @@ bool AvfBackend::open(const std::string &url_or_path) {
 			impl_->audio_tracks.push_back(meta);
 		}
 
-		// Set the single-track legacy fields from the first audio track.
+		// Store all audio track objects for track selection at build_reader() time.
+		impl_->all_audio_tracks = atracks;
+		impl_->selected_audio_track_index = 0;
+
+		// Initialise the legacy fields from the first audio track.
 		if (atracks.count > 0) {
-			impl_->audio_track = atracks[0];
-			if (impl_->audio_tracks.empty()) {
-				// Fallback: read format directly from the track.
-				NSArray *fmts = impl_->audio_track.formatDescriptions;
-				if (fmts.count > 0) {
-					CMAudioFormatDescriptionRef afd =
-							(__bridge CMAudioFormatDescriptionRef)fmts[0];
-					const AudioStreamBasicDescription *asbd =
-							CMAudioFormatDescriptionGetStreamBasicDescription(afd);
-					if (asbd) {
-						impl_->audio_channels = static_cast<int>(asbd->mChannelsPerFrame);
-						impl_->audio_rate = static_cast<int>(asbd->mSampleRate);
-					}
-				}
-			} else {
-				impl_->audio_channels = impl_->audio_tracks[0].channels;
-				impl_->audio_rate = impl_->audio_tracks[0].sample_rate;
-			}
+			// Apply track 0 (the default) to populate audio_track, channels, rate.
+			impl_->apply_track_selection(0);
 		}
 
-		if (!impl_->video_track && !impl_->audio_track) {
+		if (!impl_->video_track && !impl_->audio_track && atracks.count == 0) {
 			impl_->error = true;
 			return false;
 		}
@@ -434,6 +456,8 @@ void AvfBackend::close() {
 		impl_->asset = nil;
 		impl_->video_track = nil;
 		impl_->audio_track = nil;
+		impl_->all_audio_tracks = nil;
+		impl_->audio_tracks.clear();
 	}
 }
 
@@ -469,6 +493,19 @@ core::AudioTrackInfo AvfBackend::audio_track_info(int index) const {
 	info.is_default = t.is_default;
 	return info;
 }
+void AvfBackend::select_audio_track(int index) {
+	if (!impl_) {
+		return;
+	}
+	const int count = static_cast<int>(impl_->audio_tracks.size());
+	if (count == 0) {
+		return; // no audio tracks to select from
+	}
+	// Clamp out-of-range to the nearest valid index.
+	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
+	impl_->apply_track_selection(clamped);
+}
+
 bool AvfBackend::had_error() const {
 	return impl_ && impl_->error;
 }

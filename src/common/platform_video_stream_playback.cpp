@@ -64,6 +64,7 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 	channels_ = backend->audio_channel_count();
 	sample_rate_ = backend->audio_sample_rate();
 	has_audio_ = channels_ > 0 && sample_rate_ > 0;
+	audio_track_count_ = backend->audio_track_count();
 
 	// Hand the Backend to the process-wide shared decode pool. From here a pool
 	// worker decodes video ahead into stream_'s queue; this object never touches
@@ -320,8 +321,28 @@ void PlatformVideoStreamPlayback::_seek(double time) {
 	apply_scrub_resolve(resolve);
 }
 
-void PlatformVideoStreamPlayback::_set_audio_track(int /*idx*/) {
-	// Single-track audio only in v1; audio output lands in the A/V-sync slice.
+void PlatformVideoStreamPlayback::_set_audio_track(int idx) {
+	// Validate out-of-range: the stock VideoStreamPlayer calls this before
+	// play() to pre-select a track, and while playing for mid-stream switch.
+	if (audio_track_count_ > 0 && (idx < 0 || idx >= audio_track_count_)) {
+		print_error(
+				String("Audio track index ") + String::num_int64(idx) +
+				" is out of range. Clip has " + String::num_int64(audio_track_count_) +
+				" track(s). Falling back to default (0).");
+		idx = 0;
+	}
+	audio_track_selection_ = idx;
+
+	// Apply the selection to the backend if it's already registered with the
+	// scheduler. Before play() the backend exists but no audio is flowing, so
+	// the selection takes effect on the next seek (which rebuilds the reader
+	// in AVF, or reconfigures stream selection in MF).
+	if (stream_) {
+		core::DecodeScheduler::instance().with_backend(
+				stream_, [idx](core::Backend &backend) {
+					backend.select_audio_track(idx);
+				});
+	}
 }
 
 Ref<Texture2D> PlatformVideoStreamPlayback::_get_texture() const {

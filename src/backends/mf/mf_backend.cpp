@@ -190,6 +190,13 @@ public:
 	};
 	std::vector<TrackMeta> audio_tracks;
 
+	// Maps audio track index (position in audio_tracks) to the MF source
+	// reader stream index used by SetStreamSelection / SetCurrentMediaType.
+	std::vector<int> audio_stream_indices;
+
+	// The currently selected audio track index.
+	int selected_audio_track = 0;
+
 	// Backing store for the most recent decoded audio chunk. core::AudioChunk
 	// returns a borrowed const float*, so the buffer must outlive the returned
 	// chunk; it stays valid until the next next_audio_chunk() call.
@@ -199,6 +206,12 @@ public:
 	bool create_reader();
 	bool configure_video_stream();
 	bool configure_audio_stream();
+	// Switch audio output to the track at `track_index` (position in
+	// audio_tracks). Deselects the old audio stream, selects the new one,
+	// and reconfigures PCM output. Returns true on success; on failure
+	// the old stream selection is left deselected and audio_stream_index
+	// is set to -1 (no audio).
+	bool switch_audio_track(int track_index);
 	void read_duration();
 	void read_colorimetry(IMFMediaType *type);
 
@@ -296,6 +309,7 @@ bool MfBackend::Impl::create_reader() {
 bool MfBackend::Impl::configure_video_stream() {
 	// Find the first video stream by walking native media types.
 	audio_tracks.clear();
+	audio_stream_indices.clear();
 	for (DWORD i = 0;; ++i) {
 		ComPtr<IMFMediaType> native;
 		HRESULT hr = reader->GetNativeMediaType(i, 0, native.put());
@@ -331,6 +345,7 @@ bool MfBackend::Impl::configure_video_stream() {
 			// language/name for MF in v1; this is consistent with the
 			// single-track legacy fields below.
 			audio_tracks.push_back(meta);
+			audio_stream_indices.push_back(static_cast<int>(i));
 			if (audio_stream_index < 0) {
 				audio_stream_index = static_cast<int>(i);
 			}
@@ -427,6 +442,58 @@ bool MfBackend::Impl::configure_audio_stream() {
 	}
 	reader->SetStreamSelection(aidx, TRUE);
 
+	ComPtr<IMFMediaType> current;
+	hr = reader->GetCurrentMediaType(aidx, current.put());
+	if (SUCCEEDED(hr) && current) {
+		UINT32 ch = 0, rate = 0;
+		current->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch);
+		current->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
+		audio_channels = static_cast<int>(ch);
+		audio_rate = static_cast<int>(rate);
+	}
+	return true;
+}
+
+bool MfBackend::Impl::switch_audio_track(int track_index) {
+	if (audio_stream_indices.empty()) {
+		return false;
+	}
+	if (track_index < 0 ||
+			static_cast<size_t>(track_index) >= audio_stream_indices.size()) {
+		return false;
+	}
+
+	// Deselect the old audio stream (if any) so the reader stops producing
+	// samples from it. This is safe even if no old stream is selected.
+	if (audio_stream_index >= 0) {
+		reader->SetStreamSelection(
+				static_cast<DWORD>(audio_stream_index), FALSE);
+	}
+
+	// Select the new audio stream index and apply PCM output type.
+	const int new_mf_index = audio_stream_indices[static_cast<size_t>(track_index)];
+	audio_stream_index = new_mf_index;
+	selected_audio_track = track_index;
+
+	// Apply the PCM output type on the new stream.
+	const DWORD aidx = static_cast<DWORD>(new_mf_index);
+	reader->SetStreamSelection(aidx, TRUE);
+
+	ComPtr<IMFMediaType> pcm;
+	HRESULT hr = MFCreateMediaType(pcm.put());
+	if (SUCCEEDED(hr)) {
+		pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+		pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
+		hr = reader->SetCurrentMediaType(aidx, nullptr, pcm.get());
+	}
+	if (FAILED(hr)) {
+		// Fallback failed; deselect this stream too.
+		reader->SetStreamSelection(aidx, FALSE);
+		audio_stream_index = -1;
+		return false;
+	}
+
+	// Read back the negotiated type to get actual channels and rate.
 	ComPtr<IMFMediaType> current;
 	hr = reader->GetCurrentMediaType(aidx, current.put());
 	if (SUCCEEDED(hr) && current) {
@@ -564,6 +631,19 @@ core::AudioTrackInfo MfBackend::audio_track_info(int index) const {
 	info.is_default = t.is_default;
 	return info;
 }
+void MfBackend::select_audio_track(int index) {
+	if (!impl_ || impl_->audio_stream_indices.empty()) {
+		return;
+	}
+	const int count = static_cast<int>(impl_->audio_tracks.size());
+	if (count == 0) {
+		return;
+	}
+	// Clamp out-of-range to the nearest valid index.
+	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
+	impl_->switch_audio_track(clamped);
+}
+
 bool MfBackend::had_error() const {
 	return impl_ && impl_->error;
 }

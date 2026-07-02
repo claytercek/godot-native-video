@@ -6,7 +6,7 @@
 	<description>
 		A [VideoStream] that plays a native video clip through the platform's hardware decoder (AVFoundation on macOS, Windows Media Foundation on Windows) and presents frames to the GPU with no CPU copy. The decoded NV12 surface is imported via [code]RenderingDevice.texture_create_from_extension[/code] and converted to RGB in a single compute pass into an engine-owned [Texture2DRD] returned from the playback's texture; Godot never samples the decoder surface directly.
 		Drop a recognised clip ([code].mp4[/code], [code].mov[/code], [code].m4v[/code]) onto a stock [VideoStreamPlayer] to play it. Requires Godot 4.4+ and a [b]Forward+[/b] or [b]Mobile[/b] renderer (RenderingDevice); the Compatibility/OpenGL renderer is not supported.
-		The v1 decode scope covers H.264 and HEVC (Main/Main10) video, MP4/MOV containers, NV12 / x420 / BT.709 / BT.2020 / PQ / HLG, and AAC stereo audio. 10-bit sources negotiate a matching 10-bit decoder output — [code]x420[/code] biplanar on macOS, [code]P010[/code] on Windows — for full precision; the conversion shader normalises 10-bit payloads in 16-bit GPU words. On Windows, the default CPU-Copy Import Path (stock Vulkan driver) reaches the GPU via a readback rather than the zero-copy import macOS uses. PQ/HLG clips tone-map to watchable SDR by default, or output scene-linear HDR when the stream's output mode is set to HDR. VP9/AV1 and multi-track audio are not in scope.
+		The v1 decode scope covers H.264 and HEVC (Main/Main10) video, MP4/MOV containers, NV12 / x420 / BT.709 / BT.2020 / PQ / HLG, and AAC stereo audio. 10-bit sources negotiate a matching 10-bit decoder output — [code]x420[/code] biplanar on macOS, [code]P010[/code] on Windows — for full precision; the conversion shader normalises 10-bit payloads in 16-bit GPU words. On Windows, the default CPU-Copy Import Path (stock Vulkan driver) reaches the GPU via a readback rather than the zero-copy import macOS uses. PQ/HLG clips tone-map to watchable SDR by default, or output scene-linear HDR when the stream's output mode is set to HDR. VP9/AV1 remain out of scope; multi-track AAC audio is supported — enumerate tracks with [method get_audio_tracks] and select one via [code]VideoStreamPlayer.audio_track[/code], either before [code]play()[/code] or mid-playback. Mixed-sample-rate clips are a documented limitation: the first audio track's sample rate wins, and a mid-stream switch to a track with a differing rate is refused.
 	</description>
 	<methods>
 		<method name="get_audio_tracks">
@@ -20,13 +20,10 @@
 				[code]default[/code] — whether this is the container's default track (bool).
 				Array position corresponds to the track index accepted by [code]VideoStreamPlayer.audio_track[/code].
 				The probe is lazy: the clip is opened on the first call and the result is cached for subsequent queries.
-				Call before [code]play()[/code] to enumerate available tracks and select one via [code]audio_track[/code].
+				Set [code]VideoStreamPlayer.audio_track[/code] to the desired index before calling [code]play()[/code] to
+				pre-select an audio track. An out-of-range index reports an error and falls back to the default (track 0).
 			</description>
 		</method>
-	</methods>
-	<tutorials>
-	</tutorials>
-	<methods>
 		<method name="hdr_decode_supported" qualifiers="static">
 			<return type="bool" />
 			<description>
@@ -35,6 +32,8 @@
 			</description>
 		</method>
 	</methods>
+	<tutorials>
+	</tutorials>
 	<members>
 		<member name="output_mode" type="int" setter="set_output_mode" getter="get_output_mode" default="0">
 			Selects the pipeline's output mode: [code]0[/code] for SDR (RGBA8) or [code]1[/code] for HDR (RGBA16F, scene-linear, 1.0 = 203-nit Reference White). Mirrors [member PlatformVideoStreamPlayback.output_mode] on every playback instantiated from this stream — set it here rather than on the playback directly so the stream resource and its live playbacks stay in sync.

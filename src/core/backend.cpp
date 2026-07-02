@@ -20,4 +20,9 @@ AudioTrackInfo Backend::audio_track_info(int /*index*/) const {
 	return info;
 }
 
+void Backend::select_audio_track(int /*index*/) {
+	// Single-track: the default implementation is a no-op because there is
+	// only one audio track to decode. Multi-track backends override this.
+}
+
 } // namespace core
