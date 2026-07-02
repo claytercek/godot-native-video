@@ -199,11 +199,11 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		return false;
 	}
 
-	// Push constant: output dimensions + colorimetry + bit depth. std430 — five
-	// uint32 = 20 bytes, which matches the shader's declared Params size exactly
+	// Push constant: output dimensions + colorimetry + bit depth. std430 — seven
+	// uint32 = 28 bytes, which matches the shader's declared Params size exactly
 	// (Godot 4.7+ validates the supplied size against it).
 	PackedByteArray pc;
-	pc.resize(20);
+	pc.resize(28);
 	{
 		uint8_t *w = pc.ptrw();
 		const uint32_t ow = static_cast<uint32_t>(width_);
@@ -215,11 +215,15 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		const uint32_t matrix = static_cast<uint32_t>(frame.ycbcr_matrix);
 		const uint32_t range = static_cast<uint32_t>(frame.range);
 		const uint32_t depth = static_cast<uint32_t>(frame.bit_depth);
+		const uint32_t transfer = static_cast<uint32_t>(frame.transfer);
+		const uint32_t primaries = static_cast<uint32_t>(frame.primaries);
 		memcpy(w + 0, &ow, sizeof(uint32_t));
 		memcpy(w + 4, &oh, sizeof(uint32_t));
 		memcpy(w + 8, &matrix, sizeof(uint32_t));
 		memcpy(w + 12, &range, sizeof(uint32_t));
 		memcpy(w + 16, &depth, sizeof(uint32_t));
+		memcpy(w + 20, &transfer, sizeof(uint32_t));
+		memcpy(w + 24, &primaries, sizeof(uint32_t));
 	}
 
 	// On platforms that share the decoder surface across two GPU APIs, wait for

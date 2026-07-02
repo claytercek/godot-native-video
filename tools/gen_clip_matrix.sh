@@ -82,6 +82,16 @@ HEIGHT=240
 #   h264_30_bt601_mp4 : H.264 / 30 fps / mp4, tagged BT.601 NTSC colorimetry
 #     (ffmpeg -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m)
 #
+#   hevc_pq_bt2020_30_mp4 : HEVC Main10 PQ (ST 2084) / BT.2020 / 30 fps / mp4
+#     HDR10 test: PQ transfer, BT.2020 colour primaries, BT.2020 non-constant
+#     luminance matrix
+#     (ffmpeg -color_trc smpte2084 -color_primaries bt2020 -colorspace bt2020nc)
+#
+#   hevc_hlg_bt2020_30_mp4 : HEVC Main10 HLG / BT.2020 / 30 fps / mp4
+#     HLG test: HLG transfer, BT.2020 colour primaries, BT.2020 non-constant
+#     luminance matrix
+#     (ffmpeg -color_trc arib-std-b67 -color_primaries bt2020 -colorspace bt2020nc)
+#
 # This array is the single source of truth; the matrix.list / matrix.json
 # manifests the tests read are generated from it (see write_manifests below).
 # -----------------------------------------------------------------------
@@ -94,6 +104,8 @@ MATRIX=(
     "h264_30_m4v h264 30 m4v 30"
     "h264_30_bt601_mp4 h264_bt601 30 mp4 30"
     "hevc_main10_30_mp4 hevc10 30 mp4 30"
+    "hevc_pq_bt2020_30_mp4 hevc10_pq 30 mp4 30"
+    "hevc_hlg_bt2020_30_mp4 hevc10_hlg 30 mp4 30"
 )
 
 # Write the manifests the coverage tests consume, derived from MATRIX so the
@@ -173,6 +185,10 @@ gen_clip() {
             -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m) ;;
         hevc) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p -tag:v hvc1) ;;
         hevc10) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p10le -tag:v hvc1) ;;
+        hevc10_pq) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p10le -tag:v hvc1 \
+            -color_trc smpte2084 -color_primaries bt2020 -colorspace bt2020nc) ;;
+        hevc10_hlg) vcodec=(-c:v libx265 -preset fast -crf 22 -pix_fmt yuv420p10le -tag:v hvc1 \
+            -color_trc arib-std-b67 -color_primaries bt2020 -colorspace bt2020nc) ;;
         *) echo "ERROR: unknown codec ${codec}" >&2; return 1 ;;
     esac
 
@@ -208,7 +224,7 @@ for row in "${MATRIX[@]}"; do
     # shellcheck disable=SC2086
     set -- ${row}
     name="$1" codec="$2"
-    if [[ ( "${codec}" == "hevc" || "${codec}" == "hevc10" ) && "${have_x265}" -eq 0 ]]; then
+    if [[ ( "${codec}" == "hevc" || "${codec}" == "hevc10" || "${codec}" == "hevc10_pq" || "${codec}" == "hevc10_hlg" ) && "${have_x265}" -eq 0 ]]; then
         echo "WARN: libx265 not available; skipping ${name}" >&2
         continue
     fi
