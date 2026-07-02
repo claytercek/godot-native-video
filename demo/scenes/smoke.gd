@@ -102,7 +102,7 @@ func _process(_delta: float) -> void:
 		elif player.stream.has_method("get_output_mode"):
 			# No playback object (Godot 4.4/4.5) — read the mode off the stream.
 			info = "  mode=%s" % player.stream.get_output_mode()
-		var msg := "Playing  pos=%.2fs  tex=%s  track=%d%s" % [
+		var msg := "Playing  pos=%.2fs  tex=%s  track=%d%s  (switch live using dropdown)" % [
 			player.stream_position,
 			tex_ok,
 			player.audio_track,
@@ -166,9 +166,16 @@ func _on_play_pressed() -> void:
 
 
 func _on_track_selector_item_selected(_index: int) -> void:
-	# Update the player's selection so it applies when play is pressed.
+	# Update the player's selection. If currently playing, this triggers a
+	# mid-stream track switch (the backend reselects the audio track without
+	# interrupting video).
 	player.audio_track = track_selector.get_selected_id()
-	_set_status("Track %d selected. Press Play." % player.audio_track)
+	var msg = "Track %d selected." % player.audio_track
+	if player.is_playing():
+		msg += " Switching live..."
+	else:
+		msg += " Press Play."
+	_set_status(msg)
 
 
 func _set_status(msg: String) -> void:
