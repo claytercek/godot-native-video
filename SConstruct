@@ -155,8 +155,19 @@ env = SConscript("godot-cpp/SConstruct", {"env": env, "customs": customs}, varia
 
 env.VariantDir("build/src", "src", duplicate=0)
 
+# -----------------------------------------------------------------------
+# Embed the authored NV12->RGB compute shader into a C++ header at build
+# time so the .glsl file is the single source of truth (ADR-0003).
+# -----------------------------------------------------------------------
+shader_header = "build/gen/src/common/nv12_to_rgb_shader.h"
+env.Command(
+    target=shader_header,
+    source="src/common/nv12_to_rgb.glsl",
+    action="python3 tools/embed_shader.py $SOURCE $TARGET",
+)
+
 # Add source files
-env.Append(CPPPATH=["src/"])
+env.Append(CPPPATH=["src/", "build/gen/src"])
 sources = ["build/src/register_types.cpp"]
 
 # Engine Core C++ sources that are not platform backends (no godot-cpp / RD deps).
