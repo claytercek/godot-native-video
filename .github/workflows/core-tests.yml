@@ -100,6 +100,14 @@ jobs:
       - name: Install SCons
         run: pip3 install scons
 
+      - name: Build Engine Core tests
+        # The Engine Core is platform-agnostic; build + run it under MSVC too so
+        # Windows threading/timing behavior is covered, not just Darwin's.
+        run: scons target=core_tests
+
+      - name: Run Engine Core tests
+        run: bin\core_tests.exe --reporters=console --no-intro
+
       - name: Install ffmpeg
         # Test-only tool; regenerates the matrix so CI does not depend on LFS.
         run: choco install ffmpeg -y
