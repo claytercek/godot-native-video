@@ -363,61 +363,61 @@ bool AvfBackend::open(const std::string &url_or_path) {
 			}
 		}
 		// Enumerate all audio tracks with per-track metadata.
-	impl_->audio_tracks.clear();
-	for (AVAssetTrack *at in atracks) {
-		Impl::TrackMeta meta;
+		impl_->audio_tracks.clear();
+		for (AVAssetTrack *at in atracks) {
+			Impl::TrackMeta meta;
 
-		// Language: use the extended language tag (BCP 47) when available,
-		// falling back to the ISO 639-2 language code.
-		if (NSString *lang = at.extendedLanguageTag) {
-			meta.language = std::string([lang UTF8String]);
-		} else if (NSString *code = at.languageCode) {
-			meta.language = std::string([code UTF8String]);
-		}
-
-		// Name: not directly available on all macOS deployments; we leave it
-		// empty in v1. The language code serves as a surrogate identifier.
-
-		// The first audio track is the container default when no explicit
-		// default flag is present in the container metadata.
-		meta.is_default = (impl_->audio_tracks.empty());
-
-		// Channel count and sample rate from the format description.
-		NSArray *fmts = at.formatDescriptions;
-		if (fmts.count > 0) {
-			CMAudioFormatDescriptionRef afd =
-					(__bridge CMAudioFormatDescriptionRef)fmts[0];
-			const AudioStreamBasicDescription *asbd =
-					CMAudioFormatDescriptionGetStreamBasicDescription(afd);
-			if (asbd) {
-				meta.channels = static_cast<int>(asbd->mChannelsPerFrame);
-				meta.sample_rate = static_cast<int>(asbd->mSampleRate);
+			// Language: use the extended language tag (BCP 47) when available,
+			// falling back to the ISO 639-2 language code.
+			if (NSString *lang = at.extendedLanguageTag) {
+				meta.language = std::string([lang UTF8String]);
+			} else if (NSString *code = at.languageCode) {
+				meta.language = std::string([code UTF8String]);
 			}
-		}
-		impl_->audio_tracks.push_back(meta);
-	}
 
-	// Set the single-track legacy fields from the first audio track.
-	if (atracks.count > 0) {
-		impl_->audio_track = atracks[0];
-		if (impl_->audio_tracks.empty()) {
-			// Fallback: read format directly from the track.
-			NSArray *fmts = impl_->audio_track.formatDescriptions;
+			// Name: not directly available on all macOS deployments; we leave it
+			// empty in v1. The language code serves as a surrogate identifier.
+
+			// The first audio track is the container default when no explicit
+			// default flag is present in the container metadata.
+			meta.is_default = (impl_->audio_tracks.empty());
+
+			// Channel count and sample rate from the format description.
+			NSArray *fmts = at.formatDescriptions;
 			if (fmts.count > 0) {
 				CMAudioFormatDescriptionRef afd =
 						(__bridge CMAudioFormatDescriptionRef)fmts[0];
 				const AudioStreamBasicDescription *asbd =
 						CMAudioFormatDescriptionGetStreamBasicDescription(afd);
 				if (asbd) {
-					impl_->audio_channels = static_cast<int>(asbd->mChannelsPerFrame);
-					impl_->audio_rate = static_cast<int>(asbd->mSampleRate);
+					meta.channels = static_cast<int>(asbd->mChannelsPerFrame);
+					meta.sample_rate = static_cast<int>(asbd->mSampleRate);
 				}
 			}
-		} else {
-			impl_->audio_channels = impl_->audio_tracks[0].channels;
-			impl_->audio_rate = impl_->audio_tracks[0].sample_rate;
+			impl_->audio_tracks.push_back(meta);
 		}
-	}
+
+		// Set the single-track legacy fields from the first audio track.
+		if (atracks.count > 0) {
+			impl_->audio_track = atracks[0];
+			if (impl_->audio_tracks.empty()) {
+				// Fallback: read format directly from the track.
+				NSArray *fmts = impl_->audio_track.formatDescriptions;
+				if (fmts.count > 0) {
+					CMAudioFormatDescriptionRef afd =
+							(__bridge CMAudioFormatDescriptionRef)fmts[0];
+					const AudioStreamBasicDescription *asbd =
+							CMAudioFormatDescriptionGetStreamBasicDescription(afd);
+					if (asbd) {
+						impl_->audio_channels = static_cast<int>(asbd->mChannelsPerFrame);
+						impl_->audio_rate = static_cast<int>(asbd->mSampleRate);
+					}
+				}
+			} else {
+				impl_->audio_channels = impl_->audio_tracks[0].channels;
+				impl_->audio_rate = impl_->audio_tracks[0].sample_rate;
+			}
+		}
 
 		if (!impl_->video_track && !impl_->audio_track) {
 			impl_->error = true;
