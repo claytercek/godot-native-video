@@ -658,16 +658,13 @@ bool MfBackend::reselect_audio_track(int index, double pts_seconds) {
 	// one, applying float PCM output on the new stream. The reader's current
 	// position is left unchanged so video decode is undisturbed; audio from
 	// the new track starts at the video stream's current position.
-	const double target = pts_seconds < 0.0 ? 0.0 : pts_seconds;
 	// switch_audio_track handles the actual stream toggle and PCM
-	// reconfiguration; it does not seek the reader. The target position is
-	// recorded as the new track's start for metadata consistency — MF's
-	// stream decoder naturally starts from the next available sample at the
-	// reader's current position.
+	// reconfiguration. The reader's current position is unchanged so video
+	// decode is undisturbed; audio from the new track starts at the reader's
+	// current position (within one chunk of `pts_seconds`).
 	if (!impl_->switch_audio_track(clamped)) {
 		return false;
 	}
-	(void)target; // consumed by priming logic in switch_audio_track
 	return true;
 }
 
