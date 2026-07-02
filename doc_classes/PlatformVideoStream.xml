@@ -10,4 +10,19 @@
 	</description>
 	<tutorials>
 	</tutorials>
+	<methods>
+		<method name="get_color_info">
+			<return type="Dictionary" />
+			<description>
+				Returns a [Dictionary] with the parsed/negotiated colorimetry metadata for the most recently opened clip. The dictionary contains the following keys:
+				[code]matrix[/code] (int): YCbCr matrix — 0=Unspecified, 1=BT.709, 2=BT.601, 3=BT.2020.
+				[code]primaries[/code] (int): Color primaries — 0=Unspecified, 1=BT.709, 2=BT.601-625 (PAL), 3=BT.601-525 (NTSC), 4=BT.2020, 5=DCI-P3.
+				[code]transfer[/code] (int): Transfer function — 0=Unspecified, 1=BT.709, 2=PQ (SMPTE ST 2084), 3=HLG.
+				[code]range[/code] (int): Video range — 0=Unspecified, 1=Video (limited), 2=Full.
+				[code]bit_depth[/code] (int): Bits per channel (8 for the v1 SDR scope).
+				Untagged clips (no embedded colorimetry metadata) return BT.709, video-range defaults, which is pixel-identical to the legacy hard-coded conversion shader.
+				Must be called after [method VideoStreamPlayback.play] has started, i.e. after the stream has been opened by [VideoStreamPlayer].
+			</description>
+		</method>
+	</methods>
 </class>

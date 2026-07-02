@@ -49,8 +49,15 @@ public:
 	std::optional<core::AudioChunk> next_audio_chunk() override;
 
 	// True if the most recent decode pump hit an error (as opposed to a clean
-	// end-of-stream). Lets the integration test assert "no decode errors".
+	// end-of-stream). Lets the integration test assert no decode errors.
 	bool had_error() const;
+
+	// --- Colorimetry (populated at open from format descriptions) ---
+	core::ColorMatrix ycbcr_matrix() const override;
+	core::ColorPrimaries color_primaries() const override;
+	core::TransferFunction transfer_function() const override;
+	core::ColorRange color_range() const override;
+	int bit_depth() const override;
 
 private:
 	class Impl;

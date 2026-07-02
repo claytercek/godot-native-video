@@ -82,7 +82,12 @@ public:
 protected:
 	static void _bind_methods();
 
-private:
+public:
+	// --- Colorimetry ---
+	// Returns a Dictionary with the parsed/negotiated colorimetry.
+	// Callable after load() succeeds (i.e. after open but before play).
+	// Untagged clips return BT.709 video-range defaults.
+	godot::Dictionary get_color_info() const;
 	// Pull decoded audio chunks from the backend into the audio ring until it is
 	// topped up or EOS. Cheap; called every _update before mixing.
 	void fill_audio();
@@ -150,6 +155,13 @@ private:
 
 	int width_ = 0;
 	int height_ = 0;
+
+	// Cached colorimetry from the backend (populated at load() time).
+	int color_matrix_ = 1;      // core::ColorMatrix::BT709
+	int color_primaries_ = 1;   // core::ColorPrimaries::BT709
+	int color_transfer_ = 1;    // core::TransferFunction::BT709
+	int color_range_ = 1;       // core::ColorRange::Video
+	int color_bit_depth_ = 8;
 };
 
 } // namespace godot

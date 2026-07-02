@@ -13,9 +13,11 @@
 // Output is an engine-owned RGBA8 storage image that Godot samples through a
 // Texture2DRD. Godot never samples the decoder planes directly.
 //
-// Colour math: BT.709, 8-bit, *video range* (Y' in [16,235], Cb/Cr in
-// [16,240]) — this matches kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-// requested by the AVFoundation backend.
+// Colour math: the YCbCr matrix and video/full-range normalisation are
+// selected by the push constants from per-frame metadata (matrix_select,
+// range_select), so BT.601 SD clips and P3-tagged content decode correctly.
+// Untagged clips default to BT.709 video range (matching the old hard-coded
+// behaviour).
 // -----------------------------------------------------------------------
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -32,8 +34,8 @@ layout(set = 0, binding = 2, rgba8) uniform restrict writeonly image2D rgba_out;
 layout(push_constant, std430) uniform Params {
 	uint out_width;
 	uint out_height;
-	uint pad0; // explicit pad to 16 bytes: Godot 4.7+ validates the supplied
-	uint pad1; // push-constant size against the shader's exact declared size
+	uint matrix_select; // 0=Unspecified, 1=BT.709, 2=BT.601, 3=BT.2020 (core::ColorMatrix)
+	uint range_select;  // 0=Unspecified, 1=Video, 2=Full (core::ColorRange)
 } params;
 
 void main() {
@@ -50,20 +52,62 @@ void main() {
 	float y = texture(luma_plane, uv).r;
 	vec2 cbcr = texture(chroma_plane, uv).rg;
 
-	// Video-range -> full-range normalisation.
-	//   Y'  : (255*Y - 16) / 219
-	//   Cb/Cr: (255*C - 128) / 224, centred at 0.
-	float yf = (y * 255.0 - 16.0) / 219.0;
-	float cb = (cbcr.r * 255.0 - 128.0) / 224.0;
-	float cr = (cbcr.g * 255.0 - 128.0) / 224.0;
+	// Range normalisation — selects video or full range scaling.
+	//   Video range: Y' in [16,235], Cb/Cr in [16,240]  (9 dB headroom)
+	//   Full range:  Y' in [0,255],  Cb/Cr in [0,255]
+	float y_scale, y_offset;
+	float c_scale, c_offset;
+	if (params.range_select <= 1u) {
+		// Video (limited) range — also handles Unspecified (0) and Video (1)
+		y_scale  = 255.0 / 219.0;
+		y_offset = -16.0 / 219.0;
+		c_scale  = 255.0 / 224.0;
+		c_offset = -128.0 / 224.0;
+	} else {
+		// Full range
+		y_scale  = 1.0;
+		y_offset = 0.0;
+		c_scale  = 1.0;
+		c_offset = -128.0 / 255.0;
+	}
 
-	// BT.709 YCbCr -> linear-ish RGB (the standard non-linear-to-display matrix;
-	// we keep the encoded transfer, i.e. output is BT.709 gamma-encoded RGB,
-	// which is what a stock sRGB-ish sampling pipeline expects for SDR video).
+	float yf  = y  * y_scale  + y_offset;
+	float cb  = cbcr.r * c_scale + c_offset;
+	float cr  = cbcr.g * c_scale + c_offset;
+
+	// YCbCr -> RGB matrix selection.
+	//
+	// Coefficients from ITU-R BT.601 (SD), BT.709 (HD), BT.2020 (UHD).
+	//   R = Y +                    Kr * (Cr - 0.5)
+	//   G = Y - Kb * (Cb - 0.5) - Kr * (Cr - 0.5)
+	//   B = Y + Kb * (Cb - 0.5)
+	//
+	// where Kr = 0.299,  Kb = 0.114  for BT.601  (R-Y range:  0.701, B-Y range: 0.886)
+	//       Kr = 0.2126, Kb = 0.0722 for BT.709  (R-Y range:  0.7874, B-Y range: 0.9278)
+	//       Kr = 0.2627, Kb = 0.0593 for BT.2020 (R-Y range: 1.4746, B-Y range: 1.8814)
+	//
+	// The standard inverse matrices are:
+	//   BT.601:    R = Y + 1.40200 * Cr,   G = Y - 0.34414 * Cb - 0.71414 * Cr,   B = Y + 1.77200 * Cb
+	//   BT.709:    R = Y + 1.57480 * Cr,   G = Y - 0.18732 * Cb - 0.46812 * Cr,   B = Y + 1.85560 * Cb
+	//   BT.2020:   R = Y + 1.47460 * Cr,   G = Y - 0.16455 * Cb - 0.57135 * Cr,   B = Y + 1.88140 * Cb
+
 	vec3 rgb;
-	rgb.r = yf + 1.5748 * cr;
-	rgb.g = yf - 0.1873 * cb - 0.4681 * cr;
-	rgb.b = yf + 1.8556 * cb;
+	if (params.matrix_select == 2u) {
+		// BT.601 (SD)
+		rgb.r = yf + 1.40200 * cr;
+		rgb.g = yf - 0.34414 * cb - 0.71414 * cr;
+		rgb.b = yf + 1.77200 * cb;
+	} else if (params.matrix_select == 3u) {
+		// BT.2020 (UHD)
+		rgb.r = yf + 1.47460 * cr;
+		rgb.g = yf - 0.16455 * cb - 0.57135 * cr;
+		rgb.b = yf + 1.88140 * cb;
+	} else {
+		// Default: BT.709 (HD) — also handles Unspecified (0) and BT.709 (1)
+		rgb.r = yf + 1.57480 * cr;
+		rgb.g = yf - 0.18732 * cb - 0.46812 * cr;
+		rgb.b = yf + 1.85560 * cb;
+	}
 
 	rgb = clamp(rgb, 0.0, 1.0);
 
