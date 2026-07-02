@@ -4,6 +4,8 @@
 
 #include "present_pipeline.h"
 
+#include "common/nv12_to_rgb_shader.h"
+
 #include <cstring>
 
 #include <godot_cpp/classes/rd_sampler_state.hpp>
@@ -22,45 +24,8 @@ using namespace godot;
 
 namespace platform_media {
 
-// The compute shader source. Kept in sync with nv12_to_rgb.glsl (the .glsl
-// file is the human-readable authored copy + the import artifact for tooling;
-// we compile this embedded copy at runtime so the pipeline is self-contained
-// and does not depend on the resource import step). BT.709 8-bit video-range.
-static const char *kNv12ToRgbCompute = R"GLSL(
-#version 450
-
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-
-layout(set = 0, binding = 0) uniform sampler2D luma_plane;
-layout(set = 0, binding = 1) uniform sampler2D chroma_plane;
-layout(set = 0, binding = 2, rgba8) uniform restrict writeonly image2D rgba_out;
-
-layout(push_constant, std430) uniform Params {
-	uint out_width;
-	uint out_height;
-	uint pad0; // explicit pad to 16 bytes: Godot 4.7+ validates the supplied
-	uint pad1; // push-constant size against the shader's exact declared size
-} params;
-
-void main() {
-	uvec2 gid = gl_GlobalInvocationID.xy;
-	if (gid.x >= params.out_width || gid.y >= params.out_height) {
-		return;
-	}
-	vec2 uv = (vec2(gid) + vec2(0.5)) / vec2(params.out_width, params.out_height);
-	float y = texture(luma_plane, uv).r;
-	vec2 cbcr = texture(chroma_plane, uv).rg;
-	float yf = (y * 255.0 - 16.0) / 219.0;
-	float cb = (cbcr.r * 255.0 - 128.0) / 224.0;
-	float cr = (cbcr.g * 255.0 - 128.0) / 224.0;
-	vec3 rgb;
-	rgb.r = yf + 1.5748 * cr;
-	rgb.g = yf - 0.1873 * cb - 0.4681 * cr;
-	rgb.b = yf + 1.8556 * cb;
-	rgb = clamp(rgb, 0.0, 1.0);
-	imageStore(rgba_out, ivec2(gid), vec4(rgb, 1.0));
-}
-)GLSL";
+// kNv12ToRgbCompute is auto-generated from src/common/nv12_to_rgb.glsl at
+// build time by tools/embed_shader.py — edit the .glsl, not this constant.
 
 PresentPipeline::~PresentPipeline() {
 	shutdown();
