@@ -5,8 +5,8 @@
 //
 // Owns, on Godot's RenderingDevice:
 //   - the NV12->RGB compute shader + pipeline + sampler,
-//   - an N-buffered ring of engine-owned RGBA8 storage textures, each wrapped
-//     in a Texture2DRD that Godot samples,
+//   - an N-buffered ring of engine-owned RGBA8 storage textures, exposed
+//     through ONE stable Texture2DRD that Godot samples (see get_texture()),
 //   - a SurfaceImporter (Metal on macOS, DXGI->Vulkan on Windows; chosen by the
 //     make_surface_importer() factory) that turns a decoder surface into two RD
 //     plane textures with no CPU copy,
@@ -61,10 +61,21 @@ public:
 	// frame's own release() is parked in the retire-ring.
 	bool present(core::VideoFrame &&frame);
 
-	// The engine-owned RGBA Texture2DRD currently holding the latest frame.
-	// Returned from VideoStreamPlayback::_get_texture(). Never the decoder
-	// surface — Godot samples only this.
-	godot::Ref<godot::Texture2DRD> get_texture() const { return current_texture_; }
+	// The engine-owned RGBA Texture2DRD holding the latest frame. Returned from
+	// VideoStreamPlayback::_get_texture(). Never the decoder surface — Godot
+	// samples only this.
+	//
+	// IDENTITY IS STABLE: VideoStreamPlayer caches get_texture() ONCE when the
+	// stream is set and draws that cached ref forever (it re-reads the size via
+	// the texture's `changed` signal, which set_texture_rd_rid fires). So we
+	// hand out one lazily-created Texture2DRD and re-point its RD RID at the
+	// current ring slot each present — never a different wrapper per frame.
+	godot::Ref<godot::Texture2DRD> get_texture() const {
+		if (current_texture_.is_null()) {
+			current_texture_.instantiate();
+		}
+		return current_texture_;
+	}
 
 	// Debug instrumentation: number of CPU pixel copies performed on the present
 	// path. MUST stay 0 — the perf contract (ADR-0003) forbids CPU copies.
@@ -75,8 +86,7 @@ public:
 
 private:
 	struct RingSlot {
-		godot::RID rgba_rid;                  // RD storage texture (rgba8)
-		godot::Ref<godot::Texture2DRD> tex;   // Texture2DRD wrapping rgba_rid
+		godot::RID rgba_rid; // RD storage texture (rgba8)
 	};
 
 	bool build_resources(int width, int height);
@@ -93,7 +103,9 @@ private:
 	RingSlot ring_[kRingDepth];
 	size_t ring_index_ = 0;
 
-	godot::Ref<godot::Texture2DRD> current_texture_;
+	// Lazily created in get_texture(); identity stable for the pipeline's
+	// lifetime (see get_texture()). mutable: creation is a caching detail.
+	mutable godot::Ref<godot::Texture2DRD> current_texture_;
 
 	// Holds each presented frame's surfaces (plane-texture release + the
 	// VideoFrame's own decoder release) for kFrameLatency rendered frames.
