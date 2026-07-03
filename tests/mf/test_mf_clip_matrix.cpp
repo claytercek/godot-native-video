@@ -13,9 +13,6 @@
 // failure. HEVC rows are skipped the same way on hosts with no HEVC decoder
 // MFT registered (e.g. GitHub-hosted Windows runners, which lack the
 // Store-distributed "HEVC Video Extensions" package).
-//
-// STATUS: implemented but NOT compiled/run/verified on the authoring host
-// (macOS, no Windows toolchain). A Windows dev / CI runner must build + run it.
 // -----------------------------------------------------------------------
 
 #include "vendor/doctest.h"

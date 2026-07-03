@@ -11,10 +11,11 @@
 //
 // No Godot / RenderingDevice symbols appear here.
 //
-// STATUS: implemented but NOT compiled, linked, run, or verified — authored on
-// a macOS host with no Windows toolchain. The Media Foundation / D3D11 / DXGI
-// calls follow the documented signatures but have not been exercised. See the
-// commit body for the exact Windows verification steps.
+// STATUS: VERIFIED on Windows 11 (AMD hardware decode). tests/mf passes the
+// full synthetic + real-clip matrix (H.264 and HEVC, MP4/MOV, 24/30/60 fps):
+// NV12 D3D11 textures with correct marker content, monotonic PTS, float32 PCM.
+// Note the decoder MFT emits frames as slices of one shared texture *array*;
+// the slice index is stashed in VideoFrame::cpu_pixels_size (see below).
 // -----------------------------------------------------------------------
 
 #include "mf_backend.h"

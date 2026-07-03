@@ -55,11 +55,31 @@ follow-ups.
 
 ## Platform Support
 
-| Platform | Framework                | Status                         |
-| -------- | ------------------------ | ------------------------------ |
-| macOS    | AVFoundation             | Supported                      |
-| Windows  | Windows Media Foundation | Implemented; pending device QA |
-| Linux    | GStreamer vs VA-API      | Deferred (decision pending)    |
+| Platform | Framework                | Status                                       |
+| -------- | ------------------------ | -------------------------------------------- |
+| macOS    | AVFoundation             | Supported                                    |
+| Windows  | Windows Media Foundation | Decode verified; present path blocked (§below) |
+| Linux    | GStreamer vs VA-API      | Deferred (decision pending)                  |
+
+### Windows status (QA'd on-device, 2026-07)
+
+The Media Foundation backend is **verified on real hardware**: the full
+`mf_tests` suite passes (synthetic clip + real-clip matrix, H.264 & HEVC
+hardware decode, NV12 D3D11 textures, monotonic PTS, float32 PCM), the
+extension builds and loads in Godot 4.4.1, and playback (loader → backend →
+clock → frame queue) runs end-to-end in the demo.
+
+The final present step — importing the decoded D3D11 NV12 surface into Godot's
+Vulkan device via `VK_KHR_external_memory_win32` — is **blocked by stock
+Godot**: the engine does not enable that device extension (any version through
+master) and a GDExtension cannot request additional device extensions. Frames
+decode but no texture reaches the screen. Options under evaluation:
+
+1. **Upstream Godot PR** enabling the external-memory extensions in the Vulkan
+   driver (the existing importer then works as designed).
+2. **A D3D12 importer** targeting Godot's D3D12 rendering driver (Godot 4.5+
+   implements `texture_create_from_extension` there; D3D11↔D3D12 NT-handle
+   sharing needs no extension gating).
 
 ## Installation
 
@@ -80,6 +100,12 @@ TODO
    ```bash
    scons target=[template_debug|template_release] platform=[macos|windows]
    ```
+
+   On Windows the DXGI→Vulkan importer needs the Vulkan headers and loader
+   import library. Install the [LunarG Vulkan SDK](https://vulkan.lunarg.com/)
+   (its installer sets `VULKAN_SDK`, which SConstruct picks up), or point
+   `VULKAN_SDK` at any directory containing `Include/vulkan/*.h` and
+   `Lib/vulkan-1.lib`.
 
 3. **Run the demo**:
 

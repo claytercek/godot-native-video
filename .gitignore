@@ -61,3 +61,6 @@ CMakeUserPresets.json
 # clips + the matrix.list / matrix.json manifests) are all regenerated on demand
 # by CI and locally. The generator scripts are the single source of truth.
 tests/fixtures/
+# The demo's copy of the synthetic clip (see demo/README.md) is generated too.
+demo/synthetic.mp4
+demo/synthetic.mp4.uid
