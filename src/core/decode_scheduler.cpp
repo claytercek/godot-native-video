@@ -151,7 +151,7 @@ void DecodeScheduler::with_backend(const StreamHandle &stream,
 		if (stream->dead_ || !stream->backend_) {
 			return;
 		}
-		stream->busy_ = true;
+		claim_locked(stream);
 	}
 	// We exclusively own the Backend here (busy_ held, no worker can claim it).
 	fn(*stream->backend_);
@@ -182,8 +182,8 @@ void DecodeScheduler::request_seek(const StreamHandle &stream, double pts_second
 		if (stream->dead_) {
 			return; // torn down concurrently; nothing to flush/resume.
 		}
+		claim_locked(stream); // exclude workers for the duration of the flush
 		stream->wants_more_ = true;
-		stream->busy_ = true; // exclude workers for the duration of the flush
 	}
 	// Flush queued frames on the consumer side (single-consumer: the caller). We
 	// hold busy_, so no worker is producing concurrently.
@@ -224,6 +224,24 @@ bool DecodeScheduler::at_end(const StreamHandle &stream) const {
 	}
 	std::lock_guard<std::mutex> lk(mu_);
 	return stream->eos_ && stream->queue_.empty();
+}
+
+void DecodeScheduler::claim_locked(const StreamHandle &stream) {
+	// Precondition: mu_ held and stream->busy_ == false. Claims the per-stream
+	// producer guard AND removes the stream from the ready_ work queue, so a
+	// worker in take_ready_stream can never pop it and stomp the claim (the
+	// invariant is: a stream sitting in ready_ is never busy). If the stream was
+	// queued, its pending work demand is folded back into wants_more_ so the
+	// releaser's notify() re-enqueues it afterwards.
+	if (stream->queued_) {
+		auto it = std::find(ready_.begin(), ready_.end(), stream);
+		if (it != ready_.end()) {
+			ready_.erase(it);
+		}
+		stream->queued_ = false;
+		stream->wants_more_ = true;
+	}
+	stream->busy_ = true;
 }
 
 void DecodeScheduler::notify(const StreamHandle &stream) {

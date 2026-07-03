@@ -229,6 +229,12 @@ private:
 	// not enqueued twice — this is what guarantees per-stream serial decode.
 	void notify(const StreamHandle &stream);
 
+	// Claim the per-stream busy guard from a NON-worker thread (request_seek /
+	// with_backend). Requires mu_ held and busy_ == false. Also dequeues the
+	// stream from ready_ so no worker can claim it concurrently; a queued work
+	// demand is folded back into wants_more_.
+	void claim_locked(const StreamHandle &stream);
+
 	// Decode one slice for `stream`: pull frames from its Backend into its queue
 	// until the queue is full or EOS. Runs on a worker thread (async) or the
 	// caller (sync). The caller must hold the stream's "busy" claim.
