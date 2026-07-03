@@ -16,10 +16,6 @@
 // WINDOWS-ONLY: this file is compiled only by `scons target=mf_tests` on
 // Windows. It is excluded everywhere else (the whole body is under #if _WIN32),
 // so it must NEVER be added to the macOS / core_tests source sets.
-//
-// STATUS: implemented but NOT compiled/run/verified — there is no Windows
-// toolchain on the authoring host. A Windows dev / CI runner must build and run
-// it; see the commit body.
 // -----------------------------------------------------------------------
 
 #include "vendor/doctest.h"
@@ -88,7 +84,14 @@ std::string ensure_fixture() {
 // read back from a D3D11 NV12 texture. This is a TEST-ONLY CPU read-back via a
 // staging texture; the present path imports the texture to the GPU zero-copy and
 // never does this. Mirrors mean_block_luma() in the AVF test.
-double mean_block_luma(ID3D11Texture2D *tex) {
+//
+// `subresource` is the array-slice index the backend stashes in
+// core::VideoFrame::cpu_pixels_size: DXVA decoders hand out frames as slices of
+// one shared texture *array*, so the readback must copy that slice
+// (CopySubresourceRegion) — CopyResource into a 1-slice staging texture is an
+// array-size mismatch, which D3D11 silently ignores, leaving the staging
+// texture black.
+double mean_block_luma(ID3D11Texture2D *tex, UINT subresource) {
 	if (!tex) {
 		return 0.0;
 	}
@@ -110,11 +113,12 @@ double mean_block_luma(ID3D11Texture2D *tex) {
 	sdesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 	sdesc.MiscFlags = 0;
 	sdesc.ArraySize = 1;
+	sdesc.MipLevels = 1;
 
 	ID3D11Texture2D *staging = nullptr;
 	double result = 0.0;
 	if (SUCCEEDED(device->CreateTexture2D(&sdesc, nullptr, &staging)) && staging) {
-		ctx->CopyResource(staging, tex);
+		ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, subresource, nullptr);
 		D3D11_MAPPED_SUBRESOURCE mapped = {};
 		if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
 			const uint8_t *luma = static_cast<const uint8_t *>(mapped.pData);
@@ -178,7 +182,7 @@ TEST_CASE("MF backend decodes synthetic clip to NV12 + PCM with monotonic PTS") 
 		// loss + chroma siting drags the mean down; require >= 170 over the
 		// text-free quadrant.
 		ID3D11Texture2D *tex = static_cast<ID3D11Texture2D *>(frame->native_handle);
-		double luma = mean_block_luma(tex);
+		double luma = mean_block_luma(tex, static_cast<UINT>(frame->cpu_pixels_size));
 		if (luma >= 170.0) {
 			++bright_marker_frames;
 		}
