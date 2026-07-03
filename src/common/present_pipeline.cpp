@@ -38,6 +38,8 @@ layout(set = 0, binding = 2, rgba8) uniform restrict writeonly image2D rgba_out;
 layout(push_constant, std430) uniform Params {
 	uint out_width;
 	uint out_height;
+	uint pad0; // explicit pad to 16 bytes: Godot 4.7+ validates the supplied
+	uint pad1; // push-constant size against the shader's exact declared size
 } params;
 
 void main() {
@@ -147,18 +149,16 @@ bool PresentPipeline::build_resources(int width, int height) {
 		RID rgba = rd_->texture_create(fmt, view, TypedArray<PackedByteArray>());
 		ERR_FAIL_COND_V_MSG(!rgba.is_valid(), false, "RGBA output texture_create failed.");
 
-		Ref<Texture2DRD> t2d;
-		t2d.instantiate();
-		t2d->set_texture_rd_rid(rgba);
-
 		ring_[i].rgba_rid = rgba;
-		ring_[i].tex = t2d;
 	}
 
 	width_ = width;
 	height_ = height;
 	ring_index_ = 0;
-	current_texture_ = ring_[0].tex;
+	// Point the stable output texture at slot 0 (creates it if the player has
+	// not asked for it yet). This fires `changed`, so the cached texture in
+	// VideoStreamPlayer picks up the real dimensions.
+	get_texture()->set_texture_rd_rid(ring_[0].rgba_rid);
 	ready_ = true;
 	return true;
 }
@@ -235,8 +235,8 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		return false;
 	}
 
-	// Push constant: output dimensions. std430 — two uint32 = 8 bytes, padded to
-	// 16 for the push-constant alignment Godot expects.
+	// Push constant: output dimensions + explicit shader-side padding = 16 bytes.
+	// Must exactly match the shader's declared Params size (Godot 4.7+ validates).
 	PackedByteArray pc;
 	pc.resize(16);
 	{
@@ -274,7 +274,10 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		planes.release_sync();
 	}
 
-	current_texture_ = slot.tex;
+	// Re-point the stable output texture at the slot the dispatch above wrote.
+	// Texture2DRD keeps its RenderingServer-side RID stable across this call, so
+	// the player's cached draw commands keep working; only the contents swap.
+	current_texture_->set_texture_rd_rid(slot.rgba_rid);
 
 	// Park this frame's surfaces in the retire-ring for kFrameLatency frames.
 	// We bundle: the transient plane textures + CVMetalTexture wrappers, the
@@ -302,13 +305,13 @@ void PresentPipeline::free_resources() {
 	if (rd_ == nullptr) {
 		return;
 	}
+	// Detach the stable output texture BEFORE freeing the ring textures so it
+	// never dangles. Keep the object itself alive: VideoStreamPlayer holds a
+	// cached ref to it, and a rebuild (dimension change) re-points it.
+	if (current_texture_.is_valid()) {
+		current_texture_->set_texture_rd_rid(RID());
+	}
 	for (size_t i = 0; i < kRingDepth; ++i) {
-		if (ring_[i].tex.is_valid()) {
-			// Drop our reference; clear the RD rid binding first so Texture2DRD
-			// doesn't try to free a rid we own.
-			ring_[i].tex->set_texture_rd_rid(RID());
-			ring_[i].tex.unref();
-		}
 		if (ring_[i].rgba_rid.is_valid()) {
 			rd_->free_rid(ring_[i].rgba_rid);
 			ring_[i].rgba_rid = RID();
@@ -326,7 +329,6 @@ void PresentPipeline::free_resources() {
 		rd_->free_rid(shader_);
 		shader_ = RID();
 	}
-	current_texture_.unref();
 	ready_ = false;
 	width_ = 0;
 	height_ = 0;

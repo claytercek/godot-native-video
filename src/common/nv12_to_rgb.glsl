@@ -33,6 +33,8 @@ layout(set = 0, binding = 2, rgba8) uniform restrict writeonly image2D rgba_out;
 layout(push_constant, std430) uniform Params {
 	uint out_width;
 	uint out_height;
+	uint pad0; // explicit pad to 16 bytes: Godot 4.7+ validates the supplied
+	uint pad1; // push-constant size against the shader's exact declared size
 } params;
 
 void main() {
