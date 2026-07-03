@@ -68,7 +68,11 @@ public:
 	// ID3D11Texture2D*) into two RD plane textures, zero-copy (GPU-only). Returns
 	// an invalid PlaneTextures on failure. The importer does NOT take ownership of
 	// the decoder texture; the caller's VideoFrame::release still owns it.
-	PlaneTextures import(void *d3d11_texture) override;
+	//
+	// `plane_slice` is the texture-array slice holding THIS frame: DXVA decoder
+	// MFTs pack decoded frames as slices of one shared NV12 texture array, and
+	// the MF backend records the slice index per frame (see surface_importer.h).
+	PlaneTextures import(void *d3d11_texture, uint32_t plane_slice) override;
 
 private:
 	struct Impl;
