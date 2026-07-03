@@ -40,20 +40,26 @@
 // 0. (A future optimization could request shareable decoder textures and drop
 // even this GPU blit.)
 //
-// STATUS: compiles and links on Windows, but BLOCKED AT RUNTIME on stock Godot.
-// initialize() fails at the vkGetMemoryWin32HandlePropertiesKHR resolve because
-// Godot's Vulkan driver does not enable VK_KHR_external_memory_win32 on the
-// device it creates (checked: not enabled in 4.4.1, 4.5-stable, or master, and
-// there is no mechanism for a GDExtension to request extra device extensions).
-// The import chain below is therefore unreachable as designed. Paths forward:
-//   1. Upstream Godot PR enabling VK_KHR_external_memory_win32 (+ external
-//      semaphore/keyed-mutex interop exts) in the Vulkan driver — then this
-//      code runs as designed.
-//   2. Target Godot's D3D12 RD driver instead (Godot 4.5+ implements
-//      texture_create_from_extension for D3D12): D3D11 decoder -> NT shared
-//      handle -> ID3D12Device::OpenSharedHandle needs no extension gating.
-//      Requires a separate D3D12 importer + Windows users selecting the D3D12
-//      rendering driver, and NV12 plane views / fence sync need design work.
+// STATUS (verified on-device 2026-07-03, AMD Radeon RX Vega, Win 11):
+//   - Stock Godot (<= 4.5, master): BLOCKED. initialize() fails at the
+//     vkGetMemoryWin32HandlePropertiesKHR resolve because Godot never enables
+//     VK_KHR_external_memory_win32 on its Vulkan device and provides no way to
+//     request it.
+//   - Godot PR #114940 (adds project setting rendering/rendering_device/vulkan/
+//     additional_device_extensions; demo/project.godot requests the extension):
+//     the FULL import chain below runs and end-to-end zero-copy playback was
+//     verified visually — with ONE remaining engine gap:
+//     RenderingDevice::texture_create_from_extension hardcodes
+//     VK_IMAGE_ASPECT_COLOR_BIT for its view, but the R8/RG8 plane views of the
+//     multi-planar NV12 image require VK_IMAGE_ASPECT_PLANE_0/1_BIT. With COLOR
+//     aspect the AMD driver aliases plane-0 memory for both views (garbage
+//     colors, wrong pitch); with a small local engine patch mapping
+//     R8 -> PLANE_0 / RG8 -> PLANE_1 the output is pixel-correct. Upstream needs
+//     a plane/aspect parameter on texture_create_from_extension (feedback filed
+//     on PR #114940 / proposal godot-proposals#13969).
+// Fallback if the PR route stalls: D3D12 RD driver on Godot 4.5+ (D3D11 -> NT
+// handle -> ID3D12Device::OpenSharedHandle needs no extension gating; NV12
+// PlaneSlice views + fence sync need design work).
 // Everything upstream of this file (MF decode, playback, clock, scheduler) is
 // verified working on Windows via tests/mf and the demo run.
 // -----------------------------------------------------------------------
@@ -335,7 +341,10 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	VkImageCreateInfo img_info = {};
 	img_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	img_info.pNext = &ext_img;
-	img_info.flags = VK_IMAGE_CREATE_DISJOINT_BIT; // multi-planar NV12
+	// NOT disjoint: the imported D3D11 texture is one dedicated allocation, and a
+	// disjoint image would require per-plane vkBindImageMemory2. MUTABLE_FORMAT is
+	// required to create per-plane views (R8/RG8) that differ from the image format.
+	img_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	img_info.imageType = VK_IMAGE_TYPE_2D;
 	img_info.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM; // NV12
 	img_info.extent = { width, height, 1 };
