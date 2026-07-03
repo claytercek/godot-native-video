@@ -2,7 +2,7 @@ name: Engine Core Tests
 
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
     paths:
       - "src/core/**"
       - "src/backends/**"
