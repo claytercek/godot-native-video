@@ -39,7 +39,10 @@ env = localEnv.Clone()
 # -----------------------------------------------------------------------
 if ARGUMENTS.get("target", "") == "core_tests":
     core_env = Environment(tools=["default"])
-    core_env.Append(CXXFLAGS=["-std=c++20", "-Wall", "-Wextra"])
+    if sys.platform == "win32":
+        core_env.Append(CXXFLAGS=["/std:c++20", "/EHsc", "/W4"])
+    else:
+        core_env.Append(CXXFLAGS=["-std=c++20", "-Wall", "-Wextra"])
     core_env.Append(CPPPATH=["#src/core", "#tests/core/vendor"])
     core_sources = [
         "tests/core/main.cpp",
@@ -56,13 +59,19 @@ if ARGUMENTS.get("target", "") == "core_tests":
     # The force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG.
     # Define it for the headless core tests so the force-sync test compiles/runs.
     core_env.Append(CPPDEFINES=["PLATFORM_MEDIA_DEBUG"])
-    # The scheduler spins up worker threads.
-    core_env.Append(LIBS=["pthread"])
+    # The scheduler spins up worker threads. MSVC's std::thread needs no extra
+    # library; everywhere else link pthread.
+    if sys.platform != "win32":
+        core_env.Append(LIBS=["pthread"])
     # Allow an ASan build of the core tests to prove the retire-ring is
     # use-after-free clean:  scons target=core_tests asan=yes
+    # (MSVC supports /fsanitize=address; GCC/Clang use -fsanitize=address.)
     if ARGUMENTS.get("asan", "") in ("1", "yes", "true"):
-        core_env.Append(CXXFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer", "-g"])
-        core_env.Append(LINKFLAGS=["-fsanitize=address"])
+        if sys.platform == "win32":
+            core_env.Append(CXXFLAGS=["/fsanitize=address", "/Zi"])
+        else:
+            core_env.Append(CXXFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer", "-g"])
+            core_env.Append(LINKFLAGS=["-fsanitize=address"])
     core_tests = core_env.Program("bin/core_tests", core_sources)
     Default(core_tests)
     # Skip the rest — godot-cpp is not needed.
@@ -105,9 +114,7 @@ if ARGUMENTS.get("target", "") == "avf_tests":
 # Build (on Windows):  scons target=mf_tests platform=windows
 # Run:                 bin\mf_tests.exe
 #
-# STATUS: UNVERIFIED on this (macOS) host — there is no Windows toolchain here,
-# so this target is provided for Windows CI to build + run. It is intentionally
-# guarded so an accidental invocation on a non-Windows host fails loudly with a
+# Guarded so an accidental invocation on a non-Windows host fails loudly with a
 # clear message instead of producing a broken binary.
 # -----------------------------------------------------------------------
 if ARGUMENTS.get("target", "") == "mf_tests":
@@ -199,17 +206,26 @@ elif env["platform"] == "windows":
     # sources (src/common/*.cpp) — including the DXGI->Vulkan surface importer and
     # the Windows backend factory — are already globbed above; their bodies are
     # guarded by #if _WIN32 so they only emit code on Windows.
-    #
-    # STATUS: UNVERIFIED. This block is authored on a macOS host with no Windows
-    # toolchain; it has not been built. A Windows dev should run
-    #   scons target=template_debug platform=windows
-    # and resolve any include/lib path issues (esp. the Vulkan SDK headers/loader,
-    # which the DXGI importer needs for VK_KHR_external_memory_win32).
     sources.extend(Glob("build/src/backends/mf/*.cpp"))
 
     # CPPPATH so the binding can include the core + MF backend headers by relative
     # path (mirrors the macOS block).
     env.Append(CPPPATH=["src/core", "src/backends/mf"])
+
+    # The DXGI->Vulkan importer needs the Vulkan headers (vulkan/vulkan.h) and
+    # the loader import library (vulkan-1.lib). Neither ships with MSVC, so we
+    # pull them from the Vulkan SDK via the VULKAN_SDK env var the SDK installer
+    # sets. (Any directory with Include/vulkan/*.h + Lib/vulkan-1.lib works —
+    # e.g. the Khronos Vulkan-Headers repo plus an import lib generated from
+    # the system vulkan-1.dll.)
+    vulkan_sdk = os.environ.get("VULKAN_SDK", "")
+    if vulkan_sdk:
+        env.Append(CPPPATH=[os.path.join(vulkan_sdk, "Include")])
+        env.Append(LIBPATH=[os.path.join(vulkan_sdk, "Lib")])
+    else:
+        print("WARNING: VULKAN_SDK is not set — vulkan/vulkan.h and vulkan-1.lib "
+              "will only resolve if provided some other way. Install the LunarG "
+              "Vulkan SDK if the build fails to find them.")
 
     # Libraries:
     #   mfplat/mf/mfreadwrite/mfuuid : Media Foundation source reader + decode.
