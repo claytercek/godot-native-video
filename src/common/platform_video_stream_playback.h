@@ -87,10 +87,13 @@ private:
 	void fill_audio();
 	// Drain decoded PCM from the ring into Godot's AudioServer via mix_audio(),
 	// and advance the audio-master clock by the frames Godot actually consumed.
-	// Returns true iff the clock was advanced this call, so a caller can tell a
-	// genuine real-frame advance apart from "nothing left to advance with" —
-	// _update() uses this to avoid double-advancing on the tick real audio runs out.
+	// Returns true iff the clock was advanced this call — _update() uses this to
+	// avoid double-advancing on the tick real audio runs out.
 	bool drive_audio();
+	// True once no real audio samples will ever advance the clock again: silent
+	// clips, and a shorter audio track once it has fully drained. From then on
+	// _update() advances the master clock by the render delta instead.
+	bool audio_exhausted() const;
 	// The current master clock (audio-master when audio present, else monotonic).
 	core::Clock *master() const;
 
@@ -119,11 +122,9 @@ private:
 
 	// Master-clock implementations. Exactly one is "the master" per clip:
 	//  - audio_clock_ when the clip has an audio track (samples-consumed ÷ rate,
-	//    latency-compensated). Driven by drive_audio() from real consumption;
-	//    once the audio track hits genuine EOS (shorter than the video track),
-	//    _update() falls back to advancing it by render delta so trailing video
-	//    keeps playing instead of freezing on a clock with no more samples due.
-	//  - mono_clock_  for silent clips (advanced by _update's render delta).
+	//    latency-compensated), driven by drive_audio() from real consumption.
+	//  - mono_clock_  for silent clips.
+	// Either way, once audio_exhausted() the master advances by render delta.
 	std::unique_ptr<core::AudioMasterClock> audio_clock_;
 	std::unique_ptr<core::MonotonicClock> mono_clock_;
 

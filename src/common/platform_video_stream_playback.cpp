@@ -91,6 +91,12 @@ core::Clock *PlatformVideoStreamPlayback::master() const {
 	return mono_clock_.get();
 }
 
+bool PlatformVideoStreamPlayback::audio_exhausted() const {
+	// True when no real audio samples will ever advance the clock again:
+	// silent clips, and a shorter audio track once it has fully drained.
+	return !has_audio_ || (audio_eos_ && audio_ring_ && audio_ring_->empty());
+}
+
 void PlatformVideoStreamPlayback::fill_audio() {
 	if (!stream_ || !audio_ring_ || audio_eos_) {
 		return;
@@ -331,28 +337,18 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 	}
 	core::DecodeScheduler &sched = core::DecodeScheduler::instance();
 
+	// One clock rule: advance from real audio samples when any exist; once no
+	// more can ever come (silent clip, or a shorter audio track fully drained —
+	// legitimate in real-world files), advance by the render delta instead. The
+	// gate on !advanced_from_audio keeps the last partial ring drain from
+	// double-advancing (real leftover frames + delta on the same tick).
+	bool advanced_from_audio = false;
 	if (has_audio_) {
-		// Audio-master path: keep the audio ring fed, then drain it into Godot's
-		// AudioServer. drive_audio() advances the master clock from the samples
-		// actually consumed (the audio clock IS the master here — ADR-0001).
 		fill_audio();
-		const bool advanced_from_audio = drive_audio();
-		// The audio track can legitimately end before the video track (mismatched
-		// track durations are common in real-world files, not just malformed
-		// ones). Once the backend has reported genuine audio EOS and drive_audio()
-		// had no real samples left to advance the clock with this tick, no more
-		// real samples will ever arrive — so it would otherwise freeze forever and
-		// strand any remaining video. Fall back to advancing by wall-clock delta
-		// for the tail, the same mechanism used for silent clips below. Gated on
-		// !advanced_from_audio so the one tick where the ring drains to empty
-		// still advances by exactly its real leftover frames, not real+delta.
-		if (!advanced_from_audio && audio_eos_ && audio_ring_->empty()) {
-			audio_clock_->set_time(audio_clock_->media_time() + delta);
-		}
-	} else {
-		// Silent clip: advance the monotonic clock by the render delta so the
-		// video still plays at the correct rate.
-		clock->advance(delta);
+		advanced_from_audio = drive_audio();
+	}
+	if (!advanced_from_audio && audio_exhausted()) {
+		clock->set_time(clock->media_time() + delta);
 	}
 	const double now = clock->media_time();
 
@@ -406,8 +402,7 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 
 	// End-of-playback: video stream drained (Backend EOS + empty queue) and audio
 	// fully consumed. at_end() reflects the worker-reported EOS for our stream.
-	const bool audio_done = !has_audio_ || (audio_eos_ && audio_ring_ && audio_ring_->empty());
-	if (sched.at_end(stream_) && audio_done) {
+	if (sched.at_end(stream_) && audio_exhausted()) {
 		playing_ = false;
 	}
 }
