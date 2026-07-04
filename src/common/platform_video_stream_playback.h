@@ -12,21 +12,22 @@
 // and presents it through the zero-copy PresentPipeline. _get_texture() returns
 // the engine-owned RGBA Texture2DRD.
 //
-// SCOPE (dte — this slice): linear playback + audio-master A/V sync. Audio is
+// SCOPE (linear-playback slice): linear playback + audio-master A/V sync. Audio is
 // drained into Godot via mix_audio(); the master clock is derived from the
 // audio samples Godot actually consumes (latency-compensated AudioMasterClock),
 // with a MonotonicClock delta fallback for silent clips. The present step runs
 // the Godot-free drop-late / hold-early present-selector.
 //
-// SCOPE (g1c — this slice): decode is moved OFF the main thread onto a bounded
+// SCOPE (decode-pool slice): decode is moved OFF the main thread onto a bounded
 // shared core::DecodeScheduler pool. Each playback registers its core::Backend
 // with the process-wide scheduler and receives a StreamHandle; a pool worker
 // fills that stream's decode-ahead queue while the main/render thread still does
 // the present + GPU pass via next_frame() + PresentPipeline. Many
 // VideoStreamPlayers share one bounded set of worker threads (no thread-per-
-// video). The present/clock/audio logic from dte is unchanged.
+// video). The present/clock/audio logic from the linear-playback slice is
+// unchanged.
 //
-// SCOPE (o3h — this slice): adaptive scrubbing. Godot only signals seeking via
+// SCOPE (scrubbing slice): adaptive scrubbing. Godot only signals seeking via
 // repeated _seek(time): a fast burst is a drag, a debounced gap (or playback
 // resume) is a settle. The Godot-free core::Scrubber turns that bare seek stream
 // into a per-seek decision — a fast drag presents the nearest KEYFRAME for

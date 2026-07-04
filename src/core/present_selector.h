@@ -19,7 +19,7 @@ namespace core {
 //   - the master clock time `now` (audio-master or monotonic fallback), and
 //   - the nominal frame interval (1 / fps), used to decide what "late" means.
 //
-// Policy (per the ADR / parent PRD: drop-late / hold-early):
+// Policy: drop-late / hold-early.
 //   * HOLD  — the head frame's PTS is in the future (PTS > now). It is not
 //             due yet; keep showing the current frame and wait. Return Hold.
 //   * SHOW  — the head frame is due (PTS <= now) AND it is the newest frame

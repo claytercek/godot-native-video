@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------
 // surface_importer.h — platform-agnostic surface-import interface.
 //
-// The zero-copy present pipeline (ADR-0003) imports a hardware-decoded NV12
+// The zero-copy present pipeline imports a hardware-decoded NV12
 // surface into Godot's RenderingDevice as two plane textures (luma R8 +
 // chroma RG8) WITHOUT any CPU copy, then runs the single NV12->RGB compute
 // pass. The *mechanism* of that import is platform-specific:

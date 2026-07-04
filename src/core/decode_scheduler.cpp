@@ -349,7 +349,7 @@ void DecodeScheduler::pump_stream(const StreamHandle &stream) {
 		return;
 	}
 
-	// Apply any pending seek before decoding (scrub seam for o3h).
+	// Apply any pending seek before decoding (the scrub seam).
 	bool do_seek = false;
 	double seek_target = 0.0;
 	{

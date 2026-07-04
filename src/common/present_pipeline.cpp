@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------
-// present_pipeline.cpp — zero-copy NV12->RGB present pipeline (ADR-0003).
+// present_pipeline.cpp — zero-copy NV12->RGB present pipeline.
 // -----------------------------------------------------------------------
 
 #include "present_pipeline.h"
@@ -89,7 +89,7 @@ bool PresentPipeline::build_resources(int width, int height) {
 	ERR_FAIL_NULL_V_MSG(rs, false, "RenderingServer unavailable");
 	rd_ = rs->get_rendering_device();
 	ERR_FAIL_NULL_V_MSG(rd_, false,
-			"No RenderingDevice — requires a Forward+/Mobile renderer (ADR-0002).");
+			"No RenderingDevice — requires a Forward+/Mobile renderer.");
 
 	// Build the per-platform surface importer (Metal on macOS, DXGI->Vulkan on
 	// Windows) lazily, then bind it to Godot's RD.
