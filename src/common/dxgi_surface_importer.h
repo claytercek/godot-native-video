@@ -35,10 +35,9 @@
 // pipeline parks that closure in the retire-ring for N frames so the GPU is done
 // sampling before teardown.
 //
-// STATUS: implemented and verified end-to-end on real hardware (see the STATUS
-// block in dxgi_surface_importer.cpp), but hard-disabled at the Windows factory
-// (surface_importer_factory_windows.cpp) per ADR-0007 until godot-proposals#13969
-// ships upstream.
+// STATUS: implemented and verified end-to-end on real hardware, but
+// hard-disabled at the factory — see surface_importer_factory_windows.cpp for
+// why and when to re-enable.
 // -----------------------------------------------------------------------
 
 #include <cstdint>

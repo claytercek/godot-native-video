@@ -40,36 +40,14 @@
 // 0. (A future optimization could request shareable decoder textures and drop
 // even this GPU blit.)
 //
-// STATUS (2026-07-06, per ADR-0007 — see surface_importer_factory_windows.cpp):
-// this is the Vulkan Zero-Copy Import Path, one of three shipped Windows Import
-// Paths, and it is currently HARD-DISABLED at the factory (kVulkanZeroCopyEnabled
-// = false), not merely version-gated. It stays fully built and linked, and its
-// mechanism below was verified end-to-end on real hardware:
-//   - Stock Godot (<= 4.5, master): BLOCKED. initialize() fails at the
-//     vkGetMemoryWin32HandlePropertiesKHR resolve because Godot never enables
-//     VK_KHR_external_memory_win32 on its Vulkan device and provides no way to
-//     request it.
-//   - Godot PR #114940 (adds project setting rendering/rendering_device/vulkan/
-//     additional_device_extensions; demo/project.godot requests the extension):
-//     the FULL import chain below runs and end-to-end zero-copy playback was
-//     verified visually (AMD Radeon RX Vega, Win 11) — with ONE remaining
-//     engine gap: RenderingDevice::texture_create_from_extension hardcodes
-//     VK_IMAGE_ASPECT_COLOR_BIT for its view, but the R8/RG8 plane views of the
-//     multi-planar NV12 image require VK_IMAGE_ASPECT_PLANE_0/1_BIT. With COLOR
-//     aspect the AMD driver aliases plane-0 memory for both views (garbage
-//     colors, wrong pitch); with a small local engine patch mapping
-//     R8 -> PLANE_0 / RG8 -> PLANE_1 the output is pixel-correct. Upstream needs
-//     a plane/aspect parameter on texture_create_from_extension (feedback filed
-//     on PR #114940 / proposal godot-proposals#13969) — this path stays disabled
-//     until that fix ships with its own detectable signal (no version number or
-//     capability query safely distinguishes "extension present" from "extension
-//     present AND aspect fix present").
-// The two Import Paths that ARE reachable today: D3D12SurfaceImporter (zero-copy,
-// Godot 4.5+ on the d3d12 RD driver, see d3d12_surface_importer.cpp) and
-// CpuCopySurfaceImporter (the default fallback — stock Vulkan driver, any Godot
-// version, see cpu_copy_surface_importer.cpp). Everything upstream of this file
-// (MF decode, playback, clock, scheduler) is verified working on Windows via
-// tests/mf and the demo run.
+// STATUS: verified end-to-end on real hardware — pixel-correct zero-copy
+// playback (AMD Radeon RX Vega, Win 11) against a patched Godot: PR #114940 to
+// enable VK_KHR_external_memory_win32, plus a small local engine patch giving
+// texture_create_from_extension the correct NV12 plane aspects. On stock Godot,
+// initialize() fails at the vkGetMemoryWin32HandlePropertiesKHR resolve because
+// the engine never enables that extension. This importer is hard-disabled at
+// the factory — see surface_importer_factory_windows.cpp for why and when to
+// re-enable.
 // -----------------------------------------------------------------------
 
 #include "dxgi_surface_importer.h"
@@ -467,11 +445,8 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	return out;
 }
 
-// make_surface_importer() lives in surface_importer_factory_windows.cpp: Windows
-// links three SurfaceImporter implementations (this one, D3D12SurfaceImporter,
-// CpuCopySurfaceImporter) and chooses between them at runtime. That factory
-// hard-disables this importer's selection per ADR-0007 — DxgiSurfaceImporter
-// stays fully built and linked, but is not currently reachable at runtime.
+// make_surface_importer() lives in surface_importer_factory_windows.cpp, which
+// selects among the three Windows importers (and currently hard-disables this one).
 
 } // namespace platform_media
 

@@ -251,8 +251,7 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	// the exporting side's work to be visible before we sample it: a CPU-blocking
 	// wait on a shared D3D11/D3D12 fence on the D3D12 RD path (may stall this
 	// thread until the D3D11 plane-split compute pass finishes on the GPU), or a
-	// DXGI keyed mutex acquire on DxgiSurfaceImporter's Vulkan zero-copy path —
-	// built and linked but not currently selectable by the factory (ADR-0007).
+	// DXGI keyed mutex acquire on DxgiSurfaceImporter's Vulkan zero-copy path.
 	// No-op on the CPU-Copy Import Path and on macOS (acquire is null: no
 	// cross-API handoff needed, either because there's nothing left for the GPU
 	// to do by the time this runs, or because one shared Metal device is used).

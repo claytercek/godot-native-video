@@ -39,9 +39,9 @@
 // scattered through the pipeline as #ifdefs — on Windows that selection is a
 // runtime check of the active RenderingDevice driver (all three of
 // DxgiSurfaceImporter, D3D12SurfaceImporter, and CpuCopySurfaceImporter are
-// linked in; see surface_importer_factory_windows.cpp — DxgiSurfaceImporter is
-// linked but hard-disabled there per ADR-0007), since macOS/iOS always run
-// Metal.
+// linked in; see surface_importer_factory_windows.cpp, which also documents
+// why DxgiSurfaceImporter is currently hard-disabled), since macOS/iOS always
+// run Metal.
 //
 // PlaneTextures (the import result) is defined here so both importers and the
 // present pipeline share one definition.
