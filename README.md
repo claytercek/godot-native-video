@@ -41,17 +41,27 @@ Highlights:
 
 ## Scope
 
-v1 targets the **8-bit SDR core matrix**:
+v1 targets the **8-bit SDR core matrix**, tested identically on macOS and
+Windows:
 
-- **Codecs:** H.264, HEVC.
-- **Containers:** MP4, MOV.
+- **Codecs:** H.264, HEVC (with the per-platform caveat below).
+- **Containers:** MP4, MOV — the loader registers `.mp4`, `.mov`, and `.m4v`.
 - **Pixel format:** NV12, BT.709.
 - **Audio:** AAC, stereo.
 
-At runtime the extension will attempt to play whatever the OS can decode, but only
-the matrix above is tested and contractually supported. **Out of scope for v1:**
-10-bit / HDR (P010, PQ/HLG), VP9/AV1, and multi-track audio — these are tracked as
-follow-ups.
+Decoding is delegated to the OS, so what actually plays depends on the
+platform — and on Windows, on the machine:
+
+| Codec | macOS (AVFoundation) | Windows (Media Foundation)                     |
+| ----- | -------------------- | ---------------------------------------------- |
+| H.264 | Built in             | Built in                                       |
+| HEVC  | Built in             | Requires an HEVC decoder MFT — typically the "HEVC Video Extensions" Microsoft Store package. Not present on server SKUs and some desktops. |
+
+Beyond the matrix, the extension will attempt to play anything the OS can
+decode, as long as it arrives in one of the registered container extensions
+above. Such content may well work, but only the matrix is tested and
+contractually supported. **Out of scope for v1:** 10-bit / HDR (P010,
+PQ/HLG), VP9/AV1, and multi-track audio — these are tracked as follow-ups.
 
 ## Platform Support
 
