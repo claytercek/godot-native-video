@@ -10,8 +10,9 @@
 // compute pass consumes, WITHOUT any CPU copy of the pixel data.
 //
 // Mechanism (see the .cpp for the full chain and design rationale):
-//   1. Compose D3D11SharedSurfacePool for the LUID-matched D3D11 bootstrap
-//      and the decoder-slice GPU blit into a pooled NV12 texture.
+//   1. Compose D3D11InteropDevice for the LUID-matched D3D11 bootstrap, then
+//      GPU-blit the decoder slice into a plain intermediate NV12 texture on
+//      that device (cached and reused across frames).
 //   2. Split that NV12 texture's planes into two STANDALONE, independently
 //      shareable single-plane textures (R8 luma, RG8 chroma) via a D3D11
 //      compute pass reading PlaneSlice shader-resource views

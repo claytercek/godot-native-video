@@ -7,7 +7,7 @@
 //   initialize() once:
 //     - Pull Godot's ID3D12Device out of RD (RD driver == d3d12).
 //     - Create our OWN ID3D11Device on the same adapter (matched by LUID via
-//       ID3D12Device::GetAdapterLuid) via D3D11SharedSurfacePool, so shared
+//       ID3D12Device::GetAdapterLuid) via D3D11InteropDevice, so shared
 //       handles are openable cross-API.
 //     - Create a D3D11.4 fence (ID3D11Device5::CreateFence, SHARED), export
 //       its NT handle, and open it on the D3D12 side (ID3D12Device::
@@ -18,12 +18,14 @@
 //
 //   import(frame) per frame:
 //     1. Decoder hands us an NV12 ID3D11Texture2D (possibly a texture-array
-//        slice). D3D11SharedSurfacePool::blit_into_shared GPU-blits it into a
-//        pooled NV12 texture (no CPU copy). That pooled texture is NOT itself
-//        shared into D3D12 — a multi-planar texture cannot be opened as one
-//        D3D12 resource in the shape Godot's RD expects (two independent
-//        single-plane textures), so it stays entirely on the D3D11 side.
-//     2. Create PlaneSlice shader-resource views on the pooled texture
+//        slice). GPU-blit (CopySubresourceRegion — no CPU copy) the slice into
+//        a plain intermediate NV12 texture on our D3D11 device, cached in Impl
+//        and reused across frames (recreated only when the frame size
+//        changes). The intermediate never leaves the D3D11 device — a
+//        multi-planar texture cannot be opened as one D3D12 resource in the
+//        shape Godot's RD expects (two independent single-plane textures) —
+//        so it carries no sharing flags and no keyed mutex.
+//     2. Create PlaneSlice shader-resource views on the intermediate texture
 //        (ID3D11Device3::CreateShaderResourceView1: R8_UNORM/PlaneSlice=0 for
 //        luma, R8G8_UNORM/PlaneSlice=1 for chroma).
 //     3. Run one compute dispatch that copies both planes into two freshly
@@ -62,8 +64,8 @@
 //     to work.
 //
 // NOTE ON "ZERO COPY": as with DxgiSurfaceImporter, the CopySubresourceRegion
-// inside blit_into_shared and the plane-split compute pass are GPU->GPU only;
-// neither touches the CPU. cpu_copy_count() stays 0.
+// into the intermediate texture and the plane-split compute pass are GPU->GPU
+// only; neither touches the CPU. cpu_copy_count() stays 0.
 // -----------------------------------------------------------------------
 
 #include "d3d12_surface_importer.h"
@@ -82,7 +84,7 @@
 #include <dxgi1_2.h> // IDXGIResource1
 
 #include "../backends/mf/com_raii.h" // mf::ComPtr
-#include "d3d11_shared_surface_pool.h"
+#include "d3d11_interop_device.h"
 
 using namespace godot;
 using mf::ComPtr;
@@ -91,10 +93,10 @@ namespace platform_media {
 
 namespace {
 
-// Reads two source planes (PlaneSlice SRVs over a pooled NV12 texture) and
-// copies each into its own standalone output texture. Dispatched once at the
-// luma (full) resolution; the chroma bounds check keeps the half-res writes
-// in range within the same dispatch.
+// Reads two source planes (PlaneSlice SRVs over the intermediate NV12
+// texture) and copies each into its own standalone output texture.
+// Dispatched once at the luma (full) resolution; the chroma bounds check
+// keeps the half-res writes in range within the same dispatch.
 const char *kPlaneSplitCS = R"HLSL(
 Texture2D<float>    SrcLuma    : register(t0);
 Texture2D<float2>   SrcChroma  : register(t1);
@@ -137,9 +139,19 @@ struct D3D12SurfaceImporter::Impl {
 	// D3D12 device, used to open shared handles.
 	ComPtr<ID3D12Device> d3d12_device;
 
-	// D3D11 bootstrap (own device on the same adapter as Godot's D3D12 device)
-	// and the decoder-slice-blit-into-shareable-texture logic.
-	D3D11SharedSurfacePool d3d_pool;
+	// D3D11 bootstrap (own device on the same adapter as Godot's D3D12 device),
+	// shared with DxgiSurfaceImporter by composition instead of duplication.
+	D3D11InteropDevice interop;
+
+	// Intermediate NV12 texture the decoder slice is blitted into each frame,
+	// cached and reused across frames (recreated only when the frame size
+	// changes). Plain — no sharing flags, no keyed mutex — because it never
+	// leaves this D3D11 device. Reuse is safe: the next frame's blit and the
+	// previous frame's plane-split dispatch run on the same immediate context,
+	// so they are ordered.
+	ComPtr<ID3D11Texture2D> intermediate_nv12;
+	UINT intermediate_width = 0;
+	UINT intermediate_height = 0;
 
 	// Shared D3D11.4/D3D12 fence: one persistent object for the importer's
 	// lifetime; import() increments next_fence_value and signals it after the
@@ -200,14 +212,14 @@ bool D3D12SurfaceImporter::initialize(RenderingDevice *rd) {
 	// Bootstrap our own D3D11 device on the same adapter as Godot's D3D12
 	// device so shared handles are openable cross-API.
 	const LUID luid = impl->d3d12_device->GetAdapterLuid();
-	if (!impl->d3d_pool.initialize(&luid)) {
+	if (!impl->interop.initialize(&luid)) {
 		delete impl;
 		return false;
 	}
 
 	// --- Shared fence bootstrap. ---
 	ComPtr<ID3D11Device5> device5;
-	if (FAILED(impl->d3d_pool.device()->QueryInterface(IID_PPV_ARGS(device5.put())))) {
+	if (FAILED(impl->interop.device()->QueryInterface(IID_PPV_ARGS(device5.put())))) {
 		ERR_PRINT("D3D12 importer init: ID3D11Device5 not available (needs Windows 10 1809+).");
 		delete impl;
 		return false;
@@ -240,12 +252,12 @@ bool D3D12SurfaceImporter::initialize(RenderingDevice *rd) {
 	}
 
 	// --- Extended device/context interfaces used every frame in import(). ---
-	if (FAILED(impl->d3d_pool.device()->QueryInterface(IID_PPV_ARGS(impl->device3.put())))) {
+	if (FAILED(impl->interop.device()->QueryInterface(IID_PPV_ARGS(impl->device3.put())))) {
 		ERR_PRINT("D3D12 importer init: ID3D11Device3 not available (needs Windows 10+).");
 		delete impl;
 		return false;
 	}
-	if (FAILED(impl->d3d_pool.context()->QueryInterface(IID_PPV_ARGS(impl->context4.put())))) {
+	if (FAILED(impl->interop.context()->QueryInterface(IID_PPV_ARGS(impl->context4.put())))) {
 		ERR_PRINT("D3D12 importer init: ID3D11DeviceContext4 not available (needs Windows 10 1809+).");
 		delete impl;
 		return false;
@@ -268,7 +280,7 @@ bool D3D12SurfaceImporter::initialize(RenderingDevice *rd) {
 		delete impl;
 		return false;
 	}
-	if (FAILED(impl->d3d_pool.device()->CreateComputeShader(
+	if (FAILED(impl->interop.device()->CreateComputeShader(
 				bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr, impl->plane_split_cs.put()))) {
 		ERR_PRINT("D3D12 importer init: CreateComputeShader (plane-split) failed.");
 		delete impl;
@@ -279,7 +291,7 @@ bool D3D12SurfaceImporter::initialize(RenderingDevice *rd) {
 	cb_desc.ByteWidth = sizeof(PlaneSplitParams);
 	cb_desc.Usage = D3D11_USAGE_DEFAULT;
 	cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	if (FAILED(impl->d3d_pool.device()->CreateBuffer(&cb_desc, nullptr, impl->params_cb.put()))) {
+	if (FAILED(impl->interop.device()->CreateBuffer(&cb_desc, nullptr, impl->params_cb.put()))) {
 		ERR_PRINT("D3D12 importer init: CreateBuffer (plane-split params) failed.");
 		delete impl;
 		return false;
@@ -302,8 +314,8 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 
 	Impl *impl = impl_;
 	RenderingDevice *rd = impl->rd;
-	ID3D11Device *device = impl->d3d_pool.device();
-	ID3D11DeviceContext *context = impl->d3d_pool.context();
+	ID3D11Device *device = impl->interop.device();
+	ID3D11DeviceContext *context = impl->interop.context();
 
 	// Borrow (do not own) the decoder's NV12 texture; the caller's VideoFrame
 	// release still owns it.
@@ -321,29 +333,38 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	const UINT chroma_width = width / 2;
 	const UINT chroma_height = height / 2;
 
-	// --- 1. GPU-blit the decoder slice into a pooled NV12 texture. This
-	// texture never leaves the D3D11 device — it exists only to be read by
-	// the plane-split pass below, so its own shared handle (unused here) is
-	// closed immediately.
-	D3D11SharedSurfacePool::SharedSurface pooled =
-			impl->d3d_pool.blit_into_shared(decoded.get(), static_cast<UINT>(plane_slice), width, height);
-	if (!pooled.valid()) {
-		return out;
+	// --- 1. GPU-blit the decoder slice into the cached intermediate NV12
+	// texture (recreated only when the frame size changes). It never leaves
+	// this D3D11 device — it exists only to be read by the plane-split pass
+	// below — so it carries no sharing flags and no keyed mutex, and the blit
+	// needs no explicit sync: this frame's copy and the previous frame's
+	// plane-split dispatch run on the same immediate context, so they are
+	// ordered.
+	if (!impl->intermediate_nv12 || impl->intermediate_width != width ||
+			impl->intermediate_height != height) {
+		D3D11_TEXTURE2D_DESC inter_desc = {};
+		inter_desc.Width = width;
+		inter_desc.Height = height;
+		inter_desc.MipLevels = 1;
+		inter_desc.ArraySize = 1;
+		inter_desc.Format = DXGI_FORMAT_NV12;
+		inter_desc.SampleDesc.Count = 1;
+		inter_desc.Usage = D3D11_USAGE_DEFAULT;
+		inter_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		if (FAILED(device->CreateTexture2D(&inter_desc, nullptr, impl->intermediate_nv12.put()))) {
+			ERR_PRINT("D3D12 importer: intermediate NV12 texture create failed.");
+			impl->intermediate_width = 0;
+			impl->intermediate_height = 0;
+			return out;
+		}
+		impl->intermediate_width = width;
+		impl->intermediate_height = height;
 	}
-	if (pooled.shared_handle != nullptr) {
-		CloseHandle(pooled.shared_handle);
-	}
-	// blit_into_shared() releases the keyed mutex to key 1 ("the caller's
-	// side") before returning; acquire it here since we are that caller, even
-	// though we are on the same device/context (matches the documented
-	// protocol in d3d11_shared_surface_pool.h). Released back to key 0 once we
-	// are done reading the pooled texture, below.
-	if (pooled.keyed_mutex && FAILED(pooled.keyed_mutex->AcquireSync(1, INFINITE))) {
-		ERR_PRINT("D3D12 importer: keyed AcquireSync(1) on the pooled NV12 texture failed.");
-		return out;
-	}
+	context->CopySubresourceRegion(
+			impl->intermediate_nv12.get(), 0, 0, 0, 0,
+			decoded.get(), static_cast<UINT>(plane_slice), nullptr);
 
-	// --- 2. PlaneSlice SRVs over the pooled NV12 texture. ---
+	// --- 2. PlaneSlice SRVs over the intermediate NV12 texture. ---
 	ID3D11Device3 *device3 = impl->device3.get();
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC1 luma_srv_desc = {};
@@ -353,7 +374,7 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	luma_srv_desc.Texture2D.MipLevels = 1;
 	luma_srv_desc.Texture2D.PlaneSlice = 0;
 	ComPtr<ID3D11ShaderResourceView1> luma_srv;
-	if (FAILED(device3->CreateShaderResourceView1(pooled.texture.get(), &luma_srv_desc, luma_srv.put()))) {
+	if (FAILED(device3->CreateShaderResourceView1(impl->intermediate_nv12.get(), &luma_srv_desc, luma_srv.put()))) {
 		ERR_PRINT("D3D12 importer: luma PlaneSlice SRV create failed.");
 		return out;
 	}
@@ -362,7 +383,7 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	chroma_srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
 	chroma_srv_desc.Texture2D.PlaneSlice = 1;
 	ComPtr<ID3D11ShaderResourceView1> chroma_srv;
-	if (FAILED(device3->CreateShaderResourceView1(pooled.texture.get(), &chroma_srv_desc, chroma_srv.put()))) {
+	if (FAILED(device3->CreateShaderResourceView1(impl->intermediate_nv12.get(), &chroma_srv_desc, chroma_srv.put()))) {
 		ERR_PRINT("D3D12 importer: chroma PlaneSlice SRV create failed.");
 		return out;
 	}
@@ -439,12 +460,6 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	context->CSSetShaderResources(0, 2, null_srvs);
 	context->CSSetUnorderedAccessViews(0, 2, null_uavs, nullptr);
 	context->CSSetShader(nullptr, nullptr, 0);
-
-	// Done reading the pooled NV12 texture; hand it back to the D3D side of
-	// the keyed-mutex protocol (key 0), matching blit_into_shared()'s handoff.
-	if (pooled.keyed_mutex) {
-		pooled.keyed_mutex->ReleaseSync(0);
-	}
 
 	// --- 4. Signal the shared fence for this frame and flush so the GPU
 	// actually processes the signal (the D3D12 side's CPU wait below depends
