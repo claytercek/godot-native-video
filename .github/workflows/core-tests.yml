@@ -21,7 +21,70 @@ on:
   workflow_dispatch:
 
 jobs:
+  test-media:
+    # Generates ALL test media (synthetic marker clip + real-clip matrix) once,
+    # on the cheapest runner, and shares it with the backend coverage jobs via
+    # an artifact. The clips are plain media files with no platform-specific
+    # content, so where they are encoded is irrelevant to what the backends
+    # decode. ffmpeg is a TEST-ONLY tool (never a runtime dependency); doing
+    # the generation here keeps CI independent of Git LFS bandwidth without
+    # paying for an ffmpeg install on every runner.
+    #
+    # The generated files are also cached across runs, keyed on the generator
+    # scripts: on a cache hit the ffmpeg install and generation are skipped
+    # entirely. Bump the v1 prefix to force regeneration (e.g. after an ffmpeg
+    # behavior change worth picking up).
+    name: Generate Test Media
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore cached test media
+        id: media-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/fixtures/synthetic.mp4
+            tests/fixtures/matrix
+          key: test-media-v1-${{ hashFiles('tools/gen_test_media.sh', 'tools/gen_clip_matrix.sh') }}
+
+      - name: Install ffmpeg
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Generate synthetic test media
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        # Doubles as the smoke-test for the generator script: it re-runs
+        # whenever the script changes (cache miss) and fails the workflow if
+        # generation breaks.
+        run: |
+          bash tools/gen_test_media.sh \
+            --frames 30 \
+            --output tests/fixtures/synthetic.mp4
+          # Verify the output file exists and is non-empty
+          test -s tests/fixtures/synthetic.mp4 && \
+            echo "Synthetic clip generated: $(du -sh tests/fixtures/synthetic.mp4 | cut -f1)"
+
+      - name: Generate real-clip matrix
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        run: bash tools/gen_clip_matrix.sh
+
+      - name: Upload test media artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-media
+          path: |
+            tests/fixtures/synthetic.mp4
+            tests/fixtures/matrix
+          if-no-files-found: error
+          retention-days: 1
+
   core-tests:
+    # No ffmpeg / test media needed: the Engine Core tests are hermetic.
     name: Core Tests (macOS)
     runs-on: macos-latest
 
@@ -40,25 +103,10 @@ jobs:
       - name: Run Engine Core tests
         run: ./bin/core_tests --reporters=console --no-intro
 
-      - name: Install ffmpeg (for synthetic media generator smoke-test)
-        # ffmpeg-full (not the plain ffmpeg formula) is required for drawtext
-        # filter support (libfreetype/fontconfig), used to stamp frame numbers.
-        run: |
-          brew install ffmpeg-full
-          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
-
-      - name: Generate synthetic test media
-        run: |
-          bash tools/gen_test_media.sh \
-            --frames 30 \
-            --output tests/fixtures/synthetic.mp4
-          # Verify the output file exists and is non-empty
-          test -s tests/fixtures/synthetic.mp4 && \
-            echo "Synthetic clip generated: $(du -sh tests/fixtures/synthetic.mp4 | cut -f1)"
-
   avf-coverage:
     name: AVF Backend + Real-Clip Matrix (macOS)
     runs-on: macos-latest
+    needs: test-media
 
     steps:
       - name: Checkout
@@ -69,17 +117,11 @@ jobs:
       - name: Install SCons
         run: brew install scons
 
-      - name: Install ffmpeg
-        # ffmpeg is a TEST-ONLY tool (never a runtime dependency). It regenerates
-        # the real-clip matrix here so CI does not depend on Git LFS bandwidth.
-        # ffmpeg-full (not the plain ffmpeg formula) is required for drawtext
-        # filter support (libfreetype/fontconfig), used to stamp frame numbers.
-        run: |
-          brew install ffmpeg-full
-          echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
-
-      - name: Generate real-clip matrix
-        run: bash tools/gen_clip_matrix.sh
+      - name: Download test media
+        uses: actions/download-artifact@v4
+        with:
+          name: test-media
+          path: tests/fixtures
 
       - name: Build AVF backend tests
         run: scons target=avf_tests
@@ -90,6 +132,7 @@ jobs:
   mf-coverage:
     name: MF Backend + Real-Clip Matrix (Windows)
     runs-on: windows-latest
+    needs: test-media
 
     steps:
       - name: Checkout
@@ -108,13 +151,11 @@ jobs:
       - name: Run Engine Core tests
         run: bin\core_tests.exe --reporters=console --no-intro
 
-      - name: Install ffmpeg
-        # Test-only tool; regenerates the matrix so CI does not depend on LFS.
-        run: choco install ffmpeg -y
-
-      - name: Generate real-clip matrix
-        shell: bash
-        run: bash tools/gen_clip_matrix.sh
+      - name: Download test media
+        uses: actions/download-artifact@v4
+        with:
+          name: test-media
+          path: tests/fixtures
 
       - name: Build MF backend tests
         # Uses the MSVC toolchain provided by the windows runner.
