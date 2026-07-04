@@ -58,34 +58,38 @@ follow-ups.
 | Platform | Framework                | Status                                       |
 | -------- | ------------------------ | -------------------------------------------- |
 | macOS    | AVFoundation             | Supported                                    |
-| Windows  | Windows Media Foundation | Supported (§below)                           |
+| Windows  | Windows Media Foundation | Supported ([details](#windows))              |
 | Linux    | GStreamer vs VA-API      | Deferred (decision pending)                  |
 
-### Windows status (QA'd on-device, 2026-07)
+### Windows
 
-The Media Foundation backend is **verified on real hardware**: the full
-`mf_tests` suite passes (synthetic clip + real-clip matrix, H.264 & HEVC
-hardware decode, NV12 D3D11 textures, monotonic PTS, float32 PCM), and
-playback (loader → backend → clock → frame queue → present) runs end-to-end
-in the demo.
+Hardware decode is identical on every Windows setup and **verified on real
+hardware**: the full `mf_tests` suite passes (synthetic clip + real-clip
+matrix, H.264 & HEVC hardware decode, NV12 D3D11 textures, monotonic PTS,
+float32 PCM), and playback runs end-to-end in the demo.
 
-Windows ships three present-side **Import Paths**, chosen once at
-runtime by `RenderingServer::get_current_rendering_driver_name()` +
+What varies is the **present path** — how decoded frames reach Godot's
+renderer. It is chosen once at runtime from
+`RenderingServer::get_current_rendering_driver_name()` +
 `Engine::get_version_info()` — never as separate build variants, and never a
 try-and-fail probe:
 
-1. **D3D12 Path** (zero-copy) — the `d3d12` RenderingDevice driver on Godot
-   4.5+. Verified end-to-end on-device, pixel-correct.
-2. **Vulkan Zero-Copy Path** — the original `DxgiSurfaceImporter`. Fully built
-   and verified end-to-end against a patched Godot (PR #114940), but **hard-
-   disabled** on stock Godot: the engine does not enable
-   `VK_KHR_external_memory_win32` on its Vulkan device, and even with that PR,
-   `texture_create_from_extension`'s hardcoded `COLOR` aspect mis-binds the
-   NV12 plane views until godot-proposals#13969 lands upstream.
-3. **CPU-Copy Path** — the fallback for the common case: stock Vulkan driver,
-   any Godot version. Same hardware decode, plus a GPU→CPU readback before
-   present (this path's sole, explicit exception to the zero-copy contract).
-   Verified end-to-end on-device on a stock Godot install.
+| Your setup                          | Present path     | Zero-copy | Notes                                            |
+| ----------------------------------- | ---------------- | --------- | ------------------------------------------------ |
+| Godot 4.5+, `d3d12` driver          | D3D12 import     | Yes       | **Recommended.** Verified on-device, pixel-correct. |
+| Any Godot, stock `vulkan` driver    | CPU-copy fallback | No        | Verified on-device. Adds one GPU→CPU readback per frame. |
+| Godot patched with PR #114940, `vulkan` | DXGI zero-copy import | Yes  | Built and verified, but hard-disabled on stock Godot (see below). |
+
+**Recommendation:** run Godot 4.5+ with the D3D12 rendering driver. On stock
+Vulkan you still get full hardware decode, but with a per-frame GPU→CPU
+readback before present — the sole, explicit exception to the zero-copy
+contract, and the only drawback of that path.
+
+The Vulkan zero-copy path stays hard-disabled on stock Godot because the
+engine does not enable `VK_KHR_external_memory_win32` on its Vulkan device,
+and even with PR #114940, `texture_create_from_extension`'s hardcoded `COLOR`
+aspect mis-binds the NV12 plane views until godot-proposals#13969 lands
+upstream.
 
 ## Installation
 
