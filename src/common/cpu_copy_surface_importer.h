@@ -13,14 +13,14 @@
 // R8/RG8 textures instead of an aliased import.
 //
 // This is the ONE Import Path that violates the zero-copy contract, by
-// design (ADR-0007): PlaneTextures::is_cpu_copy / PresentPipeline::
-// cpu_copy_count() must count it honestly.
+// design: it overrides SurfaceImporter::is_zero_copy to return
+// false so PresentPipeline::cpu_copy_count() counts it honestly.
 //
 // Mechanism (see the .cpp for the full readback-ring walkthrough):
 //   1. Lazily bind to the SAME ID3D11Device the decoder texture already lives
 //      on (ID3D11DeviceChild::GetDevice on the decoder texture) — no adapter
 //      matching, no device of our own, no cross-API share to make openable,
-//      so none of D3D11SharedSurfacePool's machinery is needed here.
+//      so none of D3D11InteropDevice's machinery is needed here.
 //   2. GPU-blit (CopySubresourceRegion, no CPU copy yet) the decoder's NV12
 //      slice into the next slot of an N-buffered ring of CPU-readable D3D11
 //      staging textures.
@@ -60,6 +60,9 @@ public:
 	bool initialize(godot::RenderingDevice *rd) override;
 
 	bool is_initialized() const override;
+
+	// The one Import Path that is not zero-copy, by design; see the file header.
+	bool is_zero_copy() const override { return false; }
 
 	// Import the NV12 ID3D11Texture2D (passed as an opaque void* ==
 	// ID3D11Texture2D*) into two RD plane textures via a GPU->CPU readback.
