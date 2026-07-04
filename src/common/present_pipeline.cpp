@@ -181,10 +181,9 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	// Import the decoder surface zero-copy into two RD plane textures. No CPU
 	// copy happens here — the importer aliases the decoder's surface memory
 	// (CVMetalTextureCache on macOS; a Vulkan image opened from the DXGI shared
-	// handle on Windows). cpu_pixels_size carries the texture-array slice index
-	// on Windows (see surface_importer.h); the Metal importer ignores it.
-	PlaneTextures planes = importer_->import(
-			frame.native_handle, static_cast<uint32_t>(frame.cpu_pixels_size));
+	// handle on Windows). plane_slice is the texture-array slice index on
+	// Windows (see surface_importer.h); the Metal importer ignores it.
+	PlaneTextures planes = importer_->import(frame.native_handle, frame.plane_slice);
 	if (!planes.valid()) {
 		// Import failed (wrong format / non-Metal). Retire the frame now.
 		if (frame.release) {
