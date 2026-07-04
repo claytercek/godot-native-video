@@ -107,11 +107,9 @@ TODO
    scons target=[template_debug|template_release] platform=[macos|windows]
    ```
 
-   On Windows the DXGI→Vulkan importer needs the Vulkan headers and loader
-   import library. Install the [LunarG Vulkan SDK](https://vulkan.lunarg.com/)
-   (its installer sets `VULKAN_SDK`, which SConstruct picks up), or point
-   `VULKAN_SDK` at any directory containing `Include/vulkan/*.h` and
-   `Lib/vulkan-1.lib`.
+   No SDK installs are required: the Vulkan headers the Windows build needs
+   come from the `thirdparty/vulkan-headers` submodule, and the Vulkan loader
+   is resolved from `vulkan-1.dll` at runtime rather than linked.
 
 3. **Run the demo**:
 
@@ -152,3 +150,5 @@ runtime dependency**:
   tests.
 - `demo/` — test Godot project.
 - `godot-cpp/` — Godot C++ bindings (submodule).
+- `thirdparty/vulkan-headers/` — Khronos Vulkan headers (submodule; used by the
+  Windows build only).

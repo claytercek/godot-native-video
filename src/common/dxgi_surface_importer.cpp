@@ -5,6 +5,8 @@
 // The interop chain (the "DXGI dance"), in order:
 //
 //   open() once:
+//     - Load vulkan-1.dll and resolve the loader entry points (no link-time
+//       Vulkan dependency — see VK_NO_PROTOTYPES below).
 //     - Pull Godot's VkInstance / VkPhysicalDevice / VkDevice out of RD.
 //     - Create our OWN ID3D11Device on the same adapter Godot's Vulkan device
 //       runs on (matched by LUID) so the shared handle is openable cross-API.
@@ -62,6 +64,11 @@
 #include <d3d11_1.h> // ID3D11Texture2D, IDXGIKeyedMutex
 #include <dxgi1_2.h> // IDXGIResource1
 
+// VK_NO_PROTOTYPES: every Vulkan entry point is resolved at runtime from
+// vulkan-1.dll (below) instead of linking vulkan-1.lib, so building never
+// needs the Vulkan SDK. Removing the prototypes makes an accidental direct
+// call a compile error rather than a silent link dependency.
+#define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
 
@@ -72,6 +79,58 @@ using namespace godot;
 using mf::ComPtr;
 
 namespace platform_media {
+
+namespace {
+
+// Loader entry points, named like the functions they replace so call sites
+// read as plain Vulkan. All are vulkan-1.dll exports, dispatched exactly as a
+// vulkan-1.lib link would be; the one extension function
+// (vkGetMemoryWin32HandlePropertiesKHR) is still resolved per-device in
+// initialize(). The release/acquire closures below capture nothing extra —
+// these have process lifetime.
+PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = nullptr;
+PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2 = nullptr;
+PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties = nullptr;
+PFN_vkCreateImage vkCreateImage = nullptr;
+PFN_vkDestroyImage vkDestroyImage = nullptr;
+PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements = nullptr;
+PFN_vkAllocateMemory vkAllocateMemory = nullptr;
+PFN_vkFreeMemory vkFreeMemory = nullptr;
+PFN_vkBindImageMemory vkBindImageMemory = nullptr;
+
+template <typename F>
+bool resolve_export(HMODULE module, F &fn, const char *name) {
+	fn = reinterpret_cast<F>(GetProcAddress(module, name));
+	return fn != nullptr;
+}
+
+// Lazily load vulkan-1.dll and resolve the entry points above. Only ever
+// called on the Vulkan import path, so D3D12/CPU-copy users never touch the
+// loader. The module is deliberately never freed: Godot's Vulkan RD holds it
+// loaded anyway, and the closures handed to the retire-ring call through
+// these pointers. Idempotent; retries on a previous failure.
+bool load_vulkan_loader() {
+	static bool loaded = false;
+	if (loaded) {
+		return true;
+	}
+	HMODULE module = LoadLibraryW(L"vulkan-1.dll");
+	if (module == nullptr) {
+		return false;
+	}
+	loaded = resolve_export(module, vkGetDeviceProcAddr, "vkGetDeviceProcAddr") &&
+			resolve_export(module, vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2") &&
+			resolve_export(module, vkGetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties") &&
+			resolve_export(module, vkCreateImage, "vkCreateImage") &&
+			resolve_export(module, vkDestroyImage, "vkDestroyImage") &&
+			resolve_export(module, vkGetImageMemoryRequirements, "vkGetImageMemoryRequirements") &&
+			resolve_export(module, vkAllocateMemory, "vkAllocateMemory") &&
+			resolve_export(module, vkFreeMemory, "vkFreeMemory") &&
+			resolve_export(module, vkBindImageMemory, "vkBindImageMemory");
+	return loaded;
+}
+
+} // namespace
 
 // PImpl holding the D3D/Vulkan interop state. Raw owning pointer so the header
 // stays plain C++; freed in DxgiSurfaceImporter::~DxgiSurfaceImporter.
@@ -105,6 +164,12 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 		return impl_->initialized;
 	}
 	if (rd == nullptr) {
+		return false;
+	}
+
+	if (!load_vulkan_loader()) {
+		ERR_PRINT("DXGI importer init: vulkan-1.dll is not available or is missing "
+				  "required exports — no Vulkan loader on this system.");
 		return false;
 	}
 

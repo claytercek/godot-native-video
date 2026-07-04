@@ -213,20 +213,16 @@ elif env["platform"] == "windows":
     # path (mirrors the macOS block).
     env.Append(CPPPATH=["src/core", "src/backends/mf"])
 
-    # The DXGI->Vulkan importer needs the Vulkan headers (vulkan/vulkan.h) and
-    # the loader import library (vulkan-1.lib). Neither ships with MSVC, so we
-    # pull them from the Vulkan SDK via the VULKAN_SDK env var the SDK installer
-    # sets. (Any directory with Include/vulkan/*.h + Lib/vulkan-1.lib works —
-    # e.g. the Khronos Vulkan-Headers repo plus an import lib generated from
-    # the system vulkan-1.dll.)
-    vulkan_sdk = os.environ.get("VULKAN_SDK", "")
-    if vulkan_sdk:
-        env.Append(CPPPATH=[os.path.join(vulkan_sdk, "Include")])
-        env.Append(LIBPATH=[os.path.join(vulkan_sdk, "Lib")])
-    else:
-        print("WARNING: VULKAN_SDK is not set — vulkan/vulkan.h and vulkan-1.lib "
-              "will only resolve if provided some other way. Install the LunarG "
-              "Vulkan SDK if the build fails to find them.")
+    # The DXGI->Vulkan importer needs vulkan/vulkan.h, vendored as the
+    # thirdparty/vulkan-headers submodule. Headers only — the importer loads
+    # vulkan-1.dll at runtime (VK_NO_PROTOTYPES), so no Vulkan SDK and no
+    # vulkan-1.lib are needed to build.
+    if not os.path.isfile("thirdparty/vulkan-headers/include/vulkan/vulkan.h"):
+        print("""thirdparty/vulkan-headers is missing. Run:
+
+    git submodule update --init --recursive""")
+        sys.exit(1)
+    env.Append(CPPPATH=["#thirdparty/vulkan-headers/include"])
 
     # Libraries:
     #   mfplat/mf/mfreadwrite/mfuuid : Media Foundation source reader + decode.
@@ -235,13 +231,11 @@ elif env["platform"] == "windows":
     #   d3dcompiler                  : runtime HLSL compile for the D3D11 plane-split
     #                                  compute shader (D3D12SurfaceImporter).
     #   ole32/propsys/shlwapi        : COM init + PROPVARIANT helpers + path utils.
-    # The Vulkan loader (vulkan-1) is needed by the DXGI->Vulkan importer; it is
-    # provided by the Vulkan SDK. If godot-cpp already links the loader this is
-    # redundant but harmless.
+    # No Vulkan loader here: the DXGI->Vulkan importer resolves vulkan-1.dll
+    # at runtime.
     env.Append(LIBS=[
         "mfplat", "mf", "mfreadwrite", "mfuuid",
         "d3d11", "dxgi", "d3d12", "d3dcompiler", "ole32", "shlwapi", "propsys",
-        "vulkan-1",
     ])
 
     # Enable Unicode for Windows API.
