@@ -416,9 +416,11 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	return out;
 }
 
-// make_surface_importer() lives in windows_surface_importer_factory.cpp: with
-// the D3D12 importer added, Windows now links two SurfaceImporter
-// implementations and needs a runtime (not compile-time) choice between them.
+// make_surface_importer() lives in windows_surface_importer_factory.cpp: Windows
+// links three SurfaceImporter implementations (this one, D3D12SurfaceImporter,
+// CpuCopySurfaceImporter) and chooses between them at runtime. That factory
+// hard-disables this importer's selection per ADR-0007 — DxgiSurfaceImporter
+// stays fully built and linked, but is not currently reachable at runtime.
 
 } // namespace platform_media
 
