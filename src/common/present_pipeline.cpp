@@ -232,11 +232,13 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	}
 
 	// Push constant: output dimensions + colorimetry + bit depth. std430 — seven
-	// uint32 = 28 bytes, which matches the shaders' declared Params size exactly
-	// (Godot 4.7+ validates the supplied size against it). Both SDR and HDR
-	// shaders share the same push-constant layout.
+	// uint32 + one pad uint = 32 bytes. The pad keeps the block a 16-byte
+	// multiple: pre-4.7 Godot rounds the required push-constant size up to 32,
+	// 4.7+ validates the exact declared size, and 32 satisfies both. Both SDR
+	// and HDR shaders share the same push-constant layout.
 	PackedByteArray pc;
-	pc.resize(28);
+	pc.resize(32);
+	pc.fill(0);
 	{
 		uint8_t *w = pc.ptrw();
 		const uint32_t ow = static_cast<uint32_t>(width_);
