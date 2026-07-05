@@ -381,7 +381,15 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
-		desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+		// D3D11_RESOURCE_MISC_SHARED_NTHANDLE is invalid on its own — the API
+		// requires pairing it with SHARED or SHARED_KEYEDMUTEX (CreateTexture2D
+		// fails E_INVALIDARG otherwise, confirmed on-device). Pair with plain
+		// SHARED, not SHARED_KEYEDMUTEX: this pass never Acquire/ReleaseSync's a
+		// keyed mutex on these textures (sync is entirely the shared fence), and
+		// pairing with SHARED_KEYEDMUTEX made CSSetUnorderedAccessViews hang
+		// forever on-device (AMD driver enforcing an implicit, never-acquired
+		// lock) — confirmed by bisecting with per-call diagnostics.
+		desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 		ComPtr<ID3D11Texture2D> tex;
 		if (FAILED(device->CreateTexture2D(&desc, nullptr, tex.put()))) {
 			return {};
@@ -513,12 +521,18 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	// --- 7. Fence handoff: acquire() CPU-waits for this frame's signal value
 	// before the present pipeline's compute dispatch samples the planes. No
 	// release_sync — these plane textures are single-use.
+	//
+	// The wait is bounded (not INFINITE): if the fence is never signaled — a
+	// driver/GPU-hang scenario — the present pipeline proceeds anyway (risking
+	// one stale/torn frame) rather than freezing the whole process forever.
 	ID3D12Fence *fence = impl->d3d12_fence.get();
 	HANDLE fence_event = impl->fence_event;
 	out.acquire = [fence, fence_event, signal_value]() {
 		if (fence->GetCompletedValue() < signal_value) {
 			fence->SetEventOnCompletion(signal_value, fence_event);
-			WaitForSingleObject(fence_event, INFINITE);
+			if (WaitForSingleObject(fence_event, 5000) != WAIT_OBJECT_0) {
+				ERR_PRINT("D3D12 importer: shared-fence wait timed out; sampling planes without confirmed GPU sync.");
+			}
 		}
 	};
 
