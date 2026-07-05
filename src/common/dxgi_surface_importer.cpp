@@ -70,15 +70,15 @@
 
 #include <godot_cpp/core/error_macros.hpp>
 
-#include <cstring> // std::memcmp
+#include <cstring> // std::memcpy
 
-#include <d3d11_1.h> // ID3D11Device, IDXGIKeyedMutex, IDXGIResource1
-#include <dxgi1_2.h>
+#include <d3d11_1.h> // ID3D11Texture2D, IDXGIKeyedMutex
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
 
 #include "../backends/mf/com_raii.h" // mf::ComPtr
+#include "d3d11_shared_surface_pool.h"
 
 using namespace godot;
 using mf::ComPtr;
@@ -95,21 +95,15 @@ struct DxgiSurfaceImporter::Impl {
 	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 
-	// Our own D3D11 device on the same adapter as Godot's Vulkan device. We own
-	// this; it produces the shareable NV12 staging textures the decoder slice is
-	// blitted into.
-	ComPtr<ID3D11Device> d3d_device;
-	ComPtr<ID3D11DeviceContext> d3d_context;
+	// D3D11 bootstrap (own device on the same adapter as Godot's Vulkan device)
+	// and the decoder-slice-blit-into-shareable-texture logic, shared with a
+	// future D3D12 importer by composition instead of duplication.
+	D3D11SharedSurfacePool d3d_pool;
 
 	// VK_KHR_external_memory_win32 entry points (resolved from the device).
 	PFN_vkGetMemoryWin32HandlePropertiesKHR get_mem_handle_props = nullptr;
 
 	bool initialized = false;
-
-	~Impl() {
-		d3d_context.reset();
-		d3d_device.reset();
-	}
 };
 
 DxgiSurfaceImporter::DxgiSurfaceImporter() = default;
@@ -158,8 +152,8 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 	}
 
 	// Find the DXGI adapter whose LUID matches Godot's Vulkan physical device, so
-	// the D3D11 device we create shares GPU memory with Godot's renderer (a
-	// requirement for cross-API shared handles to be openable).
+	// the D3D11 device the pool creates shares GPU memory with Godot's renderer
+	// (a requirement for cross-API shared handles to be openable).
 	VkPhysicalDeviceIDProperties id_props = {};
 	id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
 	VkPhysicalDeviceProperties2 props2 = {};
@@ -167,42 +161,11 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 	props2.pNext = &id_props;
 	vkGetPhysicalDeviceProperties2(impl->physical_device, &props2);
 
-	ComPtr<IDXGIFactory1> factory;
-	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) {
-		ERR_PRINT("DXGI importer init: CreateDXGIFactory1 failed.");
-		delete impl;
-		return false;
-	}
-
-	ComPtr<IDXGIAdapter1> chosen;
-	for (UINT i = 0;; ++i) {
-		ComPtr<IDXGIAdapter1> adapter;
-		if (factory->EnumAdapters1(i, adapter.put()) == DXGI_ERROR_NOT_FOUND) {
-			break;
-		}
-		DXGI_ADAPTER_DESC1 desc = {};
-		adapter->GetDesc1(&desc);
-		// LUID match: VkPhysicalDeviceIDProperties.deviceLUID is 8 bytes laid out
-		// to compare equal to the DXGI adapter LUID when deviceLUIDValid is set.
-		if (id_props.deviceLUIDValid &&
-				std::memcmp(&desc.AdapterLuid, id_props.deviceLUID, sizeof(LUID)) == 0) {
-			chosen = std::move(adapter);
-			break;
-		}
-		if (!chosen) {
-			chosen = std::move(adapter); // fallback to the first adapter
-		}
-	}
-
-	UINT d3d_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-	D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_1;
-	HRESULT hr = D3D11CreateDevice(
-			chosen.get(),
-			chosen ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-			nullptr, d3d_flags, nullptr, 0, D3D11_SDK_VERSION,
-			impl->d3d_device.put(), &got, impl->d3d_context.put());
-	if (FAILED(hr) || !impl->d3d_device) {
-		ERR_PRINT("DXGI importer init: D3D11CreateDevice failed on the matched adapter.");
+	// VkPhysicalDeviceIDProperties.deviceLUID is 8 bytes laid out to compare
+	// equal to a Win32 LUID when deviceLUIDValid is set.
+	LUID luid = {};
+	std::memcpy(&luid, id_props.deviceLUID, sizeof(LUID));
+	if (!impl->d3d_pool.initialize(id_props.deviceLUIDValid ? &luid : nullptr)) {
 		delete impl;
 		return false;
 	}
@@ -258,68 +221,26 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	const UINT width = src_desc.Width;
 	const UINT height = src_desc.Height;
 
-	// --- 1. Create a shareable NV12 staging texture on OUR D3D device. ---
-	D3D11_TEXTURE2D_DESC shared_desc = {};
-	shared_desc.Width = width;
-	shared_desc.Height = height;
-	shared_desc.MipLevels = 1;
-	shared_desc.ArraySize = 1;
-	shared_desc.Format = DXGI_FORMAT_NV12;
-	shared_desc.SampleDesc.Count = 1;
-	shared_desc.Usage = D3D11_USAGE_DEFAULT;
-	shared_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	shared_desc.MiscFlags =
-			D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
-
-	ComPtr<ID3D11Texture2D> shared_tex;
-	if (FAILED(impl->d3d_device->CreateTexture2D(&shared_desc, nullptr, shared_tex.put()))) {
-		ERR_PRINT("DXGI importer: shareable NV12 texture create failed.");
-		return out;
-	}
-
-	// Keyed mutex for cross-API sync. Key 0 == "D3D owns it", key 1 == "Vulkan
-	// owns it". We acquire 0 here on the D3D side, blit, release to 1.
-	ComPtr<IDXGIKeyedMutex> keyed;
-	if (FAILED(shared_tex->QueryInterface(IID_PPV_ARGS(keyed.put())))) {
-		ERR_PRINT("DXGI importer: keyed mutex query failed.");
-		return out;
-	}
-
-	// --- 2. GPU blit the decoded frame into the shared texture. No CPU copy. ---
-	if (FAILED(keyed->AcquireSync(0, INFINITE))) {
-		ERR_PRINT("DXGI importer: D3D keyed AcquireSync(0) failed.");
-		return out;
-	}
+	// --- 1-2. Blit the decoded slice into a fresh shareable NV12 texture on our
+	// D3D device (GPU-only, no CPU copy) and export it as an NT shared handle.
 	// Source subresource: DXVA decoder MFTs pack decoded frames as slices of one
 	// shared texture array, so the slice for THIS frame is the plane_slice the
 	// backend recorded in VideoFrame.cpu_pixels_size and the present pipeline
 	// forwarded here. (Verified on real hardware: the MF decoder does emit a
 	// texture array — always blitting slice 0 shows stale/wrong frames.)
-	const UINT src_subresource = static_cast<UINT>(plane_slice);
-	impl->d3d_context->CopySubresourceRegion(
-			shared_tex.get(), 0, 0, 0, 0,
-			decoded.get(), src_subresource, nullptr);
-	impl->d3d_context->Flush();
-	keyed->ReleaseSync(1); // hand to Vulkan
-
-	// --- 3. Export an NT shared handle and open it in Vulkan. ---
-	ComPtr<IDXGIResource1> dxgi_res;
-	if (FAILED(shared_tex->QueryInterface(IID_PPV_ARGS(dxgi_res.put())))) {
-		ERR_PRINT("DXGI importer: IDXGIResource1 query failed.");
+	D3D11SharedSurfacePool::SharedSurface shared =
+			impl->d3d_pool.blit_into_shared(decoded.get(), static_cast<UINT>(plane_slice), width, height);
+	if (!shared.valid()) {
 		return out;
 	}
-	HANDLE shared_handle = nullptr;
-	if (FAILED(dxgi_res->CreateSharedHandle(
-				nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-				nullptr, &shared_handle)) ||
-			shared_handle == nullptr) {
-		ERR_PRINT("DXGI importer: CreateSharedHandle failed.");
-		return out;
-	}
+	ComPtr<ID3D11Texture2D> shared_tex = std::move(shared.texture);
+	ComPtr<IDXGIKeyedMutex> keyed = std::move(shared.keyed_mutex);
+	HANDLE shared_handle = shared.shared_handle;
 
-	// Query the import properties for this handle to pick a compatible memory
-	// type. A D3D11 shared NT handle imports as VK_EXTERNAL_MEMORY_HANDLE_TYPE_
-	// D3D11_TEXTURE_BIT (KMT/global-share would differ).
+	// --- 3. Open the shared handle in Vulkan. Query the import properties for
+	// this handle to pick a compatible memory type. A D3D11 shared NT handle
+	// imports as VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT (KMT/
+	// global-share would differ).
 	const VkExternalMemoryHandleTypeFlagBits handle_type =
 			VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
 
