@@ -57,9 +57,8 @@
 //     R8 -> PLANE_0 / RG8 -> PLANE_1 the output is pixel-correct. Upstream needs
 //     a plane/aspect parameter on texture_create_from_extension (feedback filed
 //     on PR #114940 / proposal godot-proposals#13969).
-// Fallback if the PR route stalls: D3D12 RD driver on Godot 4.5+ (D3D11 -> NT
-// handle -> ID3D12Device::OpenSharedHandle needs no extension gating; NV12
-// PlaneSlice views + fence sync need design work).
+// Alternative if the PR route stalls: the D3D12 RD driver on Godot 4.5+, which
+// needs no external-memory-extension gating (see d3d12_surface_importer.cpp).
 // Everything upstream of this file (MF decode, playback, clock, scheduler) is
 // verified working on Windows via tests/mf and the demo run.
 // -----------------------------------------------------------------------
@@ -96,8 +95,8 @@ struct DxgiSurfaceImporter::Impl {
 	VkDevice device = VK_NULL_HANDLE;
 
 	// D3D11 bootstrap (own device on the same adapter as Godot's Vulkan device)
-	// and the decoder-slice-blit-into-shareable-texture logic, shared with a
-	// future D3D12 importer by composition instead of duplication.
+	// and the decoder-slice-blit-into-shareable-texture logic, shared with
+	// D3D12SurfaceImporter by composition instead of duplication.
 	D3D11SharedSurfacePool d3d_pool;
 
 	// VK_KHR_external_memory_win32 entry points (resolved from the device).
@@ -417,14 +416,9 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	return out;
 }
 
-// -----------------------------------------------------------------------
-// Platform factory (Windows build). The macOS build defines its own
-// make_surface_importer() in metal_surface_importer.mm; exactly one is compiled
-// per platform.
-// -----------------------------------------------------------------------
-std::unique_ptr<SurfaceImporter> make_surface_importer() {
-	return std::make_unique<DxgiSurfaceImporter>();
-}
+// make_surface_importer() lives in windows_surface_importer_factory.cpp: with
+// the D3D12 importer added, Windows now links two SurfaceImporter
+// implementations and needs a runtime (not compile-time) choice between them.
 
 } // namespace platform_media
 

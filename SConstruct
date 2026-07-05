@@ -230,13 +230,16 @@ elif env["platform"] == "windows":
     # Libraries:
     #   mfplat/mf/mfreadwrite/mfuuid : Media Foundation source reader + decode.
     #   d3d11/dxgi                   : D3D11 device + DXGI shared-handle interop.
+    #   d3d12                        : D3D12SurfaceImporter's OpenSharedHandle path.
+    #   d3dcompiler                  : runtime HLSL compile for the D3D11 plane-split
+    #                                  compute shader (D3D12SurfaceImporter).
     #   ole32/propsys/shlwapi        : COM init + PROPVARIANT helpers + path utils.
     # The Vulkan loader (vulkan-1) is needed by the DXGI->Vulkan importer; it is
     # provided by the Vulkan SDK. If godot-cpp already links the loader this is
     # redundant but harmless.
     env.Append(LIBS=[
         "mfplat", "mf", "mfreadwrite", "mfuuid",
-        "d3d11", "dxgi", "ole32", "shlwapi", "propsys",
+        "d3d11", "dxgi", "d3d12", "d3dcompiler", "ole32", "shlwapi", "propsys",
         "vulkan-1",
     ])
 

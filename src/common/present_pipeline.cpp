@@ -248,10 +248,12 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		memset(w + 8, 0, 8);
 	}
 
-	// On platforms that share the decoder surface across two GPU APIs (Windows:
-	// D3D11 decoder <-> Vulkan present), acquire the DXGI keyed mutex so the
-	// decoder cannot recycle/overwrite the surface while we sample it. No-op on
-	// macOS (acquire is null — one shared Metal device, no cross-API handoff).
+	// On platforms that share the decoder surface across two GPU APIs, wait for
+	// the exporting side's work to be visible before we sample it: a DXGI keyed
+	// mutex acquire on the Vulkan RD path, or a CPU-blocking wait on a shared
+	// D3D11/D3D12 fence on the D3D12 RD path (may stall this thread until the
+	// D3D11 plane-split compute pass finishes on the GPU). No-op on macOS
+	// (acquire is null — one shared Metal device, no cross-API handoff).
 	if (planes.acquire) {
 		planes.acquire();
 	}
