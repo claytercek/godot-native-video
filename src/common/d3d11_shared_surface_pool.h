@@ -2,21 +2,20 @@
 
 // -----------------------------------------------------------------------
 // d3d11_shared_surface_pool.h — D3D11 bootstrap + decoder-slice-blit shared
-// by every graphics-API-specific surface importer (Vulkan today, D3D12
-// later).
+// by every graphics-API-specific surface importer (Vulkan's DxgiSurfaceImporter
+// and D3D12's D3D12SurfaceImporter).
 //
 // Owns a D3D11 device created on a caller-chosen adapter (matched by LUID so
 // the device shares GPU memory with the caller's own graphics device — a
 // requirement for cross-API shared handles to be openable) and knows how to
 // GPU-blit a decoder's NV12 texture (which is not directly shareable) into a
 // fresh shareable NV12 texture, exporting it as a DXGI NT handle the caller
-// can open in whatever API it drives (Vulkan today via
-// VK_KHR_external_memory_win32; D3D12 in the future via
-// ID3D12Device::OpenSharedHandle).
+// can open in whatever API it drives (Vulkan via VK_KHR_external_memory_win32;
+// D3D12 via ID3D12Device::OpenSharedHandle).
 //
-// This type knows nothing about Vulkan or Godot's RenderingDevice — that
-// keeps it reusable by composition instead of duplicating the D3D11 setup
-// once a D3D12 importer exists.
+// This type knows nothing about Vulkan, D3D12, or Godot's RenderingDevice —
+// that keeps it reusable by composition instead of duplicating the D3D11
+// setup across importers.
 // -----------------------------------------------------------------------
 
 #if defined(_WIN32)
@@ -46,6 +45,12 @@ public:
 	bool initialize(const LUID *luid);
 
 	bool is_initialized() const { return static_cast<bool>(d3d_device_); }
+
+	// Borrowed accessors for callers (e.g. D3D12SurfaceImporter) that need to
+	// drive the D3D11 device directly for work this pool doesn't wrap itself,
+	// such as a plane-split compute pass or a shared-fence bootstrap.
+	ID3D11Device *device() const { return d3d_device_.get(); }
+	ID3D11DeviceContext *context() const { return d3d_context_.get(); }
 
 	// One shareable NV12 surface produced by blit_into_shared(): the keyed
 	// mutex serializing cross-API access (key 0 == D3D side, key 1 == the

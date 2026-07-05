@@ -11,17 +11,26 @@
 //   - macOS:   CVPixelBuffer IOSurface -> MTLTexture (CVMetalTextureCache)
 //              -> RenderingDevice::texture_create_from_extension.
 //              (MetalSurfaceImporter, metal_surface_importer.mm)
-//   - Windows: ID3D11Texture2D NV12 -> DXGI NT shared handle
+//   - Windows (Vulkan RD): ID3D11Texture2D NV12 -> DXGI NT shared handle
 //              -> Vulkan VK_KHR_external_memory_win32 image
 //              -> RenderingDevice::texture_create_from_extension.
 //              (DxgiSurfaceImporter, dxgi_surface_importer.cpp)
+//   - Windows (D3D12 RD): ID3D11Texture2D NV12 -> D3D11 plane-split compute
+//              pass -> two standalone NT-shareable D3D11 textures
+//              -> ID3D12Device::OpenSharedHandle -> ID3D12Resource
+//              -> RenderingDevice::texture_create_from_extension, synced via
+//              a shared D3D11.4/D3D12 fence.
+//              (D3D12SurfaceImporter, d3d12_surface_importer.cpp)
 //
 // This header is the seam between the platform-agnostic Binding (present
 // pipeline, video-stream playback) and the per-platform importer. The present
 // pipeline holds a SurfaceImporter* obtained from make_surface_importer();
-// nothing in the shared path knows which concrete importer is in use, so the
-// platform selection lives in exactly ONE place (the factory) instead of being
-// scattered through the pipeline as #ifdefs.
+// nothing in the shared path knows which concrete importer is in use. Importer
+// selection lives in exactly ONE place (the factory) instead of being
+// scattered through the pipeline as #ifdefs — on Windows that selection is a
+// runtime check of the active RenderingDevice driver (both DxgiSurfaceImporter
+// and D3D12SurfaceImporter are linked in; see
+// windows_surface_importer_factory.cpp), since macOS/iOS always run Metal.
 //
 // PlaneTextures (the import result) is defined here so both importers and the
 // present pipeline share one definition.
@@ -52,15 +61,22 @@ struct PlaneTextures {
 	std::function<void()> release;
 
 	// Optional GPU-sync hooks for platforms that gate decoder<->Godot access on
-	// a shared keyed mutex / external semaphore (Windows). On macOS these stay
-	// null: CoreVideo + Metal share one device so no cross-device sync object is
-	// needed. The present pipeline, if these are set, calls acquire() before the
-	// compute dispatch that samples the planes and release_sync() after, so the
-	// decoder cannot recycle the surface while the GPU reads it.
+	// a shared keyed mutex / external semaphore / fence (Windows). On macOS
+	// these stay null: CoreVideo + Metal share one device so no cross-device
+	// sync object is needed. The present pipeline, if these are set, calls
+	// acquire() before the compute dispatch that samples the planes and
+	// release_sync() after, so the decoder cannot recycle the surface while the
+	// GPU reads it.
+	//
+	// The blocking behavior of acquire() is importer-specific: DxgiSurfaceImporter's
+	// is a non-blocking DXGI keyed-mutex acquire, while D3D12SurfaceImporter's
+	// CPU-blocks (SetEventOnCompletion + WaitForSingleObject) until the D3D11
+	// plane-split compute pass it depends on has finished on the GPU. Callers
+	// must not assume acquire() returns quickly.
 	//
 	// NOTE: acquire/release_sync are GPU-submission ordering hooks, distinct from
 	// the lifetime `release` closure above (which frees the wrappers).
-	std::function<void()> acquire;       // keyed-mutex acquire (Windows)
+	std::function<void()> acquire;       // keyed-mutex acquire or fence wait (Windows)
 	std::function<void()> release_sync;  // keyed-mutex release (Windows)
 
 	bool valid() const { return luma.is_valid() && chroma.is_valid(); }
@@ -100,9 +116,11 @@ public:
 	virtual PlaneTextures import(void *native_handle, uint32_t plane_slice) = 0;
 };
 
-// Factory: returns the importer for the platform this translation unit was
-// compiled for. Selection is compile-time (#ifdef on the godot-cpp platform
-// macros) so the shared present pipeline never sees a platform #ifdef.
+// Factory: returns the importer for the current platform and (on Windows)
+// RenderingDevice driver. Exactly one implementation of this function is
+// linked per platform (metal_surface_importer.mm on macOS/iOS,
+// windows_surface_importer_factory.cpp on Windows), so the shared present
+// pipeline never sees a platform #ifdef.
 std::unique_ptr<SurfaceImporter> make_surface_importer();
 
 } // namespace platform_media
