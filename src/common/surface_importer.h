@@ -21,6 +21,15 @@
 //              -> RenderingDevice::texture_create_from_extension, synced via
 //              a shared D3D11.4/D3D12 fence.
 //              (D3D12SurfaceImporter, d3d12_surface_importer.cpp)
+//   - Windows (CPU-Copy Path): the fallback for the common case — stock
+//              Vulkan driver, any Godot version. Hardware decode is
+//              unchanged; the decoded NV12 slice is GPU-blitted into an
+//              N-buffered ring of CPU-readable D3D11 staging textures, Mapped
+//              once the GPU has had time to finish, and copied into ordinary
+//              RenderingDevice R8/RG8 textures via RD::texture_update. The
+//              only Import Path that is not zero-copy — see
+//              PlaneTextures::is_cpu_copy below.
+//              (CpuCopySurfaceImporter, cpu_copy_surface_importer.cpp)
 //
 // This header is the seam between the platform-agnostic Binding (present
 // pipeline, video-stream playback) and the per-platform importer. The present
@@ -28,9 +37,11 @@
 // nothing in the shared path knows which concrete importer is in use. Importer
 // selection lives in exactly ONE place (the factory) instead of being
 // scattered through the pipeline as #ifdefs — on Windows that selection is a
-// runtime check of the active RenderingDevice driver (both DxgiSurfaceImporter
-// and D3D12SurfaceImporter are linked in; see
-// windows_surface_importer_factory.cpp), since macOS/iOS always run Metal.
+// runtime check of the active RenderingDevice driver (all three of
+// DxgiSurfaceImporter, D3D12SurfaceImporter, and CpuCopySurfaceImporter are
+// linked in; see windows_surface_importer_factory.cpp — DxgiSurfaceImporter is
+// linked but hard-disabled there per ADR-0007), since macOS/iOS always run
+// Metal.
 //
 // PlaneTextures (the import result) is defined here so both importers and the
 // present pipeline share one definition.
@@ -55,6 +66,12 @@ struct PlaneTextures {
 	godot::RID chroma; // RG8, half resolution
 	int width = 0;     // luma (frame) width
 	int height = 0;    // luma (frame) height
+
+	// True only for the Windows CPU-Copy Import Path (ADR-0007): these planes
+	// came from a GPU->CPU readback instead of a zero-copy import. The present
+	// pipeline sums this into its cpu_copy_count() debug counter, which the
+	// other two Import Paths must keep at 0.
+	bool is_cpu_copy = false;
 
 	// Frees the RD texture RIDs and releases the native import wrappers.
 	// Call exactly once (the retire-ring does this after N frames).

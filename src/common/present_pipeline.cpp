@@ -249,11 +249,14 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	}
 
 	// On platforms that share the decoder surface across two GPU APIs, wait for
-	// the exporting side's work to be visible before we sample it: a DXGI keyed
-	// mutex acquire on the Vulkan RD path, or a CPU-blocking wait on a shared
-	// D3D11/D3D12 fence on the D3D12 RD path (may stall this thread until the
-	// D3D11 plane-split compute pass finishes on the GPU). No-op on macOS
-	// (acquire is null — one shared Metal device, no cross-API handoff).
+	// the exporting side's work to be visible before we sample it: a CPU-blocking
+	// wait on a shared D3D11/D3D12 fence on the D3D12 RD path (may stall this
+	// thread until the D3D11 plane-split compute pass finishes on the GPU), or a
+	// DXGI keyed mutex acquire on DxgiSurfaceImporter's Vulkan zero-copy path —
+	// built and linked but not currently selectable by the factory (ADR-0007).
+	// No-op on the CPU-Copy Import Path and on macOS (acquire is null: no
+	// cross-API handoff needed, either because there's nothing left for the GPU
+	// to do by the time this runs, or because one shared Metal device is used).
 	if (planes.acquire) {
 		planes.acquire();
 	}
@@ -280,6 +283,12 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	// Texture2DRD keeps its RenderingServer-side RID stable across this call, so
 	// the player's cached draw commands keep working; only the contents swap.
 	current_texture_->set_texture_rd_rid(slot.rgba_rid);
+
+	// Count this frame if the CPU-Copy Import Path produced the
+	// planes we just sampled. Stays 0 for the two zero-copy Import Paths.
+	if (planes.is_cpu_copy) {
+		++cpu_copy_count_;
+	}
 
 	// Park this frame's surfaces in the retire-ring for kFrameLatency frames.
 	// We bundle: the transient plane textures + CVMetalTexture wrappers, the
