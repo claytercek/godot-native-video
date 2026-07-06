@@ -69,7 +69,7 @@ hardware decode, NV12 D3D11 textures, monotonic PTS, float32 PCM), and
 playback (loader → backend → clock → frame queue → present) runs end-to-end
 in the demo.
 
-Windows ships three present-side **Import Paths** (ADR-0007), chosen once at
+Windows ships three present-side **Import Paths**, chosen once at
 runtime by `RenderingServer::get_current_rendering_driver_name()` +
 `Engine::get_version_info()` — never as separate build variants, and never a
 try-and-fail probe:
