@@ -43,7 +43,7 @@ def resolve_includes(lines, base_dir, depth=0):
     return out
 
 
-def embed_shader(glsl_path, header_path, var_name="kNv12ToRgbCompute"):
+def embed_shader(glsl_path, header_path, var_name="kNv12ToRgbCompute", defines=None):
     glsl_path = os.path.normpath(glsl_path)
     base_dir = os.path.dirname(glsl_path)
 
@@ -56,6 +56,26 @@ def embed_shader(glsl_path, header_path, var_name="kNv12ToRgbCompute"):
 
     # Resolve #include directives.
     lines = resolve_includes(lines, base_dir)
+
+    # Insert any requested #define lines immediately after the #version
+    # line.  GLSL requires #version to be the first directive in the
+    # compiled source, so #define lines must come after it, not before.
+    if defines:
+        version_pattern = re.compile(r"^\s*#version\b")
+        version_index = None
+        for i, line in enumerate(lines):
+            if version_pattern.match(line):
+                version_index = i
+                break
+        if version_index is None:
+            raise RuntimeError("no #version line found -- cannot insert #define")
+        define_lines = []
+        for name, value in defines:
+            if value:
+                define_lines.append("#define {} {}\n".format(name, value))
+            else:
+                define_lines.append("#define {}\n".format(name))
+        lines = lines[: version_index + 1] + define_lines + lines[version_index + 1 :]
 
     source = "".join(lines)
 
@@ -88,10 +108,41 @@ def embed_shader(glsl_path, header_path, var_name="kNv12ToRgbCompute"):
     print("  embed  {} -> {}".format(glsl_path, header_path))
 
 
+def _usage_error():
+    print(
+        "Usage: {} <input.glsl> <output.h> [var_name] [-D NAME=VALUE ...]".format(sys.argv[0]),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 if __name__ == "__main__":
-    argc = len(sys.argv)
-    if argc not in (3, 4):
-        print("Usage: {} <input.glsl> <output.h> [var_name]".format(sys.argv[0]), file=sys.stderr)
-        sys.exit(1)
-    var_name = sys.argv[3] if argc >= 4 else "kNv12ToRgbCompute"
-    embed_shader(sys.argv[1], sys.argv[2], var_name)
+    args = sys.argv[1:]
+    if len(args) < 2:
+        _usage_error()
+
+    glsl_path = args[0]
+    header_path = args[1]
+    rest = args[2:]
+
+    var_name = "kNv12ToRgbCompute"
+    if rest and not rest[0].startswith("-"):
+        var_name = rest[0]
+        rest = rest[1:]
+
+    defines = []
+    i = 0
+    while i < len(rest):
+        if rest[i] != "-D":
+            _usage_error()
+        if i + 1 >= len(rest):
+            _usage_error()
+        pair = rest[i + 1]
+        if "=" in pair:
+            name, value = pair.split("=", 1)
+        else:
+            name, value = pair, ""
+        defines.append((name, value))
+        i += 2
+
+    embed_shader(glsl_path, header_path, var_name, defines)

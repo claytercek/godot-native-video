@@ -1,6 +1,10 @@
 #[compute]
 #version 450
 
+#ifndef HDR_OUTPUT
+#define HDR_OUTPUT 0
+#endif
+
 // -----------------------------------------------------------------------
 // nv12_to_rgb.glsl — the single GPU pass of the zero-copy present pipeline.
 //
@@ -10,8 +14,11 @@
 //   - binding 0: luma plane  Y   — R8 or R16   (full resolution, value in .r)
 //   - binding 1: chroma plane CbCr — RG8 or RG16 (half res, Cb in .r, Cr in .g)
 //
-// Output is an engine-owned RGBA8 storage image that Godot samples through a
-// Texture2DRD. Godot never samples the decoder planes directly.
+// Output is an engine-owned storage image that Godot samples through a
+// Texture2DRD. Godot never samples the decoder planes directly. This file
+// is compiled twice (see tools/embed_shader.py's `-D` support): once with no
+// defines for the SDR variant, and once with HDR_OUTPUT=1 for the HDR
+// variant.
 //
 // Colour math: the YCbCr matrix and video/full-range normalisation are
 // selected by the push constants from per-frame metadata (matrix_select,
@@ -19,13 +26,22 @@
 // sources all decode correctly. Untagged clips default to BT.709 video range
 // 8-bit (matching the old hard-coded behaviour).
 //
-// HDR graceful degradation:
-// When transfer_select is PQ (2) or HLG (3), the shader linearises via the
-// correct EOTF, tone-maps to SDR range using a Reinhard-style operator (peak
-// normalised to the 203-nit Reference White target per BT.2408-2), and maps
-// BT.2020 primaries to BT.709 by matrix-then-clip. The colour math functions
-// live in hdr_color_math.glsl, which is #included here and shared with the
-// C++ unit tests.
+// Output modes (HDR_OUTPUT):
+//   * SDR (0, default): writes rgba8. When transfer_select is PQ (2) or HLG
+//     (3), the shader linearises via the correct EOTF, tone-maps to SDR range
+//     using a Reinhard-style operator (peak normalised to the 203-nit
+//     Reference White target per BT.2408-2), and maps BT.2020 primaries to
+//     BT.709 by matrix-then-clip — HDR content degrades gracefully to a
+//     clamped SDR output that's readable on any display with no
+//     configuration. The colour math functions live in hdr_color_math.glsl,
+//     which is #included here and shared with the C++ unit tests.
+//   * HDR (1): writes rgba16f and emits scene-linear values scaled so 1.0
+//     represents 203-nit Reference White (BT.2408): PQ and HLG are decoded
+//     via their EOTFs and normalised by the reference white, while SDR
+//     content is linearised via the BT.709 EOTF onto the same scale. There is
+//     no tone-mapping, no gamut conversion, and no headroom clamping — values
+//     > 1.0 survive naturally in fp16 for Godot's use_hdr_2d compositor,
+//     which owns the display-referred transfer function.
 // -----------------------------------------------------------------------
 
 #include "hdr_color_math.glsl"
@@ -34,7 +50,11 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform sampler2D luma_plane;
 layout(set = 0, binding = 1) uniform sampler2D chroma_plane;
+#if HDR_OUTPUT
+layout(set = 0, binding = 2, rgba16f) uniform restrict writeonly image2D rgba_out;
+#else
 layout(set = 0, binding = 2, rgba8) uniform restrict writeonly image2D rgba_out;
+#endif
 
 layout(push_constant, std430) uniform Params {
 	uint out_width;
@@ -116,6 +136,29 @@ void main() {
 		rgb.b = yf + 1.85560 * cb;
 	}
 
+#if HDR_OUTPUT
+	// ---- Scene-linear HDR output (no clamping, no tone-mapping) ----
+	// Values are scaled so 1.0 = 203-nit Reference White (BT.2408).
+	if (params.transfer_select == 2u) {
+		// PQ: decode to nits, then normalise by reference white.
+		rgb.r = pq_eotf(rgb.r) / kReferenceWhite;
+		rgb.g = pq_eotf(rgb.g) / kReferenceWhite;
+		rgb.b = pq_eotf(rgb.b) / kReferenceWhite;
+	} else if (params.transfer_select == 3u) {
+		// HLG: scene-light OETF inverse then display OOTF, normalise.
+		rgb.r = hlg_display_eotf(rgb.r) / kReferenceWhite;
+		rgb.g = hlg_display_eotf(rgb.g) / kReferenceWhite;
+		rgb.b = hlg_display_eotf(rgb.b) / kReferenceWhite;
+	} else {
+		// SDR: BT.709 EOTF — linearise onto the same scene-linear scale.
+		// Per BT.2408-2, SDR graphics white (digital 1.0) maps to the 203-nit
+		// Reference White, i.e. exactly 1.0 on this 1.0=203-nit scale — so SDR
+		// content composites correctly in the HDR viewport alongside HDR clips.
+		rgb.r = bt709_eotf(clamp(rgb.r, 0.0, 1.0));
+		rgb.g = bt709_eotf(clamp(rgb.g, 0.0, 1.0));
+		rgb.b = bt709_eotf(clamp(rgb.b, 0.0, 1.0));
+	}
+#else
 	// ---- HDR graceful degradation ----
 	// When the transfer function is PQ (2) or HLG (3), linearise via the
 	// correct EOTF, tone-map to SDR range, and convert primaries to BT.709.
@@ -125,6 +168,7 @@ void main() {
 	} else {
 		rgb = clamp(rgb, 0.0, 1.0);
 	}
+#endif
 
 	imageStore(rgba_out, ivec2(gid), vec4(rgb, 1.0));
 }
