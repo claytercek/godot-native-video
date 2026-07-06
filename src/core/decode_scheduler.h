@@ -3,10 +3,10 @@
 // -----------------------------------------------------------------------
 // decode_scheduler.h — the bounded shared decode-worker pool (Engine Core).
 //
-// PROBLEM (User Stories 11 & 12, ADR-0001/Plan D4/D9): a scene may hold many
+// PROBLEM: a scene may hold many
 // VideoStreamPlayers. Spawning one decode thread per video does not scale.
-// Conversely, decoding inline on the main/render thread (the dte slice's
-// boundary) blocks presentation. The DecodeScheduler is a single bounded pool
+// Conversely, decoding inline on the main/render thread (the linear-playback
+// slice's boundary) blocks presentation. The DecodeScheduler is a single bounded pool
 // of worker threads, SHARED across all active streams, that pulls frames from
 // each stream's core::Backend and fills that stream's FrameQueue ahead of the
 // present step.
@@ -45,7 +45,7 @@
 // (main) thread inside pump_stream(), so a decode->convert->present lifetime bug
 // reproduces deterministically with no worker handoff and no deferred timing.
 //
-// SCRUB SEAM (boundary -> o3h): request_seek() lets the binding ask a stream to
+// SCRUB SEAM: request_seek() lets the binding ask a stream to
 // flush + reseek before resuming decode-ahead; a future scrubbing slice can use
 // it to request a keyframe-only decode without changing the threading model.
 // -----------------------------------------------------------------------
@@ -211,7 +211,7 @@ public:
 
 	// Ask the scheduler to flush the stream's queue and reseek the Backend to
 	// `pts_seconds` before resuming decode-ahead. Blocks until any in-flight slice
-	// completes so the reseek does not race a worker. (Scrub seam for o3h.)
+	// completes so the reseek does not race a worker. (The scrub seam.)
 	void request_seek(const StreamHandle &stream, double pts_seconds);
 
 	// True end-of-stream: the Backend reported EOS and the queue is drained.

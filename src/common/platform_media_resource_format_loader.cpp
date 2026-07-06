@@ -14,7 +14,7 @@ void PlatformMediaResourceFormatLoader::_bind_methods() {}
 PackedStringArray PlatformMediaResourceFormatLoader::_get_recognized_extensions() const {
 	PackedStringArray exts;
 	// Containers AVFoundation decodes on macOS. v1 contract is 8-bit SDR
-	// H.264/HEVC in MP4/MOV (parent PRD format scope).
+	// H.264/HEVC in MP4/MOV (v1 format scope).
 	exts.push_back("mp4");
 	exts.push_back("mov");
 	exts.push_back("m4v");

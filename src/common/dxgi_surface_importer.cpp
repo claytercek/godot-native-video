@@ -33,7 +33,8 @@
 //     free the RD textures, destroy the VkImages + imported VkDeviceMemory, and
 //     drop the shared texture + keyed mutex.
 //
-// NOTE ON "ZERO COPY": ADR-0003 forbids CPU copies on the present path, not GPU
+// NOTE ON "ZERO COPY": the perf contract forbids CPU copies on the present
+// path, not GPU
 // blits. The one CopySubresourceRegion here is a GPU->GPU copy required only
 // because MF decoder textures are not directly shareable; it never touches the
 // CPU and so does not violate the zero-CPU-copy contract. cpu_copy_count() stays

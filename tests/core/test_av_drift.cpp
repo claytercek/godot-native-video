@@ -25,7 +25,7 @@
 //     FrameQueue). Frame N has the ideal PTS N*frame_interval, but it ARRIVES
 //     with INDUCED JITTER: a random, sometimes large delay relative to when it
 //     "should" have been decoded. A deliberate JITTER SPIKE stalls decode
-//     entirely for a span of ticks to test recovery (the PRD's "decode hiccup").
+//     entirely for a span of ticks to test recovery (a decode hiccup).
 //
 //   * Each render tick we run the REAL present-selector (drop-late/hold-early)
 //     against the buffer head/next and the master clock, applying its decisions

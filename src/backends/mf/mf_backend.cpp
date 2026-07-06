@@ -2,7 +2,7 @@
 // mf_backend.cpp — Media Foundation Decoder-mode Backend (Windows).
 //
 // Drives an IMFSourceReader + IMFDXGIDeviceManager as a pure hardware decoder
-// per ADR-0001. Video is configured for NV12 / BT.709 8-bit (D12) decoded into
+// by design. Video is configured for NV12 / BT.709 8-bit (D12) decoded into
 // D3D11 textures (DXGI_FORMAT_NV12); audio is configured for interleaved
 // float32 LPCM. Each decoded video frame hands out the underlying
 // ID3D11Texture2D as a native surface handle owned by a move-only RAII wrapper

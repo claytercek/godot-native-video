@@ -160,7 +160,7 @@ bool PlatformVideoStreamPlayback::drive_audio() {
 	// `accepted`), but a tiny amount of audio is lost. In practice mix_audio
 	// accepts the full request, and `request` is capped to what is buffered, so
 	// this only bites under sustained AudioServer back-pressure. Tolerable for
-	// linear playback; the shared decode-pool slice (g1c) can re-offer instead.
+	// linear playback; the shared decode-pool slice can re-offer instead.
 	const int accepted = mix_audio(request, mix_buffer_, 0);
 	const int advance = std::min<int>(accepted, static_cast<int>(real_frames));
 	if (advance > 0) {
@@ -310,12 +310,12 @@ void PlatformVideoStreamPlayback::_seek(double time) {
 }
 
 void PlatformVideoStreamPlayback::_set_audio_track(int /*idx*/) {
-	// Single-track audio only in v1; audio output lands in the A/V-sync slice (dte).
+	// Single-track audio only in v1; audio output lands in the A/V-sync slice.
 }
 
 Ref<Texture2D> PlatformVideoStreamPlayback::_get_texture() const {
 	// The engine-owned RGBA Texture2DRD. Godot samples ONLY this — never the
-	// decoder surface (ADR-0003).
+	// decoder surface.
 	return present_.get_texture();
 }
 

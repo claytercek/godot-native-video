@@ -12,8 +12,7 @@ namespace core {
 // calls. There is no "drag started / drag ended" signal: a rapid BURST of seeks
 // is a user dragging the playhead, and a GAP (or a playback resume) means they
 // settled. The Scrubber turns that bare stream of (target, wall-clock-now) seek
-// events into a decision about HOW to resolve each seek (Plan D11, CONTEXT.md
-// "Scrub vs Seek"):
+// events into a decision about HOW to resolve each seek:
 //
 //   * KEYFRAME (fast feedback) — during a fast drag burst we only want to decode
 //     + present the nearest keyframe at/just-before each target. Skipping the

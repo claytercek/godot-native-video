@@ -237,7 +237,7 @@ TEST_CASE("unregister mid-decode releases buffered surfaces, no leak") {
 }
 
 // -----------------------------------------------------------------------
-// request_seek (the o3h scrub seam): flushes the queue, reseeks the backend,
+// request_seek (the scrub seam): flushes the queue, reseeks the backend,
 // and resumes decode-ahead from the new position in order.
 // -----------------------------------------------------------------------
 TEST_CASE("request_seek flushes and resumes decode-ahead at the target") {

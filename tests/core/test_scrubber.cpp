@@ -128,7 +128,8 @@ TEST_CASE("config is tunable: a higher threshold treats the same drag as exact")
 // Integration with the decode scheduler — proves the Scrubber's decisions, when
 // mapped onto real seeks, give (a) low keyframe-scrub latency during a drag and
 // (b) the EXACT target frame once the scrub settles. This is the acceptance
-// harness for o3h: the exact-frame-on-settle marker assertion + the scrub-latency
+// harness for adaptive scrubbing: the exact-frame-on-settle marker assertion +
+// the scrub-latency
 // perf metric, both runnable headlessly in CI via ./bin/core_tests.
 // -----------------------------------------------------------------------
 

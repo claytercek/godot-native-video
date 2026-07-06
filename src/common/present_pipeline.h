@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------
-// present_pipeline.h — the zero-copy NV12->RGB present pipeline (ADR-0003).
+// present_pipeline.h — the zero-copy NV12->RGB present pipeline.
 //
 // Owns, on Godot's RenderingDevice:
 //   - the NV12->RGB compute shader + pipeline + sampler,
