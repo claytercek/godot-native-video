@@ -161,11 +161,14 @@ env.VariantDir("build/src", "src", duplicate=0)
 # Embed the authored NV12->RGB compute shaders into C++ headers at build
 # time so the .glsl files are the single source of truth.
 # -----------------------------------------------------------------------
+# Run the embed script with the same interpreter that runs SCons — `python3`
+# is not on PATH on stock Windows (the Store stub shadows it).
+python_exe = '"%s"' % sys.executable
 shader_header = "build/gen/src/common/nv12_to_rgb_shader.h"
 env.Command(
     target=shader_header,
     source="src/common/nv12_to_rgb.glsl",
-    action="python3 tools/embed_shader.py $SOURCE $TARGET",
+    action=python_exe + " tools/embed_shader.py $SOURCE $TARGET",
 )
 # Track the included hdr_color_math.glsl as a dependency so the shader
 # header is regenerated when it changes.
@@ -176,7 +179,7 @@ shader_hdr_header = "build/gen/src/common/nv12_to_rgb_hdr_shader.h"
 env.Command(
     target=shader_hdr_header,
     source="src/common/nv12_to_rgb_hdr.glsl",
-    action="python3 tools/embed_shader.py $SOURCE $TARGET kNv12ToRgbHdrCompute",
+    action=python_exe + " tools/embed_shader.py $SOURCE $TARGET kNv12ToRgbHdrCompute",
 )
 env.Depends(shader_hdr_header, "src/common/hdr_color_math.glsl")
 
