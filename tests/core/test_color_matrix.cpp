@@ -13,6 +13,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <regex>
+#include <sstream>
+#include <string>
+
+#include "nv12_to_rgb_shader.h"
 
 namespace {
 
@@ -90,6 +95,70 @@ static void ycbcr_to_rgb(double y, double cb, double cr,
 constexpr double kTol = 0.001;
 
 // -----------------------------------------------------------------------
+// Shader-source coefficient parsing (for the regression guard test below).
+//
+// Unlike the C++ reference structs above, this parses the actual embedded
+// GLSL SOURCE TEXT (nv12_to_rgb_shader.h, generated from
+// src/common/nv12_to_rgb.glsl by tools/embed_shader.py) to catch the case
+// where the shader's code diverges from its own derivation -- something a
+// C++-only reference test can never see.
+// -----------------------------------------------------------------------
+
+struct ParsedCoeffs {
+	double r_cr = 0.0;
+	double g_cb = 0.0;
+	double g_cr = 0.0;
+	double b_cb = 0.0;
+};
+
+// Drop any line whose first non-whitespace characters are "//" so the parser
+// below can't accidentally match the illustrative comment table above the
+// matrix code (e.g. "// BT.709 (HD): R=Y+1.57480*Cr ...") instead of the real
+// `rgb.r = ...` / `rgb.g = ...` / `rgb.b = ...` assignment statements.
+static std::string strip_comment_lines(const std::string &text) {
+	std::string out;
+	std::istringstream iss(text);
+	std::string line;
+	while (std::getline(iss, line)) {
+		const size_t first = line.find_first_not_of(" \t");
+		if (first != std::string::npos && line.compare(first, 2, "//") == 0) {
+			continue;
+		}
+		out += line;
+		out += "\n";
+	}
+	return out;
+}
+
+// Parse the three coefficient assignment lines out of one matrix branch's
+// code block (the body of an `if`/`else if`/`else` for params.matrix_select).
+// The shader writes the g-channel line as two subtractions with positive
+// literals (e.g. `rgb.g = yf - 0.18732 * cb - 0.46812 * cr;`), so the signed
+// coefficients (matching Bt*Coeffs::g_cb/g_cr, which are negative) are the
+// negation of the parsed magnitudes.
+static ParsedCoeffs parse_matrix_block(const std::string &block_raw) {
+	const std::string block = strip_comment_lines(block_raw);
+	ParsedCoeffs result;
+
+	static const std::regex r_pattern(R"(rgb\.r\s*=\s*yf\s*\+\s*([0-9]*\.?[0-9]+)\s*\*\s*cr;)");
+	static const std::regex g_pattern(R"(rgb\.g\s*=\s*yf\s*-\s*([0-9]*\.?[0-9]+)\s*\*\s*cb\s*-\s*([0-9]*\.?[0-9]+)\s*\*\s*cr;)");
+	static const std::regex b_pattern(R"(rgb\.b\s*=\s*yf\s*\+\s*([0-9]*\.?[0-9]+)\s*\*\s*cb;)");
+
+	std::smatch m;
+	REQUIRE(std::regex_search(block, m, r_pattern));
+	result.r_cr = std::stod(m[1].str());
+
+	REQUIRE(std::regex_search(block, m, g_pattern));
+	result.g_cb = -std::stod(m[1].str());
+	result.g_cr = -std::stod(m[2].str());
+
+	REQUIRE(std::regex_search(block, m, b_pattern));
+	result.b_cb = std::stod(m[1].str());
+
+	return result;
+}
+
+// -----------------------------------------------------------------------
 // Known reference values (computed independently for verification).
 //
 // For a pure white video-range signal:
@@ -128,6 +197,63 @@ TEST_CASE("BT.2020 matrix coefficients match ITU-R BT.2020-2") {
 	CHECK(std::fabs(Bt2020Coeffs::b_cb - 1.8814) < kTol);  // B = Y + 1.8814*Cb
 	CHECK(std::fabs(Bt2020Coeffs::g_cb - (-0.16455)) < kTol); // G = Y - 0.16455*Cb - 0.57135*Cr
 	CHECK(std::fabs(Bt2020Coeffs::g_cr - (-0.57135)) < kTol);
+}
+
+// Regression guard: parse the embedded shader SOURCE TEXT itself (not a
+// hand-reimplemented C++ mirror) and check its rgb.r/rgb.g/rgb.b coefficients
+// against the ITU-derived Bt601Coeffs/Bt709Coeffs/Bt2020Coeffs above.
+//
+// This test exists because the merge of the separate SDR and HDR shader
+// files into one src/common/nv12_to_rgb.glsl once shipped a real bug: the
+// BT.709 branch's rgb.g line carried BT.2020's -0.57135 Cr coefficient
+// (copy-pasted from the adjacent branch) instead of BT.709's own -0.46812.
+// None of the TEST_CASEs above could have caught that -- they only check the
+// derived C++ constants, never the actual GLSL that ships. This test reads
+// the shader text and would have failed on that bug.
+//
+// kNv12ToRgbCompute is the SDR embedding of nv12_to_rgb.glsl. The HDR
+// embedding (kNv12ToRgbHdrCompute, built with -D HDR_OUTPUT=1) comes from the
+// exact same source file and differs only by an injected #define -- the
+// matrix-selection code checked here is identical in both, so checking the
+// SDR string covers both variants.
+TEST_CASE("Shader source matrix coefficients match ITU-R derivations (regression guard)") {
+	const std::string source(kNv12ToRgbCompute);
+
+	// matrix_select: 2u=BT.601, 3u=BT.2020, else (default)=BT.709.
+	const size_t bt601_pos = source.find("if (params.matrix_select == 2u) {");
+	REQUIRE(bt601_pos != std::string::npos);
+
+	const size_t bt2020_pos = source.find("} else if (params.matrix_select == 3u) {", bt601_pos);
+	REQUIRE(bt2020_pos != std::string::npos);
+
+	const size_t bt709_pos = source.find("} else {", bt2020_pos);
+	REQUIRE(bt709_pos != std::string::npos);
+
+	const size_t bt709_end = source.find("\n\t}\n", bt709_pos);
+	REQUIRE(bt709_end != std::string::npos);
+
+	const std::string bt601_block = source.substr(bt601_pos, bt2020_pos - bt601_pos);
+	const std::string bt2020_block = source.substr(bt2020_pos, bt709_pos - bt2020_pos);
+	const std::string bt709_block = source.substr(bt709_pos, bt709_end - bt709_pos);
+
+	const ParsedCoeffs bt601 = parse_matrix_block(bt601_block);
+	const ParsedCoeffs bt2020 = parse_matrix_block(bt2020_block);
+	const ParsedCoeffs bt709 = parse_matrix_block(bt709_block);
+
+	CHECK(std::fabs(bt601.r_cr - Bt601Coeffs::r_cr) < kTol);
+	CHECK(std::fabs(bt601.g_cb - Bt601Coeffs::g_cb) < kTol);
+	CHECK(std::fabs(bt601.g_cr - Bt601Coeffs::g_cr) < kTol);
+	CHECK(std::fabs(bt601.b_cb - Bt601Coeffs::b_cb) < kTol);
+
+	CHECK(std::fabs(bt2020.r_cr - Bt2020Coeffs::r_cr) < kTol);
+	CHECK(std::fabs(bt2020.g_cb - Bt2020Coeffs::g_cb) < kTol);
+	CHECK(std::fabs(bt2020.g_cr - Bt2020Coeffs::g_cr) < kTol);
+	CHECK(std::fabs(bt2020.b_cb - Bt2020Coeffs::b_cb) < kTol);
+
+	CHECK(std::fabs(bt709.r_cr - Bt709Coeffs::r_cr) < kTol);
+	CHECK(std::fabs(bt709.g_cb - Bt709Coeffs::g_cb) < kTol);
+	CHECK(std::fabs(bt709.g_cr - Bt709Coeffs::g_cr) < kTol);
+	CHECK(std::fabs(bt709.b_cb - Bt709Coeffs::b_cb) < kTol);
 }
 
 TEST_CASE("White reference: BT.601 video-range YCbCr maps to RGB=1,1,1") {
