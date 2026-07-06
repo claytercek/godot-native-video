@@ -4,20 +4,23 @@
 // d3d12_surface_importer.h — Windows/D3D12 half of the zero-copy import.
 //
 // The D3D12-RD analog of DxgiSurfaceImporter (which targets Godot's Vulkan
-// RD). Takes a hardware-decoded NV12 ID3D11Texture2D (from the Media
+// RD). Takes a hardware-decoded NV12 or P010 ID3D11Texture2D (from the Media
 // Foundation Backend) and produces two Godot RenderingDevice plane
-// textures — luma (R8) and chroma (RG8) — that the SAME nv12_to_rgb.glsl
-// compute pass consumes, WITHOUT any CPU copy of the pixel data.
+// textures — luma (R8/R16) and chroma (RG8/RG16) — that the SAME
+// nv12_to_rgb.glsl compute pass consumes, WITHOUT any CPU copy of the pixel
+// data.
 //
 // Mechanism (see the .cpp for the full chain and design rationale):
 //   1. Compose D3D11InteropDevice for the LUID-matched D3D11 bootstrap, then
-//      GPU-blit the decoder slice into a plain intermediate NV12 texture on
-//      that device (cached and reused across frames).
-//   2. Split that NV12 texture's planes into two STANDALONE, independently
-//      shareable single-plane textures (R8 luma, RG8 chroma) via a D3D11
-//      compute pass reading PlaneSlice shader-resource views
-//      (ID3D11Device3::CreateShaderResourceView1) — a multi-planar texture
-//      cannot itself be shared into D3D12 as one resource.
+//      GPU-blit the decoder slice into a plain intermediate texture of the
+//      same format on that device (cached and reused across frames).
+//   2. Split that texture's planes into two STANDALONE, independently
+//      shareable single-plane textures (R8/RG8 for NV12, R16/RG16 for P010 —
+//      rescaled to the right-justified 10-bit-in-16 layout the CPU-Copy
+//      Import Path also produces) via a D3D11 compute pass reading PlaneSlice
+//      shader-resource views (ID3D11Device3::CreateShaderResourceView1) — a
+//      multi-planar texture cannot itself be shared into D3D12 as one
+//      resource.
 //   3. Share both plane textures via DXGI NT handle and open them on the
 //      D3D12 side (ID3D12Device::OpenSharedHandle) as ID3D12Resource, then
 //      hand each to RenderingDevice::texture_create_from_extension.
@@ -59,7 +62,7 @@ public:
 
 	bool is_initialized() const override;
 
-	// Import the NV12 ID3D11Texture2D (passed as an opaque void* ==
+	// Import the NV12/P010 ID3D11Texture2D (passed as an opaque void* ==
 	// ID3D11Texture2D*) into two RD plane textures, zero-copy (GPU-only).
 	// Returns an invalid PlaneTextures on failure. The importer does NOT take
 	// ownership of the decoder texture; the caller's VideoFrame::release still
