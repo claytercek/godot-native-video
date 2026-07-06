@@ -58,28 +58,34 @@ follow-ups.
 | Platform | Framework                | Status                                       |
 | -------- | ------------------------ | -------------------------------------------- |
 | macOS    | AVFoundation             | Supported                                    |
-| Windows  | Windows Media Foundation | Decode verified; present path blocked (§below) |
+| Windows  | Windows Media Foundation | Supported (§below)                           |
 | Linux    | GStreamer vs VA-API      | Deferred (decision pending)                  |
 
 ### Windows status (QA'd on-device, 2026-07)
 
 The Media Foundation backend is **verified on real hardware**: the full
 `mf_tests` suite passes (synthetic clip + real-clip matrix, H.264 & HEVC
-hardware decode, NV12 D3D11 textures, monotonic PTS, float32 PCM), the
-extension builds and loads in Godot 4.4.1, and playback (loader → backend →
-clock → frame queue) runs end-to-end in the demo.
+hardware decode, NV12 D3D11 textures, monotonic PTS, float32 PCM), and
+playback (loader → backend → clock → frame queue → present) runs end-to-end
+in the demo.
 
-The final present step — importing the decoded D3D11 NV12 surface into Godot's
-Vulkan device via `VK_KHR_external_memory_win32` — is **blocked by stock
-Godot**: the engine does not enable that device extension (any version through
-master) and a GDExtension cannot request additional device extensions. Frames
-decode but no texture reaches the screen. Options under evaluation:
+Windows ships three present-side **Import Paths** (ADR-0007), chosen once at
+runtime by `RenderingServer::get_current_rendering_driver_name()` +
+`Engine::get_version_info()` — never as separate build variants, and never a
+try-and-fail probe:
 
-1. **Upstream Godot PR** enabling the external-memory extensions in the Vulkan
-   driver (the existing importer then works as designed).
-2. **A D3D12 importer** targeting Godot's D3D12 rendering driver (Godot 4.5+
-   implements `texture_create_from_extension` there; D3D11↔D3D12 NT-handle
-   sharing needs no extension gating).
+1. **D3D12 Path** (zero-copy) — the `d3d12` RenderingDevice driver on Godot
+   4.5+. Verified end-to-end on-device, pixel-correct.
+2. **Vulkan Zero-Copy Path** — the original `DxgiSurfaceImporter`. Fully built
+   and verified end-to-end against a patched Godot (PR #114940), but **hard-
+   disabled** on stock Godot: the engine does not enable
+   `VK_KHR_external_memory_win32` on its Vulkan device, and even with that PR,
+   `texture_create_from_extension`'s hardcoded `COLOR` aspect mis-binds the
+   NV12 plane views until godot-proposals#13969 lands upstream.
+3. **CPU-Copy Path** — the fallback for the common case: stock Vulkan driver,
+   any Godot version. Same hardware decode, plus a GPU→CPU readback before
+   present (this path's sole, explicit exception to the zero-copy contract).
+   Verified end-to-end on-device on a stock Godot install.
 
 ## Installation
 

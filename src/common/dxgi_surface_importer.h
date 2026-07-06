@@ -35,9 +35,10 @@
 // pipeline parks that closure in the retire-ring for N frames so the GPU is done
 // sampling before teardown.
 //
-// STATUS: implemented but NOT compiled/run/verified — no Windows toolchain on
-// the authoring host. The GPU-interop chain is novel (see the parent PRD: this
-// is a Human-in-the-Loop slice) and needs on-device visual + correctness checks.
+// STATUS: implemented and verified end-to-end on real hardware (see the STATUS
+// block in dxgi_surface_importer.cpp), but hard-disabled at the Windows factory
+// (surface_importer_factory_windows.cpp) per ADR-0007 until godot-proposals#13969
+// ships upstream.
 // -----------------------------------------------------------------------
 
 #include <cstdint>

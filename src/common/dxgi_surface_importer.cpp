@@ -40,7 +40,11 @@
 // 0. (A future optimization could request shareable decoder textures and drop
 // even this GPU blit.)
 //
-// STATUS (verified on-device 2026-07-03, AMD Radeon RX Vega, Win 11):
+// STATUS (2026-07-06, per ADR-0007 — see surface_importer_factory_windows.cpp):
+// this is the Vulkan Zero-Copy Import Path, one of three shipped Windows Import
+// Paths, and it is currently HARD-DISABLED at the factory (kVulkanZeroCopyEnabled
+// = false), not merely version-gated. It stays fully built and linked, and its
+// mechanism below was verified end-to-end on real hardware:
 //   - Stock Godot (<= 4.5, master): BLOCKED. initialize() fails at the
 //     vkGetMemoryWin32HandlePropertiesKHR resolve because Godot never enables
 //     VK_KHR_external_memory_win32 on its Vulkan device and provides no way to
@@ -48,19 +52,24 @@
 //   - Godot PR #114940 (adds project setting rendering/rendering_device/vulkan/
 //     additional_device_extensions; demo/project.godot requests the extension):
 //     the FULL import chain below runs and end-to-end zero-copy playback was
-//     verified visually — with ONE remaining engine gap:
-//     RenderingDevice::texture_create_from_extension hardcodes
+//     verified visually (AMD Radeon RX Vega, Win 11) — with ONE remaining
+//     engine gap: RenderingDevice::texture_create_from_extension hardcodes
 //     VK_IMAGE_ASPECT_COLOR_BIT for its view, but the R8/RG8 plane views of the
 //     multi-planar NV12 image require VK_IMAGE_ASPECT_PLANE_0/1_BIT. With COLOR
 //     aspect the AMD driver aliases plane-0 memory for both views (garbage
 //     colors, wrong pitch); with a small local engine patch mapping
 //     R8 -> PLANE_0 / RG8 -> PLANE_1 the output is pixel-correct. Upstream needs
 //     a plane/aspect parameter on texture_create_from_extension (feedback filed
-//     on PR #114940 / proposal godot-proposals#13969).
-// Alternative if the PR route stalls: the D3D12 RD driver on Godot 4.5+, which
-// needs no external-memory-extension gating (see d3d12_surface_importer.cpp).
-// Everything upstream of this file (MF decode, playback, clock, scheduler) is
-// verified working on Windows via tests/mf and the demo run.
+//     on PR #114940 / proposal godot-proposals#13969) — this path stays disabled
+//     until that fix ships with its own detectable signal (no version number or
+//     capability query safely distinguishes "extension present" from "extension
+//     present AND aspect fix present").
+// The two Import Paths that ARE reachable today: D3D12SurfaceImporter (zero-copy,
+// Godot 4.5+ on the d3d12 RD driver, see d3d12_surface_importer.cpp) and
+// CpuCopySurfaceImporter (the default fallback — stock Vulkan driver, any Godot
+// version, see cpu_copy_surface_importer.cpp). Everything upstream of this file
+// (MF decode, playback, clock, scheduler) is verified working on Windows via
+// tests/mf and the demo run.
 // -----------------------------------------------------------------------
 
 #include "dxgi_surface_importer.h"
@@ -68,6 +77,7 @@
 #if defined(_WIN32)
 
 #include <godot_cpp/core/error_macros.hpp>
+#include <godot_cpp/variant/packed_string_array.hpp>
 
 #include <cstring> // std::memcpy
 
@@ -83,6 +93,30 @@ using namespace godot;
 using mf::ComPtr;
 
 namespace platform_media {
+
+namespace {
+
+// Reflection probe for RenderingDevice::get_device_enabled_extensions() — a
+// method absent from today's public godot-cpp bindings, so it cannot be called
+// directly and must be probed dynamically via Object::has_method()/call().
+// Returns false (never crashes) against any currently released godot-cpp,
+// which lacks the method entirely; only used to sharpen the diagnostic below
+// if/when a future binding adds it. The shipped factory
+// (surface_importer_factory_windows.cpp) only constructs this importer when
+// kVulkanZeroCopyEnabled is true, which it currently is not per ADR-0007, so
+// this probe does not run in production builds today.
+bool vulkan_device_has_extension(RenderingDevice *rd, const char *extension_name) {
+	if (rd == nullptr || !rd->has_method("get_device_enabled_extensions")) {
+		return false;
+	}
+	const Variant result = rd->call("get_device_enabled_extensions");
+	if (result.get_type() != Variant::PACKED_STRING_ARRAY) {
+		return false;
+	}
+	return static_cast<PackedStringArray>(result).has(String(extension_name));
+}
+
+} // namespace
 
 // PImpl holding the D3D/Vulkan interop state. Raw owning pointer so the header
 // stays plain C++; freed in DxgiSurfaceImporter::~DxgiSurfaceImporter.
@@ -144,8 +178,13 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 			reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
 					vkGetDeviceProcAddr(impl->device, "vkGetMemoryWin32HandlePropertiesKHR"));
 	if (impl->get_mem_handle_props == nullptr) {
-		ERR_PRINT("DXGI importer init: vkGetMemoryWin32HandlePropertiesKHR not resolvable — "
-				  "VK_KHR_external_memory_win32 is not enabled on Godot's Vulkan device.");
+		if (vulkan_device_has_extension(rd, "VK_KHR_external_memory_win32")) {
+			ERR_PRINT("DXGI importer init: RD reports VK_KHR_external_memory_win32 enabled, but "
+					  "vkGetMemoryWin32HandlePropertiesKHR did not resolve.");
+		} else {
+			ERR_PRINT("DXGI importer init: vkGetMemoryWin32HandlePropertiesKHR not resolvable — "
+					  "VK_KHR_external_memory_win32 is not enabled on Godot's Vulkan device.");
+		}
 		delete impl;
 		return false;
 	}
@@ -416,7 +455,7 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	return out;
 }
 
-// make_surface_importer() lives in windows_surface_importer_factory.cpp: Windows
+// make_surface_importer() lives in surface_importer_factory_windows.cpp: Windows
 // links three SurfaceImporter implementations (this one, D3D12SurfaceImporter,
 // CpuCopySurfaceImporter) and chooses between them at runtime. That factory
 // hard-disables this importer's selection per ADR-0007 — DxgiSurfaceImporter

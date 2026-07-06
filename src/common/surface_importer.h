@@ -39,7 +39,7 @@
 // scattered through the pipeline as #ifdefs — on Windows that selection is a
 // runtime check of the active RenderingDevice driver (all three of
 // DxgiSurfaceImporter, D3D12SurfaceImporter, and CpuCopySurfaceImporter are
-// linked in; see windows_surface_importer_factory.cpp — DxgiSurfaceImporter is
+// linked in; see surface_importer_factory_windows.cpp — DxgiSurfaceImporter is
 // linked but hard-disabled there per ADR-0007), since macOS/iOS always run
 // Metal.
 //
@@ -136,7 +136,7 @@ public:
 // Factory: returns the importer for the current platform and (on Windows)
 // RenderingDevice driver. Exactly one implementation of this function is
 // linked per platform (metal_surface_importer.mm on macOS/iOS,
-// windows_surface_importer_factory.cpp on Windows), so the shared present
+// surface_importer_factory_windows.cpp on Windows), so the shared present
 // pipeline never sees a platform #ifdef.
 std::unique_ptr<SurfaceImporter> make_surface_importer();
 
