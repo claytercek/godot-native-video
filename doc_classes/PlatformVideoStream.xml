@@ -24,14 +24,12 @@
 				Must be called after [method VideoStreamPlayback.play] has started, i.e. after the stream has been opened by [VideoStreamPlayer].
 			</description>
 		</method>
-	</methods>
-	<methods_static>
-		<method name="hdr_decode_supported" qualifiers="static const">
+		<method name="hdr_decode_supported" qualifiers="static">
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] when the current platform supports hardware decoding of 10-bit (and HDR) video through the zero-copy pipeline. On macOS, [method hdr_decode_supported] always returns [code]true[/code] because the Metal-accelerated VideoToolbox can produce 10-bit biplanar surfaces (x420) that the Metal surface importer imports directly. On Windows and Linux, this returns [code]false[/code] — only 8-bit NV12 decode is supported on those platforms in this release.
 				Call this before loading a clip to decide whether to offer HDR playback options in the UI, or to present an informative message when the clip's bit depth exceeds the platform's decode capability.
 			</description>
 		</method>
-	</methods_static>
+	</methods>
 </class>
