@@ -34,6 +34,10 @@ public:
 	// Mirrors the playback's output_mode (0 = SDR, 1 = HDR) so GDScript can set
 	// it via VideoStreamPlayer.stream on stock Godot 4.4 (no get_stream_playback()).
 	// Applied to new playbacks at instantiation and forwarded to live ones.
+	// Known limitation: this mirror is one-way. Calling set_output_mode directly
+	// on a PlatformVideoStreamPlayback changes that playback's pipeline but does
+	// NOT update output_mode_ here, so callers should always drive the mode
+	// through the stream rather than the playback.
 	void set_output_mode(int mode);
 	int get_output_mode() const;
 
