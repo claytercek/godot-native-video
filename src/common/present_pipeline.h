@@ -80,7 +80,9 @@ public:
 	bool is_ready() const { return ready_; }
 
 	// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
-	// next ensure_ready() call. Default SDR.
+	// next ensure_ready() call — the ring texture format changes too (rgba8 vs
+	// rgba16f), so build_resources() has to rebuild everything anyway, shader
+	// included. Default SDR.
 	void set_output_mode(OutputMode mode) {
 		if (mode != output_mode_) {
 			output_mode_ = mode;
@@ -135,12 +137,12 @@ private:
 	// Per-platform importer chosen at link time by make_surface_importer().
 	std::unique_ptr<SurfaceImporter> importer_;
 
-	// SDR shader (rgba8 output, current behavior).
-	godot::RID shader_sdr_;
-	godot::RID pipeline_sdr_;
-	// HDR shader (rgba16f output, scene-linear).
-	godot::RID shader_hdr_;
-	godot::RID pipeline_hdr_;
+	// Compute shader + pipeline for the currently active output_mode_. Rebuilt
+	// whenever output_mode_ changes (build_resources() only compiles the
+	// variant matching output_mode_ at the time it runs — see
+	// set_output_mode()).
+	godot::RID shader_;
+	godot::RID pipeline_;
 
 	godot::RID sampler_;
 
@@ -162,14 +164,6 @@ private:
 	OutputMode output_mode_ = OutputMode::SDR;
 
 	uint64_t cpu_copy_count_ = 0; // invariant: 0 on the two zero-copy Import Paths
-
-	// Which pipeline is active (selected by output_mode_).
-	godot::RID active_shader() const {
-		return output_mode_ == OutputMode::HDR ? shader_hdr_ : shader_sdr_;
-	}
-	godot::RID active_pipeline() const {
-		return output_mode_ == OutputMode::HDR ? pipeline_hdr_ : pipeline_sdr_;
-	}
 };
 
 } // namespace platform_media
