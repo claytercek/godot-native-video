@@ -3,10 +3,12 @@
 // -----------------------------------------------------------------------
 // surface_importer.h — platform-agnostic surface-import interface.
 //
-// The zero-copy present pipeline imports a hardware-decoded NV12
-// surface into Godot's RenderingDevice as two plane textures (luma R8 +
-// chroma RG8) WITHOUT any CPU copy, then runs the single NV12->RGB compute
-// pass. The *mechanism* of that import is platform-specific:
+// The zero-copy present pipeline imports a hardware-decoded biplanar Y'CbCr
+// surface (NV12 8-bit, or P010/x420 10-bit) into Godot's RenderingDevice as
+// two plane textures (luma R8/R16 + chroma RG8/RG16; 10-bit samples
+// right-justified in the 16-bit formats) WITHOUT any CPU copy, then runs the
+// single NV12->RGB compute pass. The *mechanism* of that import is
+// platform-specific:
 //
 //   - macOS:   CVPixelBuffer IOSurface -> MTLTexture (CVMetalTextureCache)
 //              -> RenderingDevice::texture_create_from_extension.
@@ -15,8 +17,8 @@
 //              -> Vulkan VK_KHR_external_memory_win32 image
 //              -> RenderingDevice::texture_create_from_extension.
 //              (DxgiSurfaceImporter, dxgi_surface_importer.cpp)
-//   - Windows (D3D12 RD): ID3D11Texture2D NV12 -> D3D11 plane-split compute
-//              pass -> two standalone NT-shareable D3D11 textures
+//   - Windows (D3D12 RD): ID3D11Texture2D NV12/P010 -> D3D11 plane-split
+//              compute pass -> two standalone NT-shareable D3D11 textures
 //              -> ID3D12Device::OpenSharedHandle -> ID3D12Resource
 //              -> RenderingDevice::texture_create_from_extension, synced via
 //              a shared D3D11.4/D3D12 fence.
@@ -56,14 +58,14 @@
 
 namespace platform_media {
 
-// The two imported plane textures for one NV12 frame, plus a release closure
+// The two imported plane textures for one frame, plus a release closure
 // that tears down everything created during the import (RD RIDs + the native
 // wrapper objects). The caller invokes release() exactly once; the present
 // pipeline parks it in the retire-ring for N rendered frames so the GPU is done
 // sampling before the wrappers are freed.
 struct PlaneTextures {
-	godot::RID luma;   // R8, full resolution
-	godot::RID chroma; // RG8, half resolution
+	godot::RID luma;   // R8 (8-bit) or R16 (10-bit), full resolution
+	godot::RID chroma; // RG8 (8-bit) or RG16 (10-bit), half resolution
 	int width = 0;     // luma (frame) width
 	int height = 0;    // luma (frame) height
 
@@ -106,7 +108,7 @@ inline void free_plane_rids(godot::RenderingDevice *rd, godot::RID luma, godot::
 }
 
 // -----------------------------------------------------------------------
-// SurfaceImporter — abstract per-platform NV12 surface importer.
+// SurfaceImporter — abstract per-platform decoder-surface importer.
 //
 // One instance per present pipeline; reused across frames. Concrete importers
 // own whatever cache/device state their platform needs (a CVMetalTextureCache
