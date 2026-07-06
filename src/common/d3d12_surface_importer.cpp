@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------
-// d3d12_surface_importer.cpp — zero-copy NV12 D3D11 texture -> RD textures
-// (Windows / D3D12). See d3d12_surface_importer.h.
+// d3d12_surface_importer.cpp — zero-copy NV12/P010 D3D11 texture -> RD
+// textures (Windows / D3D12). See d3d12_surface_importer.h.
 //
 // The interop chain:
 //
@@ -17,20 +17,28 @@
 //       D3D11 compute pipeline state.
 //
 //   import(frame) per frame:
-//     1. Decoder hands us an NV12 ID3D11Texture2D (possibly a texture-array
-//        slice). GPU-blit (CopySubresourceRegion — no CPU copy) the slice into
-//        a plain intermediate NV12 texture on our D3D11 device, cached in Impl
-//        and reused across frames (recreated only when the frame size
-//        changes). The intermediate never leaves the D3D11 device — a
-//        multi-planar texture cannot be opened as one D3D12 resource in the
-//        shape Godot's RD expects (two independent single-plane textures) —
-//        so it carries no sharing flags and no keyed mutex.
+//     1. Decoder hands us an NV12 or P010 ID3D11Texture2D (possibly a
+//        texture-array slice). GPU-blit (CopySubresourceRegion — no CPU copy)
+//        the slice into a plain intermediate texture of the same format on our
+//        D3D11 device, cached in Impl and reused across frames (recreated only
+//        when the frame size or format changes). The intermediate never leaves
+//        the D3D11 device — a multi-planar texture cannot be opened as one
+//        D3D12 resource in the shape Godot's RD expects (two independent
+//        single-plane textures) — so it carries no sharing flags and no keyed
+//        mutex.
 //     2. Create PlaneSlice shader-resource views on the intermediate texture
-//        (ID3D11Device3::CreateShaderResourceView1: R8_UNORM/PlaneSlice=0 for
-//        luma, R8G8_UNORM/PlaneSlice=1 for chroma).
+//        (ID3D11Device3::CreateShaderResourceView1): R8_UNORM/PlaneSlice=0 for
+//        luma and R8G8_UNORM/PlaneSlice=1 for chroma on NV12; the R16 variants
+//        of the same on P010.
 //     3. Run one compute dispatch that copies both planes into two freshly
-//        created, independently NT-shareable output textures (R8 full-res,
-//        RG8 half-res). Both are created with D3D11_BIND_RENDER_TARGET in
+//        created, independently NT-shareable output textures (full-res luma,
+//        half-res chroma; R8/RG8 for NV12, R16/RG16 for P010). For P010 the
+//        copy also rescales each sample from P010's left-justified convention
+//        (code << 6 in a 16-bit word) to the right-justified 10-bit-in-16
+//        layout the shared present shader expects — the same layout the
+//        CPU-Copy Import Path produces (see cpu_copy_surface_importer.cpp for
+//        the bit-justification contract) — as a x1/64 multiply in UNORM space.
+//        Both textures are created with D3D11_BIND_RENDER_TARGET in
 //        addition to SHADER_RESOURCE/UNORDERED_ACCESS (root-caused against
 //        godot#117115): RenderingDeviceDriverD3D12::
 //        texture_create_from_extension() unconditionally tracks the imported
@@ -93,10 +101,17 @@ namespace platform_media {
 
 namespace {
 
-// Reads two source planes (PlaneSlice SRVs over the intermediate NV12
+// Reads two source planes (PlaneSlice SRVs over the intermediate NV12/P010
 // texture) and copies each into its own standalone output texture.
 // Dispatched once at the luma (full) resolution; the chroma bounds check
 // keeps the half-res writes in range within the same dispatch.
+//
+// sample_scale is 1.0 for NV12 (straight copy) and 1/64 for P010: P010 stores
+// each 10-bit code left-justified in its 16-bit word (word = code << 6), and
+// the shared present shader expects the right-justified layout the CPU-Copy
+// Import Path produces (code in the low 10 bits). In UNORM space that shift
+// is exactly a divide by 64 — the low 6 bits are zero, so the R16_UNORM
+// store rounds back to the exact shifted code.
 const char *kPlaneSplitCS = R"HLSL(
 Texture2D<float>    SrcLuma    : register(t0);
 Texture2D<float2>   SrcChroma  : register(t1);
@@ -108,15 +123,16 @@ cbuffer Params : register(b0) {
 	uint luma_height;
 	uint chroma_width;
 	uint chroma_height;
+	float sample_scale;
 };
 
 [numthreads(8, 8, 1)]
 void CSMain(uint3 tid : SV_DispatchThreadID) {
 	if (tid.x < luma_width && tid.y < luma_height) {
-		DstLuma[tid.xy] = SrcLuma.Load(int3(tid.xy, 0));
+		DstLuma[tid.xy] = SrcLuma.Load(int3(tid.xy, 0)) * sample_scale;
 	}
 	if (tid.x < chroma_width && tid.y < chroma_height) {
-		DstChroma[tid.xy] = SrcChroma.Load(int3(tid.xy, 0));
+		DstChroma[tid.xy] = SrcChroma.Load(int3(tid.xy, 0)) * sample_scale;
 	}
 }
 )HLSL";
@@ -126,6 +142,9 @@ struct PlaneSplitParams {
 	uint32_t luma_height;
 	uint32_t chroma_width;
 	uint32_t chroma_height;
+	float sample_scale;
+	// cbuffer sizes must be 16-byte multiples; CreateBuffer rejects 20.
+	uint32_t pad[3];
 };
 
 } // namespace
@@ -143,15 +162,16 @@ struct D3D12SurfaceImporter::Impl {
 	// shared with DxgiSurfaceImporter by composition instead of duplication.
 	D3D11InteropDevice interop;
 
-	// Intermediate NV12 texture the decoder slice is blitted into each frame,
-	// cached and reused across frames (recreated only when the frame size
-	// changes). Plain — no sharing flags, no keyed mutex — because it never
-	// leaves this D3D11 device. Reuse is safe: the next frame's blit and the
-	// previous frame's plane-split dispatch run on the same immediate context,
-	// so they are ordered.
-	ComPtr<ID3D11Texture2D> intermediate_nv12;
+	// Intermediate NV12/P010 texture the decoder slice is blitted into each
+	// frame, cached and reused across frames (recreated only when the frame
+	// size or format changes). Plain — no sharing flags, no keyed mutex —
+	// because it never leaves this D3D11 device. Reuse is safe: the next
+	// frame's blit and the previous frame's plane-split dispatch run on the
+	// same immediate context, so they are ordered.
+	ComPtr<ID3D11Texture2D> intermediate;
 	UINT intermediate_width = 0;
 	UINT intermediate_height = 0;
+	DXGI_FORMAT intermediate_format = DXGI_FORMAT_UNKNOWN;
 
 	// Shared D3D11.4/D3D12 fence: one persistent object for the importer's
 	// lifetime; import() increments next_fence_value and signals it after the
@@ -317,22 +337,16 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	ID3D11Device *device = impl->interop.device();
 	ID3D11DeviceContext *context = impl->interop.context();
 
-	// Borrow (do not own) the decoder's NV12 texture; the caller's VideoFrame
+	// Borrow (do not own) the decoder's texture; the caller's VideoFrame
 	// release still owns it.
 	ComPtr<ID3D11Texture2D> decoded =
 			ComPtr<ID3D11Texture2D>::retain(static_cast<ID3D11Texture2D *>(d3d11_texture));
 
 	D3D11_TEXTURE2D_DESC src_desc = {};
 	decoded->GetDesc(&src_desc);
-	// KNOWN LIMITATION: the MF backend now negotiates DXGI_FORMAT_P010 for
-	// 10-bit HEVC sources regardless of which Import Path is active (see
-	// mf_backend.cpp). This path does not handle P010 yet, so a 10-bit clip
-	// routed here drops every frame (silently, via the invalid PlaneTextures
-	// below) instead of presenting anything. Not a concern for the default
-	// configuration — this path only activates on Godot 4.5+ with the d3d12
-	// RD driver, and the CPU-Copy Path (the default) handles P010 correctly.
-	if (src_desc.Format != DXGI_FORMAT_NV12) {
-		ERR_PRINT("D3D12 importer: decoder texture is not NV12.");
+	const bool is_10bit = src_desc.Format == DXGI_FORMAT_P010;
+	if (!is_10bit && src_desc.Format != DXGI_FORMAT_NV12) {
+		ERR_PRINT("D3D12 importer: decoder texture is not NV12 or P010.");
 		return out;
 	}
 	const UINT width = src_desc.Width;
@@ -340,57 +354,66 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	const UINT chroma_width = width / 2;
 	const UINT chroma_height = height / 2;
 
-	// --- 1. GPU-blit the decoder slice into the cached intermediate NV12
-	// texture (recreated only when the frame size changes). It never leaves
+	// Per-plane view/output formats: 16-bit for P010, 8-bit for NV12. The
+	// R16/RG16 outputs carry right-justified 10-bit samples (see the shader
+	// comment above), matching the CPU-Copy Import Path's layout so the shared
+	// present shaders need no changes.
+	const DXGI_FORMAT luma_format = is_10bit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+	const DXGI_FORMAT chroma_format = is_10bit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
+
+	// --- 1. GPU-blit the decoder slice into the cached intermediate texture
+	// (recreated only when the frame size or format changes). It never leaves
 	// this D3D11 device — it exists only to be read by the plane-split pass
 	// below — so it carries no sharing flags and no keyed mutex, and the blit
 	// needs no explicit sync: this frame's copy and the previous frame's
 	// plane-split dispatch run on the same immediate context, so they are
 	// ordered.
-	if (!impl->intermediate_nv12 || impl->intermediate_width != width ||
-			impl->intermediate_height != height) {
+	if (!impl->intermediate || impl->intermediate_width != width ||
+			impl->intermediate_height != height || impl->intermediate_format != src_desc.Format) {
 		D3D11_TEXTURE2D_DESC inter_desc = {};
 		inter_desc.Width = width;
 		inter_desc.Height = height;
 		inter_desc.MipLevels = 1;
 		inter_desc.ArraySize = 1;
-		inter_desc.Format = DXGI_FORMAT_NV12;
+		inter_desc.Format = src_desc.Format;
 		inter_desc.SampleDesc.Count = 1;
 		inter_desc.Usage = D3D11_USAGE_DEFAULT;
 		inter_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		if (FAILED(device->CreateTexture2D(&inter_desc, nullptr, impl->intermediate_nv12.put()))) {
-			ERR_PRINT("D3D12 importer: intermediate NV12 texture create failed.");
+		if (FAILED(device->CreateTexture2D(&inter_desc, nullptr, impl->intermediate.put()))) {
+			ERR_PRINT("D3D12 importer: intermediate texture create failed.");
 			impl->intermediate_width = 0;
 			impl->intermediate_height = 0;
+			impl->intermediate_format = DXGI_FORMAT_UNKNOWN;
 			return out;
 		}
 		impl->intermediate_width = width;
 		impl->intermediate_height = height;
+		impl->intermediate_format = src_desc.Format;
 	}
 	context->CopySubresourceRegion(
-			impl->intermediate_nv12.get(), 0, 0, 0, 0,
+			impl->intermediate.get(), 0, 0, 0, 0,
 			decoded.get(), static_cast<UINT>(plane_slice), nullptr);
 
-	// --- 2. PlaneSlice SRVs over the intermediate NV12 texture. ---
+	// --- 2. PlaneSlice SRVs over the intermediate texture. ---
 	ID3D11Device3 *device3 = impl->device3.get();
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC1 luma_srv_desc = {};
-	luma_srv_desc.Format = DXGI_FORMAT_R8_UNORM;
+	luma_srv_desc.Format = luma_format;
 	luma_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	luma_srv_desc.Texture2D.MostDetailedMip = 0;
 	luma_srv_desc.Texture2D.MipLevels = 1;
 	luma_srv_desc.Texture2D.PlaneSlice = 0;
 	ComPtr<ID3D11ShaderResourceView1> luma_srv;
-	if (FAILED(device3->CreateShaderResourceView1(impl->intermediate_nv12.get(), &luma_srv_desc, luma_srv.put()))) {
+	if (FAILED(device3->CreateShaderResourceView1(impl->intermediate.get(), &luma_srv_desc, luma_srv.put()))) {
 		ERR_PRINT("D3D12 importer: luma PlaneSlice SRV create failed.");
 		return out;
 	}
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC1 chroma_srv_desc = luma_srv_desc;
-	chroma_srv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+	chroma_srv_desc.Format = chroma_format;
 	chroma_srv_desc.Texture2D.PlaneSlice = 1;
 	ComPtr<ID3D11ShaderResourceView1> chroma_srv;
-	if (FAILED(device3->CreateShaderResourceView1(impl->intermediate_nv12.get(), &chroma_srv_desc, chroma_srv.put()))) {
+	if (FAILED(device3->CreateShaderResourceView1(impl->intermediate.get(), &chroma_srv_desc, chroma_srv.put()))) {
 		ERR_PRINT("D3D12 importer: chroma PlaneSlice SRV create failed.");
 		return out;
 	}
@@ -425,15 +448,15 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 		return tex;
 	};
 
-	ComPtr<ID3D11Texture2D> luma_out = make_output_texture(DXGI_FORMAT_R8_UNORM, width, height);
-	ComPtr<ID3D11Texture2D> chroma_out = make_output_texture(DXGI_FORMAT_R8G8_UNORM, chroma_width, chroma_height);
+	ComPtr<ID3D11Texture2D> luma_out = make_output_texture(luma_format, width, height);
+	ComPtr<ID3D11Texture2D> chroma_out = make_output_texture(chroma_format, chroma_width, chroma_height);
 	if (!luma_out || !chroma_out) {
 		ERR_PRINT("D3D12 importer: plane-split output texture create failed.");
 		return out;
 	}
 
 	D3D11_UNORDERED_ACCESS_VIEW_DESC luma_uav_desc = {};
-	luma_uav_desc.Format = DXGI_FORMAT_R8_UNORM;
+	luma_uav_desc.Format = luma_format;
 	luma_uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
 	ComPtr<ID3D11UnorderedAccessView> luma_uav;
 	if (FAILED(device->CreateUnorderedAccessView(luma_out.get(), &luma_uav_desc, luma_uav.put()))) {
@@ -441,7 +464,7 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 		return out;
 	}
 	D3D11_UNORDERED_ACCESS_VIEW_DESC chroma_uav_desc = {};
-	chroma_uav_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+	chroma_uav_desc.Format = chroma_format;
 	chroma_uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
 	ComPtr<ID3D11UnorderedAccessView> chroma_uav;
 	if (FAILED(device->CreateUnorderedAccessView(chroma_out.get(), &chroma_uav_desc, chroma_uav.put()))) {
@@ -450,7 +473,10 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	}
 
 	// --- Dispatch the plane-split pass. ---
-	const PlaneSplitParams params = { width, height, chroma_width, chroma_height };
+	const PlaneSplitParams params = {
+		width, height, chroma_width, chroma_height,
+		is_10bit ? 1.0f / 64.0f : 1.0f, {}
+	};
 	context->UpdateSubresource(impl->params_cb.get(), 0, nullptr, &params, 0, 0);
 
 	ID3D11ShaderResourceView *srvs[2] = { luma_srv.get(), chroma_srv.get() };
@@ -517,11 +543,13 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	const int64_t chroma_handle_value = reinterpret_cast<int64_t>(d3d12_chroma.get());
 
 	RID luma = rd->texture_create_from_extension(
-			RenderingDevice::TEXTURE_TYPE_2D, RenderingDevice::DATA_FORMAT_R8_UNORM,
+			RenderingDevice::TEXTURE_TYPE_2D,
+			is_10bit ? RenderingDevice::DATA_FORMAT_R16_UNORM : RenderingDevice::DATA_FORMAT_R8_UNORM,
 			RenderingDevice::TEXTURE_SAMPLES_1, usage, luma_handle_value,
 			static_cast<int64_t>(width), static_cast<int64_t>(height), 1, 1);
 	RID chroma = rd->texture_create_from_extension(
-			RenderingDevice::TEXTURE_TYPE_2D, RenderingDevice::DATA_FORMAT_R8G8_UNORM,
+			RenderingDevice::TEXTURE_TYPE_2D,
+			is_10bit ? RenderingDevice::DATA_FORMAT_R16G16_UNORM : RenderingDevice::DATA_FORMAT_R8G8_UNORM,
 			RenderingDevice::TEXTURE_SAMPLES_1, usage, chroma_handle_value,
 			static_cast<int64_t>(chroma_width), static_cast<int64_t>(chroma_height), 1, 1);
 	if (!luma.is_valid() || !chroma.is_valid()) {
