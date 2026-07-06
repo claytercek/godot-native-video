@@ -28,7 +28,7 @@
 //              once the GPU has had time to finish, and copied into ordinary
 //              RenderingDevice R8/RG8 textures via RD::texture_update. The
 //              only Import Path that is not zero-copy — see
-//              PlaneTextures::is_cpu_copy below.
+//              SurfaceImporter::is_zero_copy below.
 //              (CpuCopySurfaceImporter, cpu_copy_surface_importer.cpp)
 //
 // This header is the seam between the platform-agnostic Binding (present
@@ -67,12 +67,6 @@ struct PlaneTextures {
 	int width = 0;     // luma (frame) width
 	int height = 0;    // luma (frame) height
 
-	// True only for the Windows CPU-Copy Import Path (ADR-0007): these planes
-	// came from a GPU->CPU readback instead of a zero-copy import. The present
-	// pipeline sums this into its cpu_copy_count() debug counter, which the
-	// other two Import Paths must keep at 0.
-	bool is_cpu_copy = false;
-
 	// Frees the RD texture RIDs and releases the native import wrappers.
 	// Call exactly once (the retire-ring does this after N frames).
 	std::function<void()> release;
@@ -99,6 +93,18 @@ struct PlaneTextures {
 	bool valid() const { return luma.is_valid() && chroma.is_valid(); }
 };
 
+// Frees whichever of the two plane RIDs are valid. Shared by the importers'
+// failure paths (one RID created, the other failed) and their release
+// closures.
+inline void free_plane_rids(godot::RenderingDevice *rd, godot::RID luma, godot::RID chroma) {
+	if (luma.is_valid()) {
+		rd->free_rid(luma);
+	}
+	if (chroma.is_valid()) {
+		rd->free_rid(chroma);
+	}
+}
+
 // -----------------------------------------------------------------------
 // SurfaceImporter — abstract per-platform NV12 surface importer.
 //
@@ -117,6 +123,12 @@ public:
 	virtual bool initialize(godot::RenderingDevice *rd) = 0;
 
 	virtual bool is_initialized() const = 0;
+
+	// Whether this importer's planes reach RD without a CPU pixel copy. Fixed
+	// per importer, not per frame: the CPU-Copy Import Path is the
+	// one override. The present pipeline uses this to keep its cpu_copy_count()
+	// debug counter honest.
+	virtual bool is_zero_copy() const { return true; }
 
 	// Import a decoder surface (the core::VideoFrame::native_handle: a
 	// CVPixelBufferRef on macOS, an ID3D11Texture2D* on Windows) into two RD

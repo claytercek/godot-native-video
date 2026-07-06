@@ -285,8 +285,8 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	current_texture_->set_texture_rd_rid(slot.rgba_rid);
 
 	// Count this frame if the CPU-Copy Import Path produced the
-	// planes we just sampled. Stays 0 for the two zero-copy Import Paths.
-	if (planes.is_cpu_copy) {
+	// planes we just sampled. Stays 0 for the zero-copy importers.
+	if (!importer_->is_zero_copy()) {
 		++cpu_copy_count_;
 	}
 

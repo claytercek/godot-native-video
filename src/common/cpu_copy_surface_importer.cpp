@@ -32,7 +32,7 @@
 //
 // NOTE ON "CPU COPY": this is the one Import Path permitted, by design, to
 // violate the zero-copy contract. The row-packing loop below is exactly the
-// CPU copy PlaneTextures::is_cpu_copy exists to count.
+// CPU copy the is_zero_copy() override exists to report.
 // -----------------------------------------------------------------------
 
 #include "cpu_copy_surface_importer.h"
@@ -239,18 +239,12 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 			make_plane_format(RenderingDevice::DATA_FORMAT_R8G8_UNORM, chroma_width, chroma_height), view,
 			TypedArray<PackedByteArray>());
 	if (!luma.is_valid() || !chroma.is_valid()) {
-		if (luma.is_valid()) {
-			rd->free_rid(luma);
-		}
-		if (chroma.is_valid()) {
-			rd->free_rid(chroma);
-		}
+		free_plane_rids(rd, luma, chroma);
 		ERR_PRINT("CPU-copy importer: texture_create failed.");
 		return out;
 	}
 	if (rd->texture_update(luma, 0, luma_bytes) != OK || rd->texture_update(chroma, 0, chroma_bytes) != OK) {
-		rd->free_rid(luma);
-		rd->free_rid(chroma);
+		free_plane_rids(rd, luma, chroma);
 		ERR_PRINT("CPU-copy importer: texture_update failed.");
 		return out;
 	}
@@ -259,14 +253,8 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 	out.chroma = chroma;
 	out.width = luma_width;
 	out.height = luma_height;
-	out.is_cpu_copy = true;
 	out.release = [rd, luma, chroma]() {
-		if (luma.is_valid()) {
-			rd->free_rid(luma);
-		}
-		if (chroma.is_valid()) {
-			rd->free_rid(chroma);
-		}
+		free_plane_rids(rd, luma, chroma);
 	};
 
 	return out;

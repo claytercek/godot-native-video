@@ -518,12 +518,7 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 			RenderingDevice::TEXTURE_SAMPLES_1, usage, chroma_handle_value,
 			static_cast<int64_t>(chroma_width), static_cast<int64_t>(chroma_height), 1, 1);
 	if (!luma.is_valid() || !chroma.is_valid()) {
-		if (luma.is_valid()) {
-			rd->free_rid(luma);
-		}
-		if (chroma.is_valid()) {
-			rd->free_rid(chroma);
-		}
+		free_plane_rids(rd, luma, chroma);
 		ERR_PRINT("D3D12 importer: texture_create_from_extension failed.");
 		return out;
 	}
@@ -554,12 +549,7 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	auto luma_holder = std::make_shared<ComPtr<ID3D12Resource>>(std::move(d3d12_luma));
 	auto chroma_holder = std::make_shared<ComPtr<ID3D12Resource>>(std::move(d3d12_chroma));
 	out.release = [rd, luma, chroma, luma_holder, chroma_holder]() {
-		if (luma.is_valid()) {
-			rd->free_rid(luma);
-		}
-		if (chroma.is_valid()) {
-			rd->free_rid(chroma);
-		}
+		free_plane_rids(rd, luma, chroma);
 		luma_holder->reset();
 		chroma_holder->reset();
 	};
