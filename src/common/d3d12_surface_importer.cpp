@@ -324,6 +324,13 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 
 	D3D11_TEXTURE2D_DESC src_desc = {};
 	decoded->GetDesc(&src_desc);
+	// KNOWN LIMITATION: the MF backend now negotiates DXGI_FORMAT_P010 for
+	// 10-bit HEVC sources regardless of which Import Path is active (see
+	// mf_backend.cpp). This path does not handle P010 yet, so a 10-bit clip
+	// routed here drops every frame (silently, via the invalid PlaneTextures
+	// below) instead of presenting anything. Not a concern for the default
+	// configuration — this path only activates on Godot 4.5+ with the d3d12
+	// RD driver, and the CPU-Copy Path (the default) handles P010 correctly.
 	if (src_desc.Format != DXGI_FORMAT_NV12) {
 		ERR_PRINT("D3D12 importer: decoder texture is not NV12.");
 		return out;

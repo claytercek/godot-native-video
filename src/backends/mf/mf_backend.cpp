@@ -2,26 +2,28 @@
 // mf_backend.cpp — Media Foundation Decoder-mode Backend (Windows).
 //
 // Drives an IMFSourceReader + IMFDXGIDeviceManager as a pure hardware decoder
-// by design. Video is always negotiated down to NV12 8-bit decoded into D3D11
-// textures (DXGI_FORMAT_NV12) — no P010 request yet, so 10-bit sources lose
-// precision to the video processor MFT's 8-bit conversion; colorimetry
+// by design. Video is negotiated to match the source's bit depth: 8-bit
+// sources request NV12 8-bit D3D11 textures (DXGI_FORMAT_NV12); 10-bit HEVC
+// (Main10) sources request P010 10-bit D3D11 textures (DXGI_FORMAT_P010)
+// instead of letting the video processor MFT down-convert to 8-bit —
+// mirroring the AVF backend's x420 negotiation. Colorimetry
 // (matrix/primaries/transfer/range) is read from the stream's
 // *native* media type and tagged onto every frame regardless of bit depth, so
-// BT.601/BT.2020/PQ/HLG clips still get the right shader treatment even while
-// decode stays 8-bit. Audio is configured for interleaved float32 LPCM. Each
-// decoded video frame hands out the underlying ID3D11Texture2D as a native
-// surface handle owned by a move-only RAII wrapper (mf::ComPtr) and released
-// via the core::VideoFrame::release callback. This is the structural mirror of
+// BT.601/BT.2020/PQ/HLG clips still get the right shader treatment. Audio is
+// configured for interleaved float32 LPCM. Each decoded video frame hands out
+// the underlying ID3D11Texture2D as a native surface handle owned by a
+// move-only RAII wrapper (mf::ComPtr) and released via the
+// core::VideoFrame::release callback. This is the structural mirror of
 // avf_backend.mm.
 //
 // No Godot / RenderingDevice symbols appear here.
 //
 // STATUS: VERIFIED on Windows 11 (AMD hardware decode). tests/mf passes the
 // full synthetic + real-clip matrix (H.264 and HEVC, MP4/MOV, 24/30/60 fps):
-// NV12 D3D11 textures with correct marker content, monotonic PTS, float32 PCM,
-// and colorimetry matching each clip's tagged VUI/colr metadata. Note the
-// decoder MFT emits frames as slices of one shared texture *array*; the slice
-// index is reported in VideoFrame::plane_slice (see below).
+// NV12/P010 D3D11 textures with correct marker content, monotonic PTS,
+// float32 PCM, and colorimetry matching each clip's tagged VUI/colr metadata.
+// Note the decoder MFT emits frames as slices of one shared texture *array*;
+// the slice index is reported in VideoFrame::plane_slice (see below).
 // -----------------------------------------------------------------------
 
 #include "mf_backend.h"
@@ -42,6 +44,7 @@
 #include <dxgi.h>
 #include <Mfobjects.h>
 #include <propvarutil.h>
+#include <codecapi.h> // eAVEncH265VProfile_*
 
 #include <cmath>
 #include <cstring>
@@ -110,6 +113,24 @@ core::ColorRange parse_color_range(UINT32 val) {
 		default: return core::ColorRange::Unspecified;
 	}
 }
+
+// Detect the source's bit depth from the native (pre-conversion) video media
+// type. MF_MT_MPEG2_PROFILE (an alias of MF_MT_VIDEO_PROFILE) carries the
+// demuxer-parsed HEVC general_profile_idc for HEVC streams; profile 2
+// (eAVEncH265VProfile_Main_420_10) identifies a 10-bit 4:2:0 source — the
+// profile every 10-bit clip in the coverage matrix (Main10 SDR, PQ, HLG)
+// encodes to. Absent or any other value (including all H.264 streams, which
+// have no 10-bit profile in this project's scope) defaults to 8-bit, matching
+// the AVF backend's "match-the-source, default to 8-bit" contract.
+int detect_bit_depth(IMFMediaType *native) {
+	UINT32 profile = 0;
+	if (SUCCEEDED(native->GetUINT32(MF_MT_MPEG2_PROFILE, &profile))) {
+		if (profile == eAVEncH265VProfile_Main_420_10) {
+			return 10;
+		}
+	}
+	return 8;
+}
 } // namespace
 
 namespace mf {
@@ -151,6 +172,12 @@ public:
 	core::ColorPrimaries primaries_ = core::ColorPrimaries::BT709;
 	core::TransferFunction transfer_ = core::TransferFunction::BT709;
 	core::ColorRange range_ = core::ColorRange::Video;
+
+	// Negotiated bit depth: 10 when the video stream output type is P010
+	// (10-bit source, matched), 8 for NV12 (8-bit source, or a 10-bit source
+	// whose P010 request failed and fell back to NV12). Set by
+	// configure_video_stream() before open() returns.
+	int bit_depth_ = 8;
 
 	bool error = false;
 	bool com_initialized = false;
@@ -251,9 +278,11 @@ bool MfBackend::Impl::create_reader() {
 	return true;
 }
 
-// Configure the video stream output type to NV12 (D3D11-friendly 8-bit 4:2:0).
-// We select the first video stream, deselect everything, then re-select the
-// streams we want, exactly like the AVF reader picks one track per type.
+// Configure the video stream output type, matching the source's bit depth:
+// NV12 (D3D11-friendly 8-bit 4:2:0) for 8-bit sources, P010 (10-bit 4:2:0) for
+// 10-bit HEVC Main10 sources. We select the first video stream, deselect
+// everything, then re-select the streams we want, exactly like the AVF reader
+// picks one track per type.
 bool MfBackend::Impl::configure_video_stream() {
 	// Find the first video stream by walking native media types.
 	for (DWORD i = 0;; ++i) {
@@ -269,12 +298,13 @@ bool MfBackend::Impl::configure_video_stream() {
 		native->GetGUID(MF_MT_MAJOR_TYPE, &major);
 		if (major == MFMediaType_Video && video_stream_index < 0) {
 			video_stream_index = static_cast<int>(i);
-			// Colorimetry lives on the *native* (pre-conversion) type: the NV12
-			// output type requested below goes through a video processor MFT that
-			// does not carry these attributes forward onto its negotiated output
-			// type, so reading them post-conversion would always see the
-			// unspecified defaults.
+			// Colorimetry and bit depth live on the *native* (pre-conversion)
+			// type: the NV12/P010 output type requested below goes through a
+			// video processor MFT that does not carry these attributes forward
+			// onto its negotiated output type, so reading them post-conversion
+			// would always see the unspecified defaults.
 			read_colorimetry(native.get());
+			bit_depth_ = detect_bit_depth(native.get());
 		} else if (major == MFMediaType_Audio && audio_stream_index < 0) {
 			audio_stream_index = static_cast<int>(i);
 		}
@@ -286,16 +316,27 @@ bool MfBackend::Impl::configure_video_stream() {
 
 	const DWORD vidx = static_cast<DWORD>(video_stream_index);
 
-	// Request NV12 output on the video stream. The reader inserts a video
-	// processor MFT if the decoder doesn't natively output NV12.
-	ComPtr<IMFMediaType> nv12;
-	HRESULT hr = MFCreateMediaType(nv12.put());
-	if (FAILED(hr)) {
-		return false;
+	// Request the output subtype matching the detected bit depth. The reader
+	// inserts a video processor MFT if the decoder doesn't natively output
+	// that subtype. If the 10-bit (P010) request fails — e.g. no MFT in the
+	// chain can produce it — fall back to NV12 and correct bit_depth_ so the
+	// frames we hand out accurately report what was actually negotiated.
+	auto request_subtype = [&](const GUID &subtype) -> HRESULT {
+		ComPtr<IMFMediaType> out_type;
+		HRESULT hr2 = MFCreateMediaType(out_type.put());
+		if (FAILED(hr2)) {
+			return hr2;
+		}
+		out_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+		out_type->SetGUID(MF_MT_SUBTYPE, subtype);
+		return reader->SetCurrentMediaType(vidx, nullptr, out_type.get());
+	};
+
+	HRESULT hr = request_subtype(bit_depth_ >= 10 ? MFVideoFormat_P010 : MFVideoFormat_NV12);
+	if (FAILED(hr) && bit_depth_ >= 10) {
+		bit_depth_ = 8;
+		hr = request_subtype(MFVideoFormat_NV12);
 	}
-	nv12->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-	nv12->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-	hr = reader->SetCurrentMediaType(vidx, nullptr, nv12.get());
 	if (FAILED(hr)) {
 		return false;
 	}
@@ -499,6 +540,10 @@ core::ColorRange MfBackend::color_range() const {
 	return impl_ ? impl_->range_ : core::ColorRange::Video;
 }
 
+int MfBackend::bit_depth() const {
+	return impl_ ? impl_->bit_depth_ : 8;
+}
+
 bool MfBackend::seek(double pts_seconds) {
 	if (!impl_ || !impl_->reader) {
 		return false;
@@ -594,7 +639,11 @@ std::optional<core::VideoFrame> MfBackend::next_video_frame() {
 		frame.native_handle = static_cast<void *>(tex.get());
 		frame.width = impl_->width;
 		frame.height = impl_->height;
-		frame.pixel_format = core::PixelFormat::NV12;
+		// 8-bit sources negotiated NV12; 10-bit HEVC Main10 sources negotiated
+		// P010, tagged as PixelFormat::x420 — the same logical tag the AVF
+		// backend uses for its 10-bit biplanar surfaces.
+		frame.pixel_format = impl_->bit_depth_ >= 10 ? core::PixelFormat::x420 : core::PixelFormat::NV12;
+		frame.bit_depth = impl_->bit_depth_;
 		// Record the array-slice index so the importer can address the right
 		// subresource of the shared decoder texture array.
 		frame.plane_slice = static_cast<uint32_t>(subresource);
