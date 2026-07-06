@@ -14,13 +14,15 @@ localEnv = Environment(tools=["default"], PLATFORM="")
 # Modify the example file as needed and uncomment the line below or
 # manually specify the build_profile parameter when running SCons.
 
-# NOTE: an `enabled_classes` build profile would have to enumerate the full
-# transitive closure of every godot-cpp class the present pipeline touches
-# (RenderingDevice, RenderingServer, Texture2DRD, the RD* descriptor classes,
-# their bases, ...). That is brittle and easy to under-specify, so we build the
-# full bindings. Re-introduce a curated profile only once the API surface is
-# stable and the closure is verified.
-# localEnv["build_profile"] = "build_profile.json"
+# NOTE: godot-cpp expands base classes automatically, but it PRUNES any binding
+# method whose signature references a class missing from `enabled_classes` — so
+# the profile must name every engine class our code calls into or passes around,
+# including types that appear only in signatures (e.g. compute_pipeline_create
+# needs RDPipelineSpecializationConstant). godot-cpp's own sources additionally
+# require OS. When adding a new engine-class usage, add it to build_profile.json
+# or the corresponding binding method silently vanishes and the build fails on
+# that call site.
+localEnv["build_profile"] = "build_profile.json"
 
 customs = ["custom.py"]
 customs = [os.path.abspath(path) for path in customs]
