@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------
-// hdr_color_math.h — shared constexpr HDR color conversion math functions.
+// hdr_color_math.h — shared inline HDR color conversion math functions.
 //
 // Matches ITU-R BT.2100 (PQ/HLG EOTFs), SMPTE ST 2084, BT.2390-4 EETF,
 // and BT.2020→BT.709 primary-matrix conversion. The same mathematical
@@ -102,14 +102,6 @@ inline double tone_map(double L_abs, double L_tw) noexcept {
 	}
 	const double L_n = L_abs / L_tw;
 	return L_n / (1.0 + L_n);
-}
-
-inline double tone_map_pq(double L_abs) noexcept {
-	return tone_map(L_abs, kReferenceWhite);
-}
-
-inline double tone_map_hlg(double L_abs) noexcept {
-	return tone_map(L_abs, kReferenceWhite);
 }
 
 // =======================================================================
