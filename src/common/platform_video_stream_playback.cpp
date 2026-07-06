@@ -116,9 +116,9 @@ void PlatformVideoStreamPlayback::fill_audio() {
 	});
 }
 
-void PlatformVideoStreamPlayback::drive_audio() {
+bool PlatformVideoStreamPlayback::drive_audio() {
 	if (!audio_ring_ || !audio_clock_ || channels_ <= 0) {
-		return;
+		return false;
 	}
 
 	// Offer up to a render-tick worth of audio per call. We request exactly the
@@ -160,6 +160,7 @@ void PlatformVideoStreamPlayback::drive_audio() {
 	if (advance > 0) {
 		audio_clock_->on_audio_mixed(advance);
 	}
+	return advance > 0;
 }
 
 void PlatformVideoStreamPlayback::_play() {
@@ -335,7 +336,19 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 		// AudioServer. drive_audio() advances the master clock from the samples
 		// actually consumed (the audio clock IS the master here — ADR-0001).
 		fill_audio();
-		drive_audio();
+		const bool advanced_from_audio = drive_audio();
+		// The audio track can legitimately end before the video track (mismatched
+		// track durations are common in real-world files, not just malformed
+		// ones). Once the backend has reported genuine audio EOS and drive_audio()
+		// had no real samples left to advance the clock with this tick, no more
+		// real samples will ever arrive — so it would otherwise freeze forever and
+		// strand any remaining video. Fall back to advancing by wall-clock delta
+		// for the tail, the same mechanism used for silent clips below. Gated on
+		// !advanced_from_audio so the one tick where the ring drains to empty
+		// still advances by exactly its real leftover frames, not real+delta.
+		if (!advanced_from_audio && audio_eos_ && audio_ring_->empty()) {
+			audio_clock_->set_time(audio_clock_->media_time() + delta);
+		}
 	} else {
 		// Silent clip: advance the monotonic clock by the render delta so the
 		// video still plays at the correct rate.
