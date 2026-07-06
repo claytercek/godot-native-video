@@ -145,8 +145,6 @@ TEST_CASE("HLG display EOTF: reference white level") {
 // =====================================================================
 TEST_CASE("tone_map: zero maps to zero") {
 	CHECK(std::fabs(tone_map(0.0, kReferenceWhite)) < 1e-10);
-	CHECK(std::fabs(tone_map_pq(0.0)) < 1e-10);
-	CHECK(std::fabs(tone_map_hlg(0.0)) < 1e-10);
 }
 
 TEST_CASE("tone_map: reference white maps to 0.5 linear") {
@@ -157,7 +155,7 @@ TEST_CASE("tone_map: reference white maps to 0.5 linear") {
 
 TEST_CASE("tone_map: output in [0, 1) for all finite inputs") {
 	for (double L = 0.0; L <= 100000.0; L += 1000.0) {
-		double t = tone_map_pq(L);
+		double t = tone_map(L, kReferenceWhite);
 		CHECK(t >= 0.0);
 		CHECK(t < 1.0);
 	}
@@ -165,24 +163,24 @@ TEST_CASE("tone_map: output in [0, 1) for all finite inputs") {
 
 TEST_CASE("tone_map: monotonic") {
 	for (double L = 1.0; L < 9000.0; L += 100.0) {
-		double t_lo = tone_map_pq(L);
-		double t_hi = tone_map_pq(L + 5.0);
+		double t_lo = tone_map(L, kReferenceWhite);
+		double t_hi = tone_map(L + 5.0, kReferenceWhite);
 		CHECK(t_hi > t_lo);
 	}
 }
 
 TEST_CASE("tone_map: characteristic values") {
 	// PQ: reference white (203) → 0.5, peak (10000) → ~0.98
-	double tw = tone_map_pq(kReferenceWhite);
+	double tw = tone_map(kReferenceWhite, kReferenceWhite);
 	CHECK(std::fabs(tw - 0.5) < 0.01);
-	double peak = tone_map_pq(kPQPeak);
+	double peak = tone_map(kPQPeak, kReferenceWhite);
 	CHECK(peak > 0.95);
 	CHECK(peak < 1.0);
 
 	// HLG: reference white → 0.5, peak (1000) → ~0.83
-	double hlg_tw = tone_map_hlg(kReferenceWhite);
+	double hlg_tw = tone_map(kReferenceWhite, kReferenceWhite);
 	CHECK(std::fabs(hlg_tw - 0.5) < 0.01);
-	double hlg_peak = tone_map_hlg(1000.0);
+	double hlg_peak = tone_map(1000.0, kReferenceWhite);
 	CHECK(hlg_peak > 0.80);
 	CHECK(hlg_peak < 0.85);
 }
