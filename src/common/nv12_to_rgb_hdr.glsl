@@ -33,6 +33,9 @@ layout(push_constant, std430) uniform Params {
 	uint bit_depth;      // 8 or 10
 	uint transfer_select; // 0=Unspecified, 1=BT.709, 2=PQ, 3=HLG
 	uint primaries_select; // (unused in HDR mode — no gamut conversion)
+	uint pad0; // explicit pad to a 16-byte multiple: pre-4.7 Godot rounds the
+	           // required push-constant size up to 32, 4.7+ validates the exact
+	           // declared size — 8 uints satisfies both
 } params;
 
 void main() {

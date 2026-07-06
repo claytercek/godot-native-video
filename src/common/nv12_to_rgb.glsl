@@ -45,6 +45,9 @@ layout(push_constant, std430) uniform Params {
 	uint transfer_select; // 0=Unspecified, 1=BT.709, 2=PQ, 3=HLG (core::TransferFunction)
 	uint primaries_select; // 0=Unspecified, 1=BT.709, 2=BT.601_625, 3=BT.601_525,
 	                       // 4=BT.2020, 5=DCI_P3 (core::ColorPrimaries)
+	uint pad0; // explicit pad to a 16-byte multiple: pre-4.7 Godot rounds the
+	           // required push-constant size up to 32, 4.7+ validates the exact
+	           // declared size — 8 uints satisfies both
 } params;
 
 void main() {
