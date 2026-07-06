@@ -146,7 +146,8 @@ runtime dependency**:
 - `tools/gen_test_media.sh` — synthetic clip with a burned-in per-frame index
   marker and a per-frame sync tone, for deterministic frame/sync assertions.
 - `tools/gen_clip_matrix.sh` — the small real-clip format matrix (H.264/HEVC,
-  24/30/60 fps, MP4/MOV, AAC stereo) consumed by the backend coverage tests.
+  24/30/60 fps, MP4/MOV/M4V, AAC stereo) consumed by the backend coverage
+  tests.
   Nothing is committed: this script is the single source of truth, regenerating
   the clips **and** the manifests (`matrix.list`, parsed by the tests, plus a
   `matrix.json` mirror) into `tests/fixtures/matrix/`. CI and local runs invoke
