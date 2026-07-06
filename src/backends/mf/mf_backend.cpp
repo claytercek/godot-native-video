@@ -15,7 +15,7 @@
 // full synthetic + real-clip matrix (H.264 and HEVC, MP4/MOV, 24/30/60 fps):
 // NV12 D3D11 textures with correct marker content, monotonic PTS, float32 PCM.
 // Note the decoder MFT emits frames as slices of one shared texture *array*;
-// the slice index is stashed in VideoFrame::cpu_pixels_size (see below).
+// the slice index is reported in VideoFrame::plane_slice (see below).
 // -----------------------------------------------------------------------
 
 #include "mf_backend.h"
@@ -481,11 +481,9 @@ std::optional<core::VideoFrame> MfBackend::next_video_frame() {
 		frame.width = impl_->width;
 		frame.height = impl_->height;
 		frame.pixel_format = core::PixelFormat::NV12;
-		// Stash the array-slice index in the unused cpu_pixels_size field so the
-		// importer can address the right subresource without widening the core
-		// VideoFrame struct (which stays Godot- and platform-agnostic). Documented
-		// contract between the MF backend and the DXGI importer.
-		frame.cpu_pixels_size = static_cast<size_t>(subresource);
+		// Record the array-slice index so the importer can address the right
+		// subresource of the shared decoder texture array.
+		frame.plane_slice = static_cast<uint32_t>(subresource);
 
 		// Move the texture owner into the release closure so the D3D11 texture is
 		// Released exactly once when the consumer is done — the COM analog of the

@@ -85,8 +85,8 @@ std::string ensure_fixture() {
 // staging texture; the present path imports the texture to the GPU zero-copy and
 // never does this. Mirrors mean_block_luma() in the AVF test.
 //
-// `subresource` is the array-slice index the backend stashes in
-// core::VideoFrame::cpu_pixels_size: DXVA decoders hand out frames as slices of
+// `subresource` is the array-slice index the backend reports in
+// core::VideoFrame::plane_slice: DXVA decoders hand out frames as slices of
 // one shared texture *array*, so the readback must copy that slice
 // (CopySubresourceRegion) — CopyResource into a 1-slice staging texture is an
 // array-size mismatch, which D3D11 silently ignores, leaving the staging
@@ -182,7 +182,7 @@ TEST_CASE("MF backend decodes synthetic clip to NV12 + PCM with monotonic PTS") 
 		// loss + chroma siting drags the mean down; require >= 170 over the
 		// text-free quadrant.
 		ID3D11Texture2D *tex = static_cast<ID3D11Texture2D *>(frame->native_handle);
-		double luma = mean_block_luma(tex, static_cast<UINT>(frame->cpu_pixels_size));
+		double luma = mean_block_luma(tex, static_cast<UINT>(frame->plane_slice));
 		if (luma >= 170.0) {
 			++bright_marker_frames;
 		}

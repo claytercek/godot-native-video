@@ -263,7 +263,7 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	}
 	// Source subresource: DXVA decoder MFTs pack decoded frames as slices of one
 	// shared texture array, so the slice for THIS frame is the plane_slice the
-	// backend recorded in VideoFrame.cpu_pixels_size and the present pipeline
+	// backend recorded in VideoFrame::plane_slice and the present pipeline
 	// forwarded here. (Verified on real hardware: the MF decoder does emit a
 	// texture array — always blitting slice 0 shows stale/wrong frames.)
 	impl->interop.context()->CopySubresourceRegion(

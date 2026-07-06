@@ -139,7 +139,7 @@ public:
 	// `plane_slice` is the subresource/array-slice index of the frame within
 	// native_handle. Windows DXVA decoders hand out frames as slices of one
 	// shared D3D11 texture *array*; the MF backend records the slice for each
-	// frame in core::VideoFrame::cpu_pixels_size and the present pipeline
+	// frame in core::VideoFrame::plane_slice and the present pipeline
 	// forwards it here. On macOS a CVPixelBuffer is always a single surface, so
 	// the Metal importer ignores it (callers pass 0).
 	virtual PlaneTextures import(void *native_handle, uint32_t plane_slice) = 0;
