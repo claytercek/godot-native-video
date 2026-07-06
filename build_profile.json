@@ -1,15 +1,24 @@
 {
 	"type": "feature_profile",
 	"enabled_classes": [
-    "ImageTexture",
-    "OS",
-    "PlatformVideoStream",
-    "PlatformVideoStreamPlayback",
-    "PlatformMediaResourceFormatLoader",
-    "ResourceFormatLoader",
-    "ResourceLoader",
-    "Texture2D",
-    "VideoStream",
-    "VideoStreamPlayback"
+		"AudioServer",
+		"Engine",
+		"OS",
+		"ProjectSettings",
+		"RDPipelineSpecializationConstant",
+		"RDSamplerState",
+		"RDShaderSPIRV",
+		"RDShaderSource",
+		"RDTextureFormat",
+		"RDTextureView",
+		"RDUniform",
+		"RenderingDevice",
+		"RenderingServer",
+		"ResourceFormatLoader",
+		"ResourceLoader",
+		"Texture2D",
+		"Texture2DRD",
+		"VideoStream",
+		"VideoStreamPlayback"
 	]
 }
