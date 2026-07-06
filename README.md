@@ -150,8 +150,9 @@ runtime dependency**:
   tests.
   Nothing is committed: this script is the single source of truth, regenerating
   the clips **and** the manifests (`matrix.list`, parsed by the tests, plus a
-  `matrix.json` mirror) into `tests/fixtures/matrix/`. CI and local runs invoke
-  it before the backend tests.
+  `matrix.json` mirror) into `tests/fixtures/matrix/`. Local runs invoke it
+  before the backend tests; CI generates the media once in a dedicated job
+  (cached across runs) and shares it with the backend jobs as an artifact.
 
 ### Repository Structure
 
