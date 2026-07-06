@@ -158,8 +158,10 @@ env = SConscript("godot-cpp/SConstruct", {"env": env, "customs": customs}, varia
 env.VariantDir("build/src", "src", duplicate=0)
 
 # -----------------------------------------------------------------------
-# Embed the authored NV12->RGB compute shaders into C++ headers at build
-# time so the .glsl files are the single source of truth.
+# Embed the authored NV12->RGB compute shader into C++ headers at build
+# time so the .glsl file is the single source of truth. The SDR and HDR
+# headers are both generated from the SAME nv12_to_rgb.glsl source, embedded
+# twice with different preprocessor defines to select the output variant.
 # -----------------------------------------------------------------------
 # Run the embed script with the same interpreter that runs SCons — `python3`
 # is not on PATH on stock Windows (the Store stub shadows it).
@@ -174,12 +176,14 @@ env.Command(
 # header is regenerated when it changes.
 env.Depends(shader_header, "src/common/hdr_color_math.glsl")
 
-# HDR variant (RGBA16F output, scene-linear, no tone-map).
+# HDR variant: the same nv12_to_rgb.glsl source, embedded with HDR_OUTPUT=1
+# injected after the #version line, selecting the RGBA16F/scene-linear
+# (no tone-map) code paths instead of the SDR rgba8 tone-mapped ones.
 shader_hdr_header = "build/gen/src/common/nv12_to_rgb_hdr_shader.h"
 env.Command(
     target=shader_hdr_header,
-    source="src/common/nv12_to_rgb_hdr.glsl",
-    action=python_exe + " tools/embed_shader.py $SOURCE $TARGET kNv12ToRgbHdrCompute",
+    source="src/common/nv12_to_rgb.glsl",
+    action=python_exe + " tools/embed_shader.py $SOURCE $TARGET kNv12ToRgbHdrCompute -D HDR_OUTPUT=1",
 )
 env.Depends(shader_hdr_header, "src/common/hdr_color_math.glsl")
 
