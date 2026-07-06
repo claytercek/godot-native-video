@@ -25,40 +25,13 @@ using namespace godot;
 
 namespace platform_media {
 
-// kNv12ToRgbCompute    is auto-generated from src/common/nv12_to_rgb.glsl
-// kNv12ToRgbHdrCompute is auto-generated from src/common/nv12_to_rgb_hdr.glsl
-// by tools/embed_shader.py — edit the .glsl files, not these constants.
+// kNv12ToRgbCompute and kNv12ToRgbHdrCompute are both auto-generated from the
+// same src/common/nv12_to_rgb.glsl by tools/embed_shader.py, embedded twice
+// with different injected HDR_OUTPUT defines — edit the .glsl file, not
+// these constants.
 
 PresentPipeline::~PresentPipeline() {
 	shutdown();
-}
-
-// -----------------------------------------------------------------------
-// Helper: compile one compute shader + pipeline from embedded GLSL source.
-// -----------------------------------------------------------------------
-static bool build_one_shader(RenderingDevice *rd, const char *label,
-		RID &out_shader, RID &out_pipeline, const char *source) {
-	Ref<RDShaderSource> src;
-	src.instantiate();
-	src->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
-	src->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, String(source));
-
-	Ref<RDShaderSPIRV> spirv = rd->shader_compile_spirv_from_source(src);
-	ERR_FAIL_COND_V_MSG(spirv.is_null(), false,
-			String(label) + " shader compile returned null.");
-	const String compile_err =
-			spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
-	ERR_FAIL_COND_V_MSG(!compile_err.is_empty(), false,
-			String(label) + " shader compile error: " + compile_err);
-
-	out_shader = rd->shader_create_from_spirv(spirv, label);
-	ERR_FAIL_COND_V_MSG(!out_shader.is_valid(), false,
-			String(label) + " shader_create_from_spirv failed.");
-
-	out_pipeline = rd->compute_pipeline_create(out_shader);
-	ERR_FAIL_COND_V_MSG(!out_pipeline.is_valid(), false,
-			String(label) + " compute_pipeline_create failed.");
-	return true;
 }
 
 bool PresentPipeline::ensure_ready(int width, int height) {
@@ -96,16 +69,36 @@ bool PresentPipeline::build_resources(int width, int height) {
 		return false;
 	}
 
-	// --- Compile both shader variants. Both are built so we can toggle
-	//     output_mode without re-compiling, but only the active one is used. ---
-	if (!build_one_shader(rd_, "nv12_to_rgb",
-			shader_sdr_, pipeline_sdr_, kNv12ToRgbCompute)) {
-		return false;
-	}
-	if (!build_one_shader(rd_, "nv12_to_rgb_hdr",
-			shader_hdr_, pipeline_hdr_, kNv12ToRgbHdrCompute)) {
-		return false;
-	}
+	// --- Compile the shader variant for the active output mode. ---
+	// set_output_mode() invalidates ready_ on a mode change, so the next
+	// ensure_ready() runs build_resources() again anyway — and the ring
+	// texture format changes too (rgba8 vs rgba16f), so that rebuild isn't
+	// avoidable regardless. There's no benefit to keeping both variants
+	// compiled, so only the one matching output_mode_ is built here.
+	const bool want_hdr = (output_mode_ == OutputMode::HDR);
+	const char *label = want_hdr ? "nv12_to_rgb_hdr" : "nv12_to_rgb";
+	const char *source = want_hdr ? kNv12ToRgbHdrCompute : kNv12ToRgbCompute;
+
+	Ref<RDShaderSource> src;
+	src.instantiate();
+	src->set_language(RenderingDevice::SHADER_LANGUAGE_GLSL);
+	src->set_stage_source(RenderingDevice::SHADER_STAGE_COMPUTE, String(source));
+
+	Ref<RDShaderSPIRV> spirv = rd_->shader_compile_spirv_from_source(src);
+	ERR_FAIL_COND_V_MSG(spirv.is_null(), false,
+			String(label) + " shader compile returned null.");
+	const String compile_err =
+			spirv->get_stage_compile_error(RenderingDevice::SHADER_STAGE_COMPUTE);
+	ERR_FAIL_COND_V_MSG(!compile_err.is_empty(), false,
+			String(label) + " shader compile error: " + compile_err);
+
+	shader_ = rd_->shader_create_from_spirv(spirv, label);
+	ERR_FAIL_COND_V_MSG(!shader_.is_valid(), false,
+			String(label) + " shader_create_from_spirv failed.");
+
+	pipeline_ = rd_->compute_pipeline_create(shader_);
+	ERR_FAIL_COND_V_MSG(!pipeline_.is_valid(), false,
+			String(label) + " compute_pipeline_create failed.");
 
 	// Bilinear sampler so the half-res chroma plane upsamples smoothly.
 	Ref<RDSamplerState> ss;
@@ -117,8 +110,7 @@ bool PresentPipeline::build_resources(int width, int height) {
 
 	// --- N engine-owned storage textures + their Texture2DRD wrappers. ---
 	// Format depends on output mode: RGBA16F for HDR, RGBA8_UNORM for SDR.
-	const bool is_hdr = (output_mode_ == OutputMode::HDR);
-	const RenderingDevice::DataFormat tex_fmt = is_hdr
+	const RenderingDevice::DataFormat tex_fmt = want_hdr
 			? RenderingDevice::DATA_FORMAT_R16G16B16A16_SFLOAT
 			: RenderingDevice::DATA_FORMAT_R8G8B8A8_UNORM;
 
@@ -191,9 +183,6 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	RingSlot &slot = ring_[ring_index_];
 
 	// --- Build the uniform set: luma(0), chroma(1), rgba_out(2). ---
-	// The active shader determines which pipeline the uniform set is created for.
-	const RID active_sh = active_shader();
-
 	Ref<RDUniform> u_luma;
 	u_luma.instantiate();
 	u_luma->set_uniform_type(RenderingDevice::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE);
@@ -219,7 +208,7 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	uniforms.push_back(u_chroma);
 	uniforms.push_back(u_out);
 
-	RID uniform_set = rd_->uniform_set_create(uniforms, active_sh, 0);
+	RID uniform_set = rd_->uniform_set_create(uniforms, shader_, 0);
 	if (!uniform_set.is_valid()) {
 		// Import succeeded but the set didn't; retire planes + frame now.
 		if (planes.release) {
@@ -235,7 +224,7 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	// importer's 10-bit sample scale. std430 — seven uint32 + one float = 32
 	// bytes, a 16-byte multiple: pre-4.7 Godot rounds the required
 	// push-constant size up to 32, 4.7+ validates the exact declared size, and
-	// 32 satisfies both. Both SDR and HDR shaders share the same layout.
+	// 32 satisfies both. The SDR and HDR shader variants share this layout.
 	PackedByteArray pc;
 	pc.resize(32);
 	pc.fill(0);
@@ -272,12 +261,11 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	}
 
 	// --- ONE compute dispatch: NV12 -> RGBA into the engine-owned slot. ---
-	// Use the pipeline matching the current output mode.
 	const int gx = (width_ + 7) / 8;
 	const int gy = (height_ + 7) / 8;
 
 	int64_t cl = rd_->compute_list_begin();
-	rd_->compute_list_bind_compute_pipeline(cl, active_pipeline());
+	rd_->compute_list_bind_compute_pipeline(cl, pipeline_);
 	rd_->compute_list_bind_uniform_set(cl, uniform_set, 0);
 	rd_->compute_list_set_push_constant(cl, pc, pc.size());
 	rd_->compute_list_dispatch(cl, gx, gy, 1);
@@ -339,25 +327,17 @@ void PresentPipeline::free_resources() {
 			ring_[i].rgba_rid = RID();
 		}
 	}
-	if (pipeline_sdr_.is_valid()) {
-		rd_->free_rid(pipeline_sdr_);
-		pipeline_sdr_ = RID();
-	}
-	if (pipeline_hdr_.is_valid()) {
-		rd_->free_rid(pipeline_hdr_);
-		pipeline_hdr_ = RID();
+	if (pipeline_.is_valid()) {
+		rd_->free_rid(pipeline_);
+		pipeline_ = RID();
 	}
 	if (sampler_.is_valid()) {
 		rd_->free_rid(sampler_);
 		sampler_ = RID();
 	}
-	if (shader_sdr_.is_valid()) {
-		rd_->free_rid(shader_sdr_);
-		shader_sdr_ = RID();
-	}
-	if (shader_hdr_.is_valid()) {
-		rd_->free_rid(shader_hdr_);
-		shader_hdr_ = RID();
+	if (shader_.is_valid()) {
+		rd_->free_rid(shader_);
+		shader_ = RID();
 	}
 	ready_ = false;
 	width_ = 0;
