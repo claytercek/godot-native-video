@@ -2,20 +2,26 @@
 // mf_backend.cpp — Media Foundation Decoder-mode Backend (Windows).
 //
 // Drives an IMFSourceReader + IMFDXGIDeviceManager as a pure hardware decoder
-// by design. Video is configured for NV12 / BT.709 8-bit (D12) decoded into
-// D3D11 textures (DXGI_FORMAT_NV12); audio is configured for interleaved
-// float32 LPCM. Each decoded video frame hands out the underlying
-// ID3D11Texture2D as a native surface handle owned by a move-only RAII wrapper
-// (mf::ComPtr) and released via the core::VideoFrame::release callback. This is
-// the structural mirror of avf_backend.mm.
+// by design. Video is always negotiated down to NV12 8-bit decoded into D3D11
+// textures (DXGI_FORMAT_NV12) — no P010 request yet, so 10-bit sources lose
+// precision to the video processor MFT's 8-bit conversion; colorimetry
+// (matrix/primaries/transfer/range) is read from the stream's
+// *native* media type and tagged onto every frame regardless of bit depth, so
+// BT.601/BT.2020/PQ/HLG clips still get the right shader treatment even while
+// decode stays 8-bit. Audio is configured for interleaved float32 LPCM. Each
+// decoded video frame hands out the underlying ID3D11Texture2D as a native
+// surface handle owned by a move-only RAII wrapper (mf::ComPtr) and released
+// via the core::VideoFrame::release callback. This is the structural mirror of
+// avf_backend.mm.
 //
 // No Godot / RenderingDevice symbols appear here.
 //
 // STATUS: VERIFIED on Windows 11 (AMD hardware decode). tests/mf passes the
 // full synthetic + real-clip matrix (H.264 and HEVC, MP4/MOV, 24/30/60 fps):
-// NV12 D3D11 textures with correct marker content, monotonic PTS, float32 PCM.
-// Note the decoder MFT emits frames as slices of one shared texture *array*;
-// the slice index is reported in VideoFrame::plane_slice (see below).
+// NV12 D3D11 textures with correct marker content, monotonic PTS, float32 PCM,
+// and colorimetry matching each clip's tagged VUI/colr metadata. Note the
+// decoder MFT emits frames as slices of one shared texture *array*; the slice
+// index is reported in VideoFrame::plane_slice (see below).
 // -----------------------------------------------------------------------
 
 #include "mf_backend.h"
@@ -53,6 +59,57 @@ inline double mf_ticks_to_seconds(LONGLONG ticks) {
 inline LONGLONG seconds_to_mf_ticks(double seconds) {
 	return static_cast<LONGLONG>(seconds * kMfTicksPerSecond + 0.5);
 }
+
+// -----------------------------------------------------------------------
+// Colorimetry helpers — map MF_MT_YUV_MATRIX / MF_MT_VIDEO_PRIMARIES /
+// MF_MT_TRANSFER_FUNCTION / MF_MT_VIDEO_NOMINAL_RANGE attribute values to our
+// enums. Structural mirror of avf_backend.mm's CVImageBuffer attachment
+// parsers. Unrecognised/absent values map to Unspecified so the caller's
+// BT.709 video-range defaults stay in effect.
+// -----------------------------------------------------------------------
+core::ColorMatrix parse_ycbcr_matrix(UINT32 val) {
+	switch (val) {
+		case MFVideoTransferMatrix_BT709: return core::ColorMatrix::BT709;
+		case MFVideoTransferMatrix_BT601: return core::ColorMatrix::BT601;
+		case MFVideoTransferMatrix_BT2020_10:
+		case MFVideoTransferMatrix_BT2020_12: return core::ColorMatrix::BT2020;
+		default: return core::ColorMatrix::Unspecified;
+	}
+}
+
+core::ColorPrimaries parse_color_primaries(UINT32 val) {
+	switch (val) {
+		case MFVideoPrimaries_BT709: return core::ColorPrimaries::BT709;
+		case MFVideoPrimaries_BT470_2_SysBG:
+		case MFVideoPrimaries_EBU3213: return core::ColorPrimaries::BT601_625;
+		case MFVideoPrimaries_SMPTE170M:
+		case MFVideoPrimaries_SMPTE_C: return core::ColorPrimaries::BT601_525;
+		case MFVideoPrimaries_BT2020: return core::ColorPrimaries::BT2020;
+		case MFVideoPrimaries_DCI_P3: return core::ColorPrimaries::DCI_P3;
+		default: return core::ColorPrimaries::Unspecified;
+	}
+}
+
+core::TransferFunction parse_transfer_function(UINT32 val) {
+	switch (val) {
+		case MFVideoTransFunc_709:
+		case MFVideoTransFunc_sRGB: return core::TransferFunction::BT709;
+		case MFVideoTransFunc_2084: return core::TransferFunction::PQ;
+		case MFVideoTransFunc_HLG: return core::TransferFunction::HLG;
+		default: return core::TransferFunction::Unspecified;
+	}
+}
+
+// MFNominalRange_0_255 / MFNominalRange_16_235 are the unambiguous names for
+// full/video range respectively (the aliased MFNominalRange_Normal /
+// MFNominalRange_Wide names in mfobjects.h are easy to misread backwards).
+core::ColorRange parse_color_range(UINT32 val) {
+	switch (val) {
+		case MFNominalRange_0_255: return core::ColorRange::Full;
+		case MFNominalRange_16_235: return core::ColorRange::Video;
+		default: return core::ColorRange::Unspecified;
+	}
+}
 } // namespace
 
 namespace mf {
@@ -86,6 +143,15 @@ public:
 	int video_stream_index = -1;
 	int audio_stream_index = -1;
 
+	// Negotiated colorimetry (read from the video stream's current media type
+	// at open time, and re-read on a native-type change mid-stream). Defaults:
+	// BT.709, video range — same as today's hard-coded shader constants and
+	// the AVF backend's untagged-clip default.
+	core::ColorMatrix ycbcr_matrix_ = core::ColorMatrix::BT709;
+	core::ColorPrimaries primaries_ = core::ColorPrimaries::BT709;
+	core::TransferFunction transfer_ = core::TransferFunction::BT709;
+	core::ColorRange range_ = core::ColorRange::Video;
+
 	bool error = false;
 	bool com_initialized = false;
 	bool mf_started = false;
@@ -100,6 +166,7 @@ public:
 	bool configure_video_stream();
 	bool configure_audio_stream();
 	void read_duration();
+	void read_colorimetry(IMFMediaType *type);
 
 	void teardown() {
 		reader.reset();
@@ -202,6 +269,12 @@ bool MfBackend::Impl::configure_video_stream() {
 		native->GetGUID(MF_MT_MAJOR_TYPE, &major);
 		if (major == MFMediaType_Video && video_stream_index < 0) {
 			video_stream_index = static_cast<int>(i);
+			// Colorimetry lives on the *native* (pre-conversion) type: the NV12
+			// output type requested below goes through a video processor MFT that
+			// does not carry these attributes forward onto its negotiated output
+			// type, so reading them post-conversion would always see the
+			// unspecified defaults.
+			read_colorimetry(native.get());
 		} else if (major == MFMediaType_Audio && audio_stream_index < 0) {
 			audio_stream_index = static_cast<int>(i);
 		}
@@ -240,6 +313,26 @@ bool MfBackend::Impl::configure_video_stream() {
 		}
 	}
 	return true;
+}
+
+// Read colorimetry attributes off a negotiated video media type. Only present
+// when the source tagged them (e.g. via VUI); an absent attribute leaves the
+// existing default (BT.709 video range) untouched, matching the AVF backend's
+// "untagged clips keep the old defaults" contract.
+void MfBackend::Impl::read_colorimetry(IMFMediaType *type) {
+	UINT32 val = 0;
+	if (SUCCEEDED(type->GetUINT32(MF_MT_YUV_MATRIX, &val))) {
+		ycbcr_matrix_ = parse_ycbcr_matrix(val);
+	}
+	if (SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_PRIMARIES, &val))) {
+		primaries_ = parse_color_primaries(val);
+	}
+	if (SUCCEEDED(type->GetUINT32(MF_MT_TRANSFER_FUNCTION, &val))) {
+		transfer_ = parse_transfer_function(val);
+	}
+	if (SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &val))) {
+		range_ = parse_color_range(val);
+	}
 }
 
 // Configure the audio stream output to interleaved float32 PCM (matches the AVF
@@ -390,6 +483,22 @@ bool MfBackend::had_error() const {
 	return impl_ && impl_->error;
 }
 
+core::ColorMatrix MfBackend::ycbcr_matrix() const {
+	return impl_ ? impl_->ycbcr_matrix_ : core::ColorMatrix::BT709;
+}
+
+core::ColorPrimaries MfBackend::color_primaries() const {
+	return impl_ ? impl_->primaries_ : core::ColorPrimaries::BT709;
+}
+
+core::TransferFunction MfBackend::transfer_function() const {
+	return impl_ ? impl_->transfer_ : core::TransferFunction::BT709;
+}
+
+core::ColorRange MfBackend::color_range() const {
+	return impl_ ? impl_->range_ : core::ColorRange::Video;
+}
+
 bool MfBackend::seek(double pts_seconds) {
 	if (!impl_ || !impl_->reader) {
 		return false;
@@ -435,10 +544,15 @@ std::optional<core::VideoFrame> MfBackend::next_video_frame() {
 			return std::nullopt; // clean EOS
 		}
 		if (!sample) {
-			// No sample this call (e.g. stream-tick / format change). Try again.
-			if (stream_flags & MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED) {
-				continue;
-			}
+			// No sample this call (e.g. stream-tick or a mid-stream native format
+			// change signaled by MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED). A
+			// changed native type could in principle carry new colorimetry, but
+			// re-probing it safely means resolving the *current* native type
+			// (MF_SOURCE_READER_CURRENT_TYPE_INDEX) and deciding whether an
+			// absent attribute should reset to defaults or keep the prior
+			// segment's tag — real complexity with no clip in the matrix to test
+			// it against. Limitation: a mid-stream colorimetry change keeps the
+			// colorimetry captured at open(), same as the AVFoundation backend.
 			continue;
 		}
 
@@ -484,6 +598,15 @@ std::optional<core::VideoFrame> MfBackend::next_video_frame() {
 		// Record the array-slice index so the importer can address the right
 		// subresource of the shared decoder texture array.
 		frame.plane_slice = static_cast<uint32_t>(subresource);
+
+		// Tag with the stream's negotiated colorimetry (refreshed above on a
+		// native-type change). MF does not expose per-IMFSample colorimetry
+		// overrides the way CoreVideo attaches per-buffer keys, so the current
+		// media type is the most granular source available.
+		frame.ycbcr_matrix = impl_->ycbcr_matrix_;
+		frame.primaries = impl_->primaries_;
+		frame.transfer = impl_->transfer_;
+		frame.range = impl_->range_;
 
 		// Move the texture owner into the release closure so the D3D11 texture is
 		// Released exactly once when the consumer is done — the COM analog of the
