@@ -1,6 +1,6 @@
 // -----------------------------------------------------------------------
-// dxgi_surface_importer.cpp — zero-copy NV12 D3D11 texture -> RD textures
-// (Windows / Vulkan). See dxgi_surface_importer.h.
+// dxgi_surface_importer.cpp — zero-copy NV12/P010 D3D11 texture -> RD
+// textures (Windows / Vulkan). See dxgi_surface_importer.h.
 //
 // The interop chain (the "DXGI dance"), in order:
 //
@@ -13,20 +13,29 @@
 //     - Resolve the VK_KHR_external_memory_win32 entry points.
 //
 //   import(frame) per frame:
-//     1. Decoder hands us an NV12 ID3D11Texture2D (possibly a texture-array
-//        slice). It is NOT shareable, so we GPU-blit (CopySubresourceRegion —
-//        no CPU copy) the slice into a fresh shareable NV12 texture created
-//        with SHARED_NTHANDLE | SHARED_KEYEDMUTEX, sized to the frame.
+//     1. Decoder hands us an NV12 or P010 ID3D11Texture2D (possibly a
+//        texture-array slice). It is NOT shareable, so we GPU-blit
+//        (CopySubresourceRegion — no CPU copy) the slice into a fresh
+//        shareable texture of the same format created with SHARED_NTHANDLE |
+//        SHARED_KEYEDMUTEX, sized to the frame.
 //     2. Acquire the shared texture's IDXGIKeyedMutex on the D3D side (key 0),
 //        do the blit, then ReleaseSync to key 1 — handing the surface to Vulkan.
 //     3. CreateSharedHandle -> an NT handle. Open it in Vulkan via
-//        vkGetMemoryWin32HandlePropertiesKHR + a dedicated VkDeviceMemory import,
-//        and create one VkImage per NV12 plane aspect:
-//          - luma:   VK_FORMAT_R8_UNORM, aspect PLANE_0
-//          - chroma: VK_FORMAT_R8G8_UNORM, aspect PLANE_1 (half res)
-//        bound to the imported memory.
-//     4. Hand each VkImage to RenderingDevice::texture_create_from_extension to
-//        get an RD texture aliasing the same memory — no copy.
+//        vkGetMemoryWin32HandlePropertiesKHR + a dedicated VkDeviceMemory
+//        import bound to one multi-planar VkImage (G8_B8R8_2PLANE_420 for
+//        NV12, G10X6_B10X6R10X6_2PLANE_420 for P010), viewed per plane aspect:
+//          - luma:   R8 (NV12) / R16 (P010), aspect PLANE_0
+//          - chroma: RG8 (NV12) / RG16 (P010), aspect PLANE_1 (half res)
+//     4. Hand the VkImage to RenderingDevice::texture_create_from_extension
+//        once per plane to get RD textures aliasing the same memory — no copy.
+//
+//        P010 NOTE: those R16/RG16 plane views alias the decoder's P010
+//        memory directly, so sampled texels carry left-justified codes
+//        (code << 6) — this path has no compute stage to rescale them the way
+//        the D3D12 Import Path's plane-split pass does. The import instead
+//        reports sample_scale = 1/64 on the returned PlaneTextures, and the
+//        shared present shaders multiply it back out when recovering 10-bit
+//        code values (see surface_importer.h).
 //     5. PlaneTextures.acquire/release_sync carry the keyed-mutex handoff for the
 //        present pipeline: acquire() waits key 1 (Vulkan side) before the compute
 //        dispatch; release_sync() releases to key 0 so D3D can reuse the surface.
@@ -266,28 +275,22 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 
 	D3D11_TEXTURE2D_DESC src_desc = {};
 	decoded->GetDesc(&src_desc);
-	// KNOWN LIMITATION: the MF backend now negotiates DXGI_FORMAT_P010 for
-	// 10-bit HEVC sources regardless of which Import Path is active (see
-	// mf_backend.cpp). This path does not handle P010 yet, so a 10-bit clip
-	// routed here drops every frame (silently, via the invalid PlaneTextures
-	// below) instead of presenting anything. Not a concern today — this path
-	// is hard-disabled (kVulkanZeroCopyEnabled = false in
-	// surface_importer_factory_windows.cpp) until godot-proposals#13969 lands,
-	// and the CPU-Copy Path (the default) handles P010 correctly.
-	if (src_desc.Format != DXGI_FORMAT_NV12) {
-		ERR_PRINT("DXGI importer: decoder texture is not NV12.");
+	const bool is_10bit = src_desc.Format == DXGI_FORMAT_P010;
+	if (!is_10bit && src_desc.Format != DXGI_FORMAT_NV12) {
+		ERR_PRINT("DXGI importer: decoder texture is not NV12 or P010.");
 		return out;
 	}
 	const UINT width = src_desc.Width;
 	const UINT height = src_desc.Height;
 
-	// --- 1. Create a fresh shareable NV12 texture on OUR D3D device. ---
+	// --- 1. Create a fresh shareable texture of the decoder's format on OUR
+	// D3D device. ---
 	D3D11_TEXTURE2D_DESC shared_desc = {};
 	shared_desc.Width = width;
 	shared_desc.Height = height;
 	shared_desc.MipLevels = 1;
 	shared_desc.ArraySize = 1;
-	shared_desc.Format = DXGI_FORMAT_NV12;
+	shared_desc.Format = src_desc.Format;
 	shared_desc.SampleDesc.Count = 1;
 	shared_desc.Usage = D3D11_USAGE_DEFAULT;
 	shared_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -296,7 +299,7 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 
 	ComPtr<ID3D11Texture2D> shared_tex;
 	if (FAILED(impl->interop.device()->CreateTexture2D(&shared_desc, nullptr, shared_tex.put()))) {
-		ERR_PRINT("DXGI importer: shareable NV12 texture create failed.");
+		ERR_PRINT("DXGI importer: shareable texture create failed.");
 		return out;
 	}
 
@@ -354,9 +357,9 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 		return out;
 	}
 
-	// Create the placeholder VkImage describing the shared NV12 layout. We use a
-	// dedicated allocation (required for imported D3D11 textures) and a multi-
-	// planar NV12 format so each plane aspect can be viewed with its own format.
+	// Create the placeholder VkImage describing the shared NV12/P010 layout. We
+	// use a dedicated allocation (required for imported D3D11 textures) and a
+	// multi-planar format so each plane aspect can be viewed with its own format.
 	VkExternalMemoryImageCreateInfo ext_img = {};
 	ext_img.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
 	ext_img.handleTypes = handle_type;
@@ -366,10 +369,13 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	img_info.pNext = &ext_img;
 	// NOT disjoint: the imported D3D11 texture is one dedicated allocation, and a
 	// disjoint image would require per-plane vkBindImageMemory2. MUTABLE_FORMAT is
-	// required to create per-plane views (R8/RG8) that differ from the image format.
+	// required to create per-plane views (R8/RG8 or R16/RG16) that differ from
+	// the image format.
 	img_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	img_info.imageType = VK_IMAGE_TYPE_2D;
-	img_info.format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM; // NV12
+	img_info.format = is_10bit
+			? VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16 // P010
+			: VK_FORMAT_G8_B8R8_2PLANE_420_UNORM; // NV12
 	img_info.extent = { width, height, 1 };
 	img_info.mipLevels = 1;
 	img_info.arrayLayers = 1;
@@ -434,15 +440,19 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 
 	// --- 4. Hand the VkImage to Godot RD as two plane textures. We pass the
 	// VkImage handle to texture_create_from_extension; RD builds a texture that
-	// aliases it. The luma view reads PLANE_0 (R8), chroma reads PLANE_1 (RG8 at
-	// half resolution). RD's from-extension import takes one native image; we
-	// import the same VkImage twice with the two plane formats so the existing
-	// nv12_to_rgb.glsl (which samples a luma R8 + chroma RG8) is reused unchanged.
+	// aliases it. The luma view reads PLANE_0 (R8/R16), chroma reads PLANE_1
+	// (RG8/RG16 at half resolution). RD's from-extension import takes one native
+	// image; we import the same VkImage twice with the two plane formats so the
+	// shared present shaders (which sample a luma R + chroma RG pair) are reused
+	// unchanged. For P010 the 16-bit views read the plane words as-is, i.e.
+	// left-justified codes — sample_scale below tells the shader (see the file
+	// header).
 	const int64_t vk_image_handle = reinterpret_cast<int64_t>(vk_image);
 
 	RID luma = rd->texture_create_from_extension(
 			RenderingDevice::TEXTURE_TYPE_2D,
-			RenderingDevice::DATA_FORMAT_R8_UNORM,
+			is_10bit ? RenderingDevice::DATA_FORMAT_R16_UNORM
+					 : RenderingDevice::DATA_FORMAT_R8_UNORM,
 			RenderingDevice::TEXTURE_SAMPLES_1,
 			RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT,
 			vk_image_handle,
@@ -451,7 +461,8 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 			1, 1);
 	RID chroma = rd->texture_create_from_extension(
 			RenderingDevice::TEXTURE_TYPE_2D,
-			RenderingDevice::DATA_FORMAT_R8G8_UNORM,
+			is_10bit ? RenderingDevice::DATA_FORMAT_R16G16_UNORM
+					 : RenderingDevice::DATA_FORMAT_R8G8_UNORM,
 			RenderingDevice::TEXTURE_SAMPLES_1,
 			RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT,
 			vk_image_handle,
@@ -475,6 +486,9 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	out.chroma = chroma;
 	out.width = static_cast<int>(width);
 	out.height = static_cast<int>(height);
+	// P010's plane views read left-justified codes (code << 6); 1/64 recovers
+	// the right-justified value the shared shaders expect (see file header).
+	out.sample_scale = is_10bit ? 1.0f / 64.0f : 1.0f;
 
 	// --- 5. Keyed-mutex handoff hooks for the present pipeline. acquire() waits
 	// the Vulkan side's key (1, set by ReleaseSync above) before the compute

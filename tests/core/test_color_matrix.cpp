@@ -305,3 +305,29 @@ TEST_CASE("Full-range vs video-range: Y=0 in full maps to RGB near black") {
 	CHECK(std::fabs(g - 0.0) < kTol);
 	CHECK(std::fabs(b - 0.0) < kTol);
 }
+
+// -----------------------------------------------------------------------
+// 10-bit code recovery through sample_scale (PlaneTextures / push constant).
+//
+// The shader recovers a 10-bit code from a sampled UNORM texel as
+// `texel * 65535 * sample_scale` (float32, same as the GPU). Two storage
+// conventions feed it:
+//   - right-justified (CPU-Copy pack, D3D12 plane-split, Metal x420):
+//     texel = code / 65535, sample_scale = 1.0
+//   - left-justified P010 aliased directly by the DXGI/Vulkan plane views:
+//     texel = (code << 6) / 65535, sample_scale = 1/64
+// Both must round back to the exact code for every 10-bit value.
+// -----------------------------------------------------------------------
+TEST_CASE("10-bit code recovery: right-justified and left-justified conventions") {
+	for (int code = 0; code < 1024; ++code) {
+		// Right-justified 10-in-16 (sample_scale = 1.0).
+		const float right_texel = static_cast<float>(code) / 65535.0f;
+		const float right_recovered = right_texel * 65535.0f * 1.0f;
+		CHECK(std::fabs(right_recovered - code) < 0.01);
+
+		// Left-justified P010 word (sample_scale = 1/64).
+		const float left_texel = static_cast<float>(code << 6) / 65535.0f;
+		const float left_recovered = left_texel * 65535.0f * (1.0f / 64.0f);
+		CHECK(std::fabs(left_recovered - code) < 0.01);
+	}
+}

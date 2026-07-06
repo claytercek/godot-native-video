@@ -33,9 +33,15 @@ layout(push_constant, std430) uniform Params {
 	uint bit_depth;      // 8 or 10
 	uint transfer_select; // 0=Unspecified, 1=BT.709, 2=PQ, 3=HLG
 	uint primaries_select; // (unused in HDR mode — no gamut conversion)
-	uint pad0; // explicit pad to a 16-byte multiple: pre-4.7 Godot rounds the
-	           // required push-constant size up to 32, 4.7+ validates the exact
-	           // declared size — 8 uints satisfies both
+	float sample_scale; // 10-bit code recovery: code = texel * 65535 * sample_scale.
+	                    // 1.0 for every path that stores right-justified codes;
+	                    // 1/64 for the Vulkan Zero-Copy Path's P010 import, whose
+	                    // plane views alias left-justified P010 memory
+	                    // (surface_importer.h).
+	                    // Occupying the former pad slot keeps the block a 16-byte
+	                    // multiple: pre-4.7 Godot rounds the required
+	                    // push-constant size up to 32, 4.7+ validates the exact
+	                    // declared size — 32 bytes satisfies both.
 } params;
 
 void main() {
@@ -52,9 +58,9 @@ void main() {
 	// ---- Range normalisation ----
 	float yf, cb, cr;
 	if (params.bit_depth == 10u) {
-		float y10 = y * 65535.0;
-		float cb10 = cbcr.r * 65535.0;
-		float cr10 = cbcr.g * 65535.0;
+		float y10 = y * 65535.0 * params.sample_scale;
+		float cb10 = cbcr.r * 65535.0 * params.sample_scale;
+		float cr10 = cbcr.g * 65535.0 * params.sample_scale;
 		if (params.range_select <= 1u) {
 			yf = (y10 - 64.0) / 876.0;
 			cb = (cb10 - 512.0) / 896.0;
