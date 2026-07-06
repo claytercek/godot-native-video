@@ -97,8 +97,8 @@ public:
 	// Returns a Dictionary with the parsed/negotiated colorimetry.
 	// Callable after load() succeeds (i.e. after open but before play).
 	// Untagged clips return BT.709 video-range defaults.
-	// When output_mode is HDR, the returned dictionary includes an
-	// "output_mode" key set to 1.
+	// The returned dictionary always includes an "output_mode" key (0 or 1)
+	// reporting the pipeline's effective output mode.
 	godot::Dictionary get_color_info() const;
 
 protected:

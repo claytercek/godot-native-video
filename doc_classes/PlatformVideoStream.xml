@@ -11,25 +11,17 @@
 	<tutorials>
 	</tutorials>
 	<methods>
-		<method name="get_color_info">
-			<return type="Dictionary" />
-			<description>
-				Returns a [Dictionary] with the parsed/negotiated colorimetry metadata for the most recently opened clip. The dictionary contains the following keys:
-				[code]matrix[/code] (int): YCbCr matrix — 0=Unspecified, 1=BT.709, 2=BT.601, 3=BT.2020.
-				[code]primaries[/code] (int): Color primaries — 0=Unspecified, 1=BT.709, 2=BT.601-625 (PAL), 3=BT.601-525 (NTSC), 4=BT.2020, 5=DCI-P3.
-				[code]transfer[/code] (int): Transfer function — 0=Unspecified, 1=BT.709, 2=PQ (SMPTE ST 2084), 3=HLG.
-				[code]range[/code] (int): Video range — 0=Unspecified, 1=Video (limited), 2=Full.
-				[code]bit_depth[/code] (int): Bits per channel (8 for 8-bit sources, 10 for 10-bit sources).
-				Untagged clips (no embedded colorimetry metadata) return BT.709, video-range defaults, which is pixel-identical to the legacy hard-coded conversion shader.
-				Must be called after [method VideoStreamPlayback.play] has started, i.e. after the stream has been opened by [VideoStreamPlayer].
-			</description>
-		</method>
 		<method name="hdr_decode_supported" qualifiers="static">
 			<return type="bool" />
 			<description>
-				Returns [code]true[/code] when the current platform supports hardware decoding of 10-bit (and HDR) video, matching the source's bit depth instead of down-converting to 8-bit. On macOS, [method hdr_decode_supported] always returns [code]true[/code] because the Metal-accelerated VideoToolbox can produce 10-bit biplanar surfaces (x420) that the Metal surface importer imports directly (zero-copy). On Windows, it also returns [code]true[/code]: Media Foundation negotiates 10-bit (P010) decoder output for 10-bit HEVC sources, and the default CPU-Copy Import Path (stock Vulkan driver) splits it into R16/RG16 planes and reaches the GPU via a readback rather than a zero-copy import. The zero-copy D3D12/DXGI Import Paths do not yet handle P010 and will drop 10-bit frames on that path — a known limitation, not a concern for the default configuration. On Linux, this returns [code]false[/code] — only 8-bit NV12 decode is supported there in this release.
+				Returns [code]true[/code] when the current platform supports hardware decoding of 10-bit (and HDR) video, matching the source's bit depth instead of down-converting to 8-bit. On macOS, [method hdr_decode_supported] always returns [code]true[/code] because the Metal-accelerated VideoToolbox can produce 10-bit biplanar surfaces (x420) that the Metal surface importer imports directly (zero-copy). On Windows, it also returns [code]true[/code]: Media Foundation negotiates 10-bit (P010) decoder output for 10-bit HEVC sources, and all three Windows Import Paths handle P010 — the default CPU-Copy Import Path (stock Vulkan driver) splits it into R16/RG16 planes and reaches the GPU via a readback, while the zero-copy DXGI/Vulkan and D3D12 Import Paths import the same P010 surface directly as 16-bit (R16/RG16) plane views with no CPU readback. On Linux, this returns [code]false[/code] — only 8-bit NV12 decode is supported there in this release.
 				Call this before loading a clip to decide whether to offer HDR playback options in the UI, or to present an informative message when the clip's bit depth exceeds the platform's decode capability.
 			</description>
 		</method>
 	</methods>
+	<members>
+		<member name="output_mode" type="int" setter="set_output_mode" getter="get_output_mode" default="0">
+			Selects the pipeline's output mode: [code]0[/code] for SDR (RGBA8) or [code]1[/code] for HDR (RGBA16F, scene-linear, 1.0 = 203-nit Reference White). Mirrors [member PlatformVideoStreamPlayback.output_mode] on every playback instantiated from this stream — set it here rather than on the playback directly so the stream resource and its live playbacks stay in sync.
+		</member>
+	</members>
 </class>
