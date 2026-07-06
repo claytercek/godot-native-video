@@ -74,6 +74,7 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_scrubber.cpp",
         "tests/core/test_color_matrix.cpp",
         "tests/core/test_hdr_color_math.cpp",
+        "tests/core/test_colorimetry.cpp",
         "src/core/decode_scheduler.cpp",
     ]
     # The force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG.
