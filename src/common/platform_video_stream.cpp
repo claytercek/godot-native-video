@@ -27,9 +27,14 @@ bool PlatformVideoStream::hdr_decode_supported() {
 	// CVMetalTextureCache. Return true unconditionally: every Metal-capable
 	// Mac (Intel since 2012, all Apple Silicon) supports this path.
 	return true;
+#elif defined(_WIN32)
+	// Windows Media Foundation negotiates P010 output for 10-bit HEVC (Main10)
+	// sources on every Import Path (CPU-Copy readback by default; the
+	// zero-copy DXGI/D3D12 paths when enabled), matching the source instead
+	// of down-converting to 8-bit NV12.
+	return true;
 #else
-	// Other platforms (Windows w/ DXGI->Vulkan, Linux) do not yet support
-	// the 10-bit decode path. Return false.
+	// Linux does not yet support the 10-bit decode path. Return false.
 	return false;
 #endif
 }

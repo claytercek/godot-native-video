@@ -5,10 +5,11 @@
 //
 // The Windows analog of avf::AvfBackend. Implements core::Backend by driving an
 // IMFSourceReader as a pure hardware decoder, configured with an
-// IMFDXGIDeviceManager so video frames decode directly into D3D11 NV12 textures
-// (DXGI_FORMAT_NV12) and audio into interleaved float32 PCM. It produces native
-// surface handles only (native_handle == ID3D11Texture2D*); it does NOT import
-// to the GPU and references NO Godot / RenderingDevice symbols.
+// IMFDXGIDeviceManager so video frames decode directly into D3D11 textures
+// matching the source's bit depth (DXGI_FORMAT_NV12 for 8-bit, DXGI_FORMAT_P010
+// for 10-bit HEVC Main10) and audio into interleaved float32 PCM. It produces
+// native surface handles only (native_handle == ID3D11Texture2D*); it does NOT
+// import to the GPU and references NO Godot / RenderingDevice symbols.
 //
 // The implementation lives in mf_backend.cpp and uses Media Foundation / D3D11
 // directly. This header is plain C++20 (no Windows headers) so the rest of the
@@ -62,6 +63,7 @@ public:
 	core::ColorPrimaries color_primaries() const override;
 	core::TransferFunction transfer_function() const override;
 	core::ColorRange color_range() const override;
+	int bit_depth() const override;
 
 private:
 	class Impl;

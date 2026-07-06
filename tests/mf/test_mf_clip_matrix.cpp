@@ -43,32 +43,46 @@ struct ColorimetryExpect {
 	core::ColorPrimaries primaries = core::ColorPrimaries::BT709;
 	core::TransferFunction transfer = core::TransferFunction::BT709;
 	core::ColorRange range = core::ColorRange::Video;
+	int bit_depth = 8;
 };
 
 bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) {
+	// HEVC Main10 SDR clip. Negotiates as 10-bit (P010); the bit depth is
+	// detected from the native type's MF_MT_MPEG2_PROFILE. The 'colr' box is
+	// absent for this encode, so open-time colorimetry stays at the BT.709
+	// video-range defaults.
+	if (file == "hevc_main10_30_mp4.mp4") {
+		out.matrix = core::ColorMatrix::BT709;
+		out.primaries = core::ColorPrimaries::BT709;
+		out.transfer = core::TransferFunction::BT709;
+		out.range = core::ColorRange::Video;
+		out.bit_depth = 10;
+		return true;
+	}
 	// HDR10 clip: PQ transfer, BT.2020 primaries, BT.2020 non-constant
 	// luminance matrix. The 'colr' box IS present for this HEVC encode, so MF
-	// reports the real tags even though decode stays 8-bit NV12 (no P010
-	// negotiation yet).
+	// reports the real tags. 10-bit (P010), same Main10 profile as the SDR row.
 	if (file == "hevc_pq_bt2020_30_mp4.mp4") {
 		out.matrix = core::ColorMatrix::BT2020;
 		out.primaries = core::ColorPrimaries::BT2020;
 		out.transfer = core::TransferFunction::PQ;
 		out.range = core::ColorRange::Video;
+		out.bit_depth = 10;
 		return true;
 	}
 	// HLG clip: HLG transfer, BT.2020 primaries, BT.2020 non-constant luminance
-	// matrix.
+	// matrix. 10-bit (P010).
 	if (file == "hevc_hlg_bt2020_30_mp4.mp4") {
 		out.matrix = core::ColorMatrix::BT2020;
 		out.primaries = core::ColorPrimaries::BT2020;
 		out.transfer = core::TransferFunction::HLG;
 		out.range = core::ColorRange::Video;
+		out.bit_depth = 10;
 		return true;
 	}
 
-	// Untagged (including hevc_main10, whose 'colr' box is absent) — defaults.
-	// h264_30_bt601_mp4.mp4 also falls here: its H.264 SPS VUI carries
+	// Untagged — defaults (8-bit NV12).
+	// h264_30_bt601_mp4.mp4 falls here too: its H.264 SPS VUI carries
 	// matrix_coefficients = smpte170m, but ffmpeg's mp4 muxer does not emit
 	// the ISOBMFF 'colr' box for this encode, and Media Foundation's mp4
 	// source surfaces colorimetry only from that container-level box (it
@@ -102,6 +116,13 @@ void check_colorimetry(core::ColorMatrix matrix, core::ColorPrimaries primaries,
 void check_backend_colorimetry(mf::MfBackend &backend, const std::string &file) {
 	check_colorimetry(backend.ycbcr_matrix(), backend.color_primaries(),
 			backend.transfer_function(), backend.color_range(), file);
+
+	ColorimetryExpect exp;
+	if (!expect_colorimetry(file, exp)) {
+		CHECK(backend.bit_depth() == 8);
+		return;
+	}
+	CHECK(backend.bit_depth() == exp.bit_depth);
 }
 
 // Assert that the first decoded frame's per-frame colorimetry matches the
@@ -192,7 +213,18 @@ TEST_CASE("MF backend decodes the real-clip format matrix") {
 		double max_drift = 0.0;
 		bool first_frame = true;
 		while (auto frame = backend.next_video_frame()) {
-			CHECK(frame->pixel_format == core::PixelFormat::NV12);
+			// 8-bit sources negotiate NV12; 10-bit HEVC Main10 sources negotiate
+			// P010, tagged x420 (the same logical 16-bit-biplanar tag the AVF
+			// backend uses).
+			ColorimetryExpect exp;
+			const bool is_10bit = expect_colorimetry(clip.file, exp) && exp.bit_depth >= 10;
+			if (is_10bit) {
+				CHECK(frame->pixel_format == core::PixelFormat::x420);
+				CHECK(frame->bit_depth == 10);
+			} else {
+				CHECK(frame->pixel_format == core::PixelFormat::NV12);
+				CHECK(frame->bit_depth == 8);
+			}
 			CHECK(frame->native_handle != nullptr);
 			CHECK(frame->width == clip.width);
 			CHECK(frame->height == clip.height);

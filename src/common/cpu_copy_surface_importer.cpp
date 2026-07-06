@@ -1,6 +1,7 @@
 // -----------------------------------------------------------------------
-// cpu_copy_surface_importer.cpp — GPU->CPU readback NV12 D3D11 texture -> RD
-// textures (Windows CPU-Copy Import Path). See cpu_copy_surface_importer.h.
+// cpu_copy_surface_importer.cpp — GPU->CPU readback of an NV12 or P010 D3D11
+// texture -> RD textures (Windows CPU-Copy Import Path). See
+// cpu_copy_surface_importer.h.
 //
 // The readback ring, in detail:
 //
@@ -20,15 +21,25 @@
 //   handed to import(): a fixed, permanent presentation lag traded for never
 //   stalling the render thread on Map().
 //
-//   Mapping an NV12 staging texture returns ONE pointer for the whole
+//   Mapping an NV12/P010 staging texture returns ONE pointer for the whole
 //   resource: the Y (luma) plane's rows starting at pData with stride
 //   RowPitch, and the interleaved UV (chroma) plane starting immediately
 //   after all of the Y plane's rows, at pData + RowPitch * height, using the
-//   SAME RowPitch (NV12 is semi-planar: both planes share one physical
-//   texture's row stride). Both planes are copied row-by-row into tightly
-//   packed buffers because RowPitch is generally wider than the plane's exact
-//   byte width (driver row alignment) while RD::texture_update expects tightly
-//   packed pixel data.
+//   SAME RowPitch (both formats are semi-planar: both planes share one
+//   physical texture's row stride). Both planes are copied row-by-row into
+//   tightly packed buffers because RowPitch is generally wider than the
+//   plane's exact byte width (driver row alignment) while RD::texture_update
+//   expects tightly packed pixel data.
+//
+//   P010 bit justification: each 10-bit sample is stored left-justified in a
+//   16-bit word (10 valid bits in the high bits, 6 zero bits at the bottom —
+//   value = code << 6), the opposite convention from CoreVideo's x420 (the
+//   AVF backend's 10-bit format), which stores the code value right-justified
+//   in the low 10 bits. The shared present shader (nv12_to_rgb.glsl) assumes
+//   the x420 convention — it recovers the code value as `sampled * 65535.0`
+//   directly — so the 10-bit packing path below shifts every sample right by
+//   6 while copying, producing the same right-justified layout the shader
+//   already expects on both platforms.
 //
 // NOTE ON "CPU COPY": this is the one Import Path permitted, by design, to
 // violate the zero-copy contract. The row-packing loop below is exactly the
@@ -69,6 +80,7 @@ struct CpuCopySurfaceImporter::Impl {
 		ComPtr<ID3D11Texture2D> staging;
 		int width = 0;
 		int height = 0;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 		bool has_data = false; // true once a CopySubresourceRegion has targeted it
 	};
 
@@ -134,8 +146,9 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 
 	D3D11_TEXTURE2D_DESC src_desc = {};
 	decoded->GetDesc(&src_desc);
-	if (src_desc.Format != DXGI_FORMAT_NV12) {
-		ERR_PRINT("CPU-copy importer: decoder texture is not NV12.");
+	const bool is_10bit = src_desc.Format == DXGI_FORMAT_P010;
+	if (!is_10bit && src_desc.Format != DXGI_FORMAT_NV12) {
+		ERR_PRINT("CPU-copy importer: decoder texture is not NV12 or P010.");
 		return out;
 	}
 	const UINT width = src_desc.Width;
@@ -148,13 +161,14 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 	// --- Queue this frame's GPU-side readback into the ring slot that has the
 	// most time left before it is read (see the file header). No CPU copy here.
 	Impl::ReadbackSlot &write = impl->ring[write_slot];
-	if (!write.staging || write.width != static_cast<int>(width) || write.height != static_cast<int>(height)) {
+	if (!write.staging || write.width != static_cast<int>(width) ||
+			write.height != static_cast<int>(height) || write.format != src_desc.Format) {
 		D3D11_TEXTURE2D_DESC desc = {};
 		desc.Width = width;
 		desc.Height = height;
 		desc.MipLevels = 1;
 		desc.ArraySize = 1;
-		desc.Format = DXGI_FORMAT_NV12;
+		desc.Format = src_desc.Format;
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_STAGING;
 		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -166,6 +180,7 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 		write.staging = std::move(tex);
 		write.width = static_cast<int>(width);
 		write.height = static_cast<int>(height);
+		write.format = src_desc.Format;
 	}
 	impl->context->CopySubresourceRegion(
 			write.staging.get(), 0, 0, 0, 0,
@@ -189,10 +204,10 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 	const int chroma_width = luma_width / 2;
 	const int chroma_height = luma_height / 2;
 
-	// The CPU copy this Import Path exists to make: pack the mapped
-	// rows (RowPitch may exceed the plane's tight row width) into tightly
-	// packed buffers RD::texture_update accepts.
-	auto pack_plane_rows = [](const uint8_t *src, UINT row_pitch, int row_bytes, int rows) {
+	// 8-bit path: the CPU copy this Import Path exists to make — pack the
+	// mapped rows (RowPitch may exceed the plane's tight row width) into
+	// tightly packed buffers RD::texture_update accepts.
+	auto pack_plane_rows_8bit = [](const uint8_t *src, UINT row_pitch, int row_bytes, int rows) {
 		PackedByteArray out_bytes;
 		out_bytes.resize(row_bytes * rows);
 		uint8_t *dst = out_bytes.ptrw();
@@ -202,12 +217,37 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 		return out_bytes;
 	};
 
-	const auto *luma_src = static_cast<const uint8_t *>(mapped.pData);
-	PackedByteArray luma_bytes = pack_plane_rows(luma_src, mapped.RowPitch, luma_width, luma_height);
+	// 10-bit path: P010 samples are 16-bit words, left-justified (see the file
+	// header). Pack tightly AND shift every sample right by 6 so the R16/RG16
+	// textures we hand the shader carry the same right-justified 10-bit-in-16
+	// layout as macOS x420 — no shader change needed on either platform.
+	auto pack_plane_rows_10bit = [](const uint8_t *src, UINT row_pitch, int samples_per_row, int rows) {
+		PackedByteArray out_bytes;
+		out_bytes.resize(static_cast<int64_t>(samples_per_row) * rows * sizeof(uint16_t));
+		auto *dst = reinterpret_cast<uint16_t *>(out_bytes.ptrw());
+		for (int y = 0; y < rows; ++y) {
+			const auto *src_row = reinterpret_cast<const uint16_t *>(src + static_cast<size_t>(y) * row_pitch);
+			uint16_t *dst_row = dst + static_cast<size_t>(y) * samples_per_row;
+			for (int x = 0; x < samples_per_row; ++x) {
+				dst_row[x] = static_cast<uint16_t>(src_row[x] >> 6);
+			}
+		}
+		return out_bytes;
+	};
 
-	const int chroma_row_bytes = chroma_width * 2; // interleaved U/V, one byte each
+	const auto *luma_src = static_cast<const uint8_t *>(mapped.pData);
 	const uint8_t *chroma_src = luma_src + mapped.RowPitch * luma_height;
-	PackedByteArray chroma_bytes = pack_plane_rows(chroma_src, mapped.RowPitch, chroma_row_bytes, chroma_height);
+
+	PackedByteArray luma_bytes, chroma_bytes;
+	if (is_10bit) {
+		luma_bytes = pack_plane_rows_10bit(luma_src, mapped.RowPitch, luma_width, luma_height);
+		// Interleaved U16+V16 per chroma sample.
+		chroma_bytes = pack_plane_rows_10bit(chroma_src, mapped.RowPitch, chroma_width * 2, chroma_height);
+	} else {
+		luma_bytes = pack_plane_rows_8bit(luma_src, mapped.RowPitch, luma_width, luma_height);
+		// Interleaved U8+V8 per chroma sample.
+		chroma_bytes = pack_plane_rows_8bit(chroma_src, mapped.RowPitch, chroma_width * 2, chroma_height);
+	}
 
 	impl->context->Unmap(read.staging.get(), 0);
 
@@ -232,11 +272,18 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 	Ref<RDTextureView> view;
 	view.instantiate();
 
+	const RenderingDevice::DataFormat luma_fmt = is_10bit
+			? RenderingDevice::DATA_FORMAT_R16_UNORM
+			: RenderingDevice::DATA_FORMAT_R8_UNORM;
+	const RenderingDevice::DataFormat chroma_fmt = is_10bit
+			? RenderingDevice::DATA_FORMAT_R16G16_UNORM
+			: RenderingDevice::DATA_FORMAT_R8G8_UNORM;
+
 	RID luma = rd->texture_create(
-			make_plane_format(RenderingDevice::DATA_FORMAT_R8_UNORM, luma_width, luma_height), view,
+			make_plane_format(luma_fmt, luma_width, luma_height), view,
 			TypedArray<PackedByteArray>());
 	RID chroma = rd->texture_create(
-			make_plane_format(RenderingDevice::DATA_FORMAT_R8G8_UNORM, chroma_width, chroma_height), view,
+			make_plane_format(chroma_fmt, chroma_width, chroma_height), view,
 			TypedArray<PackedByteArray>());
 	if (!luma.is_valid() || !chroma.is_valid()) {
 		free_plane_rids(rd, luma, chroma);
