@@ -16,9 +16,7 @@
 // objects hide behind a PImpl exactly as the AVFoundation reader hides behind
 // AvfBackend::Impl.
 //
-// STATUS: implemented but UNVERIFIED — written and self-reviewed on a macOS
-// host with no Windows toolchain. Compiles/links/runs only on Windows; see the
-// commit body for the exact verification steps.
+// STATUS: VERIFIED on Windows 11. See mf_backend.cpp for the exact coverage.
 // -----------------------------------------------------------------------
 
 #include "backend.h" // core::Backend, VideoFrame, AudioChunk, PixelFormat
@@ -58,6 +56,12 @@ public:
 	// end-of-stream). Lets the integration test assert "no decode errors",
 	// mirroring AvfBackend::had_error().
 	bool had_error() const;
+
+	// --- Colorimetry (populated at open from the negotiated media type) ---
+	core::ColorMatrix ycbcr_matrix() const override;
+	core::ColorPrimaries color_primaries() const override;
+	core::TransferFunction transfer_function() const override;
+	core::ColorRange color_range() const override;
 
 private:
 	class Impl;

@@ -5,7 +5,11 @@
 // Structural mirror of tests/avf/test_avf_clip_matrix.mm. Drives every clip in
 // tests/fixtures/matrix/matrix.list through mf::MfBackend and asserts the same
 // real-world decode contract (dimensions exact, decode success, frame count
-// +/-1, AAC stereo @ 48 kHz, monotonic PTS, PTS drift within half a frame).
+// +/-1, AAC stereo @ 48 kHz, monotonic PTS, PTS drift within half a frame) plus
+// colorimetry: per-clip matrix/primaries/transfer/range assertions, keyed by
+// clip filename. Untagged clips default to BT.709 video-range (pixel-identical
+// to the old hard-coded constants). PQ/HLG BT.2020 clips report their real
+// tags; see the BT.601 row note below for a platform gap.
 //
 // WINDOWS-ONLY: the body is under #if _WIN32 and is compiled only by
 // `scons target=mf_tests platform=windows`. Clips missing because
@@ -29,6 +33,83 @@
 #include <string>
 
 namespace {
+
+// -----------------------------------------------------------------------
+// Colorimetry expectations per clip filename.
+// Untagged clips are not listed here; they must default to BT.709 video range.
+// -----------------------------------------------------------------------
+struct ColorimetryExpect {
+	core::ColorMatrix matrix = core::ColorMatrix::BT709;
+	core::ColorPrimaries primaries = core::ColorPrimaries::BT709;
+	core::TransferFunction transfer = core::TransferFunction::BT709;
+	core::ColorRange range = core::ColorRange::Video;
+};
+
+bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) {
+	// HDR10 clip: PQ transfer, BT.2020 primaries, BT.2020 non-constant
+	// luminance matrix. The 'colr' box IS present for this HEVC encode, so MF
+	// reports the real tags even though decode stays 8-bit NV12 (no P010
+	// negotiation yet).
+	if (file == "hevc_pq_bt2020_30_mp4.mp4") {
+		out.matrix = core::ColorMatrix::BT2020;
+		out.primaries = core::ColorPrimaries::BT2020;
+		out.transfer = core::TransferFunction::PQ;
+		out.range = core::ColorRange::Video;
+		return true;
+	}
+	// HLG clip: HLG transfer, BT.2020 primaries, BT.2020 non-constant luminance
+	// matrix.
+	if (file == "hevc_hlg_bt2020_30_mp4.mp4") {
+		out.matrix = core::ColorMatrix::BT2020;
+		out.primaries = core::ColorPrimaries::BT2020;
+		out.transfer = core::TransferFunction::HLG;
+		out.range = core::ColorRange::Video;
+		return true;
+	}
+
+	// Untagged (including hevc_main10, whose 'colr' box is absent) — defaults.
+	// h264_30_bt601_mp4.mp4 also falls here: its H.264 SPS VUI carries
+	// matrix_coefficients = smpte170m, but ffmpeg's mp4 muxer does not emit
+	// the ISOBMFF 'colr' box for this encode, and Media Foundation's mp4
+	// source surfaces colorimetry only from that container-level box (it
+	// does not parse SPS VUI itself the way AVFoundation's demuxer does). So
+	// on the MF backend this clip is indistinguishable from an untagged
+	// clip — a real platform gap, not a bug in this backend.
+	return false;
+}
+
+// Assert that a matrix/primaries/transfer/range tuple matches the expectation
+// for `file` (or the BT.709 video-range defaults for an untagged clip). Shared
+// by the open-time backend check and the per-frame check below so both cover
+// all four fields identically.
+void check_colorimetry(core::ColorMatrix matrix, core::ColorPrimaries primaries,
+		core::TransferFunction transfer, core::ColorRange range, const std::string &file) {
+	ColorimetryExpect exp;
+	if (!expect_colorimetry(file, exp)) {
+		CHECK(matrix == core::ColorMatrix::BT709);
+		CHECK(primaries == core::ColorPrimaries::BT709);
+		CHECK(transfer == core::TransferFunction::BT709);
+		CHECK(range == core::ColorRange::Video);
+		return;
+	}
+	CHECK(matrix == exp.matrix);
+	CHECK(primaries == exp.primaries);
+	CHECK(transfer == exp.transfer);
+	CHECK(range == exp.range);
+}
+
+// Assert that the backend's open-time colorimetry matches expectations.
+void check_backend_colorimetry(mf::MfBackend &backend, const std::string &file) {
+	check_colorimetry(backend.ycbcr_matrix(), backend.color_primaries(),
+			backend.transfer_function(), backend.color_range(), file);
+}
+
+// Assert that the first decoded frame's per-frame colorimetry matches the
+// same expectations (the MF backend tags every frame from the stream-level
+// negotiated values; see mf_backend.cpp's read_colorimetry).
+void check_frame_colorimetry(const core::VideoFrame &frame, const std::string &file) {
+	check_colorimetry(frame.ycbcr_matrix, frame.primaries, frame.transfer, frame.range, file);
+}
 
 // GitHub-hosted Windows runners (and many headless Windows Server images) do
 // not ship a Media Foundation HEVC decoder MFT — it is an optional, licensed
@@ -100,17 +181,26 @@ TEST_CASE("MF backend decodes the real-clip format matrix") {
 		CHECK(backend.audio_sample_rate() == clip.audio_rate);
 		CHECK(backend.audio_channel_count() == clip.audio_channels);
 
+		// --- Colorimetry: open-time values ---
+		check_backend_colorimetry(backend, clip.file);
+
 		const double interval = 1.0 / static_cast<double>(clip.fps);
 		const double budget = interval * 0.5;
 
 		int video_count = 0;
 		double last_pts = -1.0;
 		double max_drift = 0.0;
+		bool first_frame = true;
 		while (auto frame = backend.next_video_frame()) {
 			CHECK(frame->pixel_format == core::PixelFormat::NV12);
 			CHECK(frame->native_handle != nullptr);
 			CHECK(frame->width == clip.width);
 			CHECK(frame->height == clip.height);
+
+			if (first_frame) {
+				check_frame_colorimetry(*frame, clip.file);
+				first_frame = false;
+			}
 
 			CHECK(frame->pts_seconds >= last_pts);
 			last_pts = frame->pts_seconds;
