@@ -6,14 +6,15 @@
 // The zero-copy present pipeline imports a hardware-decoded biplanar Y'CbCr
 // surface (NV12 8-bit, or P010/x420 10-bit) into Godot's RenderingDevice as
 // two plane textures (luma R8/R16 + chroma RG8/RG16; 10-bit samples
-// right-justified in the 16-bit formats) WITHOUT any CPU copy, then runs the
-// single NV12->RGB compute pass. The *mechanism* of that import is
+// right-justified in the 16-bit formats unless the importer declares
+// otherwise via PlaneTextures::sample_scale) WITHOUT any CPU copy, then runs
+// the single NV12->RGB compute pass. The *mechanism* of that import is
 // platform-specific:
 //
 //   - macOS:   CVPixelBuffer IOSurface -> MTLTexture (CVMetalTextureCache)
 //              -> RenderingDevice::texture_create_from_extension.
 //              (MetalSurfaceImporter, metal_surface_importer.mm)
-//   - Windows (Vulkan RD): ID3D11Texture2D NV12 -> DXGI NT shared handle
+//   - Windows (Vulkan RD): ID3D11Texture2D NV12/P010 -> DXGI NT shared handle
 //              -> Vulkan VK_KHR_external_memory_win32 image
 //              -> RenderingDevice::texture_create_from_extension.
 //              (DxgiSurfaceImporter, dxgi_surface_importer.cpp)
@@ -68,6 +69,16 @@ struct PlaneTextures {
 	godot::RID chroma; // RG8 (8-bit) or RG16 (10-bit), half resolution
 	int width = 0;     // luma (frame) width
 	int height = 0;    // luma (frame) height
+
+	// Multiplier the present shader applies when recovering 10-bit code values
+	// from a sampled plane texel: code = texel * 65535 * sample_scale. Every
+	// Import Path that materialises its planes (CPU-Copy pack, D3D12
+	// plane-split compute, Metal x420) stores right-justified codes and leaves
+	// this at 1.0. The one exception is DxgiSurfaceImporter's P010 import: its
+	// R16/RG16 plane views alias the decoder's P010 memory directly, so texels
+	// arrive left-justified (code << 6) and the importer reports 1/64 here
+	// instead of paying a rescale pass. Ignored for 8-bit planes.
+	float sample_scale = 1.0f;
 
 	// Frees the RD texture RIDs and releases the native import wrappers.
 	// Call exactly once (the retire-ring does this after N frames).

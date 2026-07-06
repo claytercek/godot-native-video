@@ -231,11 +231,11 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		return false;
 	}
 
-	// Push constant: output dimensions + colorimetry + bit depth. std430 — seven
-	// uint32 + one pad uint = 32 bytes. The pad keeps the block a 16-byte
-	// multiple: pre-4.7 Godot rounds the required push-constant size up to 32,
-	// 4.7+ validates the exact declared size, and 32 satisfies both. Both SDR
-	// and HDR shaders share the same push-constant layout.
+	// Push constant: output dimensions + colorimetry + bit depth + the
+	// importer's 10-bit sample scale. std430 — seven uint32 + one float = 32
+	// bytes, a 16-byte multiple: pre-4.7 Godot rounds the required
+	// push-constant size up to 32, 4.7+ validates the exact declared size, and
+	// 32 satisfies both. Both SDR and HDR shaders share the same layout.
 	PackedByteArray pc;
 	pc.resize(32);
 	pc.fill(0);
@@ -248,6 +248,7 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		const uint32_t depth = static_cast<uint32_t>(frame.bit_depth);
 		const uint32_t transfer = static_cast<uint32_t>(frame.transfer);
 		const uint32_t primaries = static_cast<uint32_t>(frame.primaries);
+		const float sample_scale = planes.sample_scale;
 		memcpy(w + 0, &ow, sizeof(uint32_t));
 		memcpy(w + 4, &oh, sizeof(uint32_t));
 		memcpy(w + 8, &matrix, sizeof(uint32_t));
@@ -255,6 +256,7 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		memcpy(w + 16, &depth, sizeof(uint32_t));
 		memcpy(w + 20, &transfer, sizeof(uint32_t));
 		memcpy(w + 24, &primaries, sizeof(uint32_t));
+		memcpy(w + 28, &sample_scale, sizeof(float));
 	}
 
 	// On platforms that share the decoder surface across two GPU APIs, wait for

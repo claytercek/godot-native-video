@@ -4,22 +4,24 @@
 // dxgi_surface_importer.h — Windows half of the zero-copy import.
 //
 // The Windows analog of metal_surface_importer. It takes a hardware-decoded
-// NV12 ID3D11Texture2D (from the Media Foundation Backend) and produces two
-// Godot RenderingDevice plane textures — luma (R8) and chroma (RG8) — that the
-// SAME nv12_to_rgb.glsl compute pass consumes, WITHOUT any CPU copy of the
-// pixel data.
+// NV12 or P010 ID3D11Texture2D (from the Media Foundation Backend) and
+// produces two Godot RenderingDevice plane textures — luma (R8/R16) and
+// chroma (RG8/RG16) — that the SAME nv12_to_rgb.glsl compute pass consumes,
+// WITHOUT any CPU copy of the pixel data. (P010 plane views read
+// left-justified codes; the import reports PlaneTextures::sample_scale = 1/64
+// so the shader recovers the code values — see the .cpp header.)
 //
 // Mechanism (documented in the .cpp; UNVERIFIED on a macOS host):
 //   1. Godot's RenderingDevice on Windows is Vulkan. We obtain its VkDevice /
 //      VkPhysicalDevice / VkInstance via RenderingDevice::get_driver_resource.
 //   2. The MF decoder hands us an ID3D11Texture2D that is NOT shareable, so we
-//      blit (GPU-side, no CPU copy) the decoded NV12 slice into an
-//      importer-owned D3D11 NV12 texture created with
+//      blit (GPU-side, no CPU copy) the decoded slice into an importer-owned
+//      D3D11 texture of the same format created with
 //      D3D11_RESOURCE_MISC_SHARED_NTHANDLE | ..._SHARED_KEYEDMUTEX.
 //   3. We open that texture's DXGI NT shared handle in Vulkan via
 //      VK_KHR_external_memory_win32 to get a VkImage aliasing the same GPU
 //      memory, then import that VkImage into Godot RD via
-//      texture_create_from_extension (one per NV12 plane / aspect).
+//      texture_create_from_extension (one per plane / aspect).
 //   4. A DXGI keyed mutex (or external semaphore) serializes the D3D11 blit
 //      against the Vulkan compute pass so neither side reads a surface the other
 //      is still writing. The present pipeline drives this via PlaneTextures
@@ -64,14 +66,14 @@ public:
 
 	bool is_initialized() const override;
 
-	// Import the NV12 ID3D11Texture2D (passed as an opaque void* ==
+	// Import the NV12 or P010 ID3D11Texture2D (passed as an opaque void* ==
 	// ID3D11Texture2D*) into two RD plane textures, zero-copy (GPU-only). Returns
 	// an invalid PlaneTextures on failure. The importer does NOT take ownership of
 	// the decoder texture; the caller's VideoFrame::release still owns it.
 	//
 	// `plane_slice` is the texture-array slice holding THIS frame: DXVA decoder
-	// MFTs pack decoded frames as slices of one shared NV12 texture array, and
-	// the MF backend records the slice index per frame (see surface_importer.h).
+	// MFTs pack decoded frames as slices of one shared texture array, and the
+	// MF backend records the slice index per frame (see surface_importer.h).
 	PlaneTextures import(void *d3d11_texture, uint32_t plane_slice) override;
 
 private:
