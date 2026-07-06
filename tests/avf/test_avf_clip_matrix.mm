@@ -99,21 +99,22 @@ static bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) 
 // Assert that the backend's open-time colorimetry matches expectations.
 static void check_backend_colorimetry(avf::AvfBackend &backend,
 		const std::string &file) {
+	const core::Colorimetry color = backend.colorimetry();
 	ColorimetryExpect exp;
 	if (!expect_colorimetry(file, exp)) {
 		// Untagged clip: assert defaults (BT.709 video range).
-		CHECK(backend.ycbcr_matrix() == core::ColorMatrix::BT709);
-		CHECK(backend.color_primaries() == core::ColorPrimaries::BT709);
-		CHECK(backend.transfer_function() == core::TransferFunction::BT709);
-		CHECK(backend.color_range() == core::ColorRange::Video);
-		CHECK(backend.bit_depth() == 8);
+		CHECK(color.matrix == core::ColorMatrix::BT709);
+		CHECK(color.primaries == core::ColorPrimaries::BT709);
+		CHECK(color.transfer == core::TransferFunction::BT709);
+		CHECK(color.range == core::ColorRange::Video);
+		CHECK(color.bit_depth == 8);
 		return;
 	}
-	CHECK(backend.ycbcr_matrix() == exp.matrix);
-	CHECK(backend.color_primaries() == exp.primaries);
-	CHECK(backend.transfer_function() == exp.transfer);
-	CHECK(backend.color_range() == exp.range);
-	CHECK(backend.bit_depth() == exp.bit_depth);
+	CHECK(color.matrix == exp.matrix);
+	CHECK(color.primaries == exp.primaries);
+	CHECK(color.transfer == exp.transfer);
+	CHECK(color.range == exp.range);
+	CHECK(color.bit_depth == exp.bit_depth);
 }
 
 // True for clips whose format description carries explicit colorimetry tags
@@ -139,8 +140,8 @@ static void check_frame_colorimetry(const core::VideoFrame &frame,
 	ColorimetryExpect exp;
 	expect_colorimetry(file, exp);
 	// Tagged clip: CV attachments carry the exact metadata.
-	CHECK(static_cast<int>(frame.ycbcr_matrix) == static_cast<int>(exp.matrix));
-	CHECK(static_cast<int>(frame.range) == static_cast<int>(exp.range));
+	CHECK(static_cast<int>(frame.color.matrix) == static_cast<int>(exp.matrix));
+	CHECK(static_cast<int>(frame.color.range) == static_cast<int>(exp.range));
 }
 
 TEST_CASE("AVF backend decodes the real-clip format matrix") {
@@ -190,10 +191,10 @@ TEST_CASE("AVF backend decodes the real-clip format matrix") {
 			const bool is_10bit = expect_colorimetry(clip.file, exp) && exp.bit_depth >= 10;
 			if (is_10bit) {
 				CHECK(frame->pixel_format == core::PixelFormat::x420);
-				CHECK(frame->bit_depth == 10);
+				CHECK(frame->color.bit_depth == 10);
 			} else {
 				CHECK(frame->pixel_format == core::PixelFormat::NV12);
-				CHECK(frame->bit_depth == 8);
+				CHECK(frame->color.bit_depth == 8);
 			}
 			CHECK(frame->native_handle != nullptr);
 			CHECK(frame->width == clip.width);
