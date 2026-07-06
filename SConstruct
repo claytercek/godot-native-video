@@ -44,6 +44,23 @@ if ARGUMENTS.get("target", "") == "core_tests":
     else:
         core_env.Append(CXXFLAGS=["-std=c++20", "-Wall", "-Wextra"])
     core_env.Append(CPPPATH=["#src/core", "#src/common", "#tests/core/vendor"])
+    # Embed the NV12->RGB compute shader source into a test-only header so
+    # test_color_matrix.cpp can regression-test the actual shader SOURCE TEXT
+    # (not just a hand-reimplemented C++ reference) against the ITU-derived
+    # coefficients. Only the SDR variant is embedded — the SDR and HDR headers
+    # both come from this same nv12_to_rgb.glsl source (differing only in the
+    # injected HDR_OUTPUT define), so the matrix-selection code under test is
+    # identical between them.
+    python_exe = '"%s"' % sys.executable
+    shader_header_dir = "build/gen_tests/src/common"
+    shader_header = shader_header_dir + "/nv12_to_rgb_shader.h"
+    shader_header_target = core_env.Command(
+        target=shader_header,
+        source="src/common/nv12_to_rgb.glsl",
+        action=python_exe + " tools/embed_shader.py $SOURCE $TARGET",
+    )
+    core_env.Depends(shader_header, "src/common/hdr_color_math.glsl")
+    core_env.Append(CPPPATH=[shader_header_dir])
     core_sources = [
         "tests/core/main.cpp",
         "tests/core/test_frame_queue.cpp",
@@ -76,6 +93,11 @@ if ARGUMENTS.get("target", "") == "core_tests":
             core_env.Append(CXXFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer", "-g"])
             core_env.Append(LINKFLAGS=["-fsanitize=address"])
     core_tests = core_env.Program("bin/core_tests", core_sources)
+    # Belt-and-suspenders: make sure the generated shader header exists before
+    # anything in core_tests compiles. The implicit CPPPATH include scanner
+    # normally finds this on its own once the Command node is in the graph,
+    # but an explicit Depends is cheap insurance for a clean build.
+    core_env.Depends(core_tests, shader_header_target)
     Default(core_tests)
     # Skip the rest — godot-cpp is not needed.
     Return()
