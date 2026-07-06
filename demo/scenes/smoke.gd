@@ -16,6 +16,11 @@ extends Control
 #   display transfer function. An HDR clip with supra-white highlights shows
 #   the extended range; an SDR clip in HDR mode is linearized onto the same
 #   scale so both render correctly in the same HDR viewport.
+#
+#   The mode is driven through the PlatformVideoStream resource
+#   (player.stream.set_output_mode), which forwards to the live playback.
+#   Stock Godot 4.4/4.5 has no VideoStreamPlayer.get_stream_playback(), so the
+#   playback object is only used opportunistically for richer color info.
 
 @onready var player: VideoStreamPlayer = $VideoStreamPlayer
 @onready var status: Label = $Status
@@ -31,6 +36,8 @@ extends Control
 
 var hdr_mode: bool = false
 var playback = null
+# Whether the loaded stream exposes set_output_mode (probed once per load).
+var output_mode_supported: bool = false
 
 
 func _ready() -> void:
@@ -49,8 +56,8 @@ func _on_toggle_output_mode() -> void:
 	# correct display transfer function for the HDR output.
 	get_viewport().use_hdr_2d = hdr_mode
 
-	if playback != null:
-		playback.set_output_mode(int(hdr_mode))
+	if output_mode_supported:
+		player.stream.set_output_mode(int(hdr_mode))
 
 	_set_status("Output mode: %s  use_hdr_2d: %s" % [
 		"HDR" if hdr_mode else "SDR",
@@ -65,14 +72,21 @@ func _load_clip(path: String) -> void:
 		return
 	player.stream = stream
 	player.play()
+
+	# The Output Mode toggle drives the stream resource, which forwards to the
+	# live playback — no get_stream_playback() needed (absent in Godot 4.4/4.5).
+	output_mode_supported = stream.has_method("set_output_mode")
+	output_mode_btn.disabled = not output_mode_supported
+	if not output_mode_supported:
+		_set_status("Playing %s\n%s" % [path, _toggle_unavailable_msg()])
+		return
 	_set_status("Playing %s" % path)
 
-	# Grab the playback object so we can toggle output_mode.
-	# VideoStreamPlayer.get_stream_playback() is available in Godot 4.4+.
+	# Opportunistically grab the playback object for richer color info.
+	# VideoStreamPlayer.get_stream_playback() only exists in newer Godot
+	# builds; the mode display below does not depend on it.
 	if player.has_method("get_stream_playback"):
 		playback = player.get_stream_playback()
-		if playback != null and playback.has_method("set_output_mode"):
-			output_mode_btn.disabled = false
 
 
 func _process(_delta: float) -> void:
@@ -80,12 +94,23 @@ func _process(_delta: float) -> void:
 		var tex_ok = "ok" if player.get_video_texture() != null else "null"
 		var info = ""
 		if playback != null and playback.has_method("get_color_info"):
+			# Richer color info when a playback object is reachable.
 			info = "  mode=%s" % playback.get_color_info().get("output_mode", "?")
-		_set_status("Playing  pos=%.2fs  tex=%s%s" % [
+		elif player.stream.has_method("get_output_mode"):
+			# No playback object (Godot 4.4/4.5) — read the mode off the stream.
+			info = "  mode=%s" % player.stream.get_output_mode()
+		var msg := "Playing  pos=%.2fs  tex=%s%s" % [
 			player.stream_position,
 			tex_ok,
 			info,
-		])
+		]
+		if not output_mode_supported:
+			msg += "\n" + _toggle_unavailable_msg()
+		_set_status(msg)
+
+
+func _toggle_unavailable_msg() -> String:
+	return "Output Mode toggle unavailable: stream is %s, which does not expose set_output_mode" % player.stream.get_class()
 
 
 func _set_status(msg: String) -> void:
