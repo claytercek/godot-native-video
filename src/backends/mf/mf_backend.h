@@ -4,7 +4,7 @@
 // mf_backend.h — Windows Media Foundation Backend in Decoder mode.
 //
 // The Windows analog of avf::AvfBackend. Implements core::Backend by driving an
-// IMFSourceReader as a pure hardware decoder (ADR-0001), configured with an
+// IMFSourceReader as a pure hardware decoder, configured with an
 // IMFDXGIDeviceManager so video frames decode directly into D3D11 NV12 textures
 // (DXGI_FORMAT_NV12) and audio into interleaved float32 PCM. It produces native
 // surface handles only (native_handle == ID3D11Texture2D*); it does NOT import

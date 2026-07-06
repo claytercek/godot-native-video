@@ -24,21 +24,20 @@ enum class PixelFormat : uint8_t {
 // lifetime is managed by the hardware decode pool. The Engine Core
 // imports it via RenderingDevice::texture_create_from_extension; it
 // never copies the pixel data to CPU RAM.
-//
-// In unit tests a cpu_pixels span may substitute for the native handle.
 // -----------------------------------------------------------------------
 struct VideoFrame {
 	// Presentation timestamp in seconds.
 	double pts_seconds = 0.0;
 
 	// Native surface handle (e.g. CVPixelBufferRef on Apple, ID3D11Texture2D*
-	// on Windows). Null when cpu_pixels is populated instead (test/fallback).
-	// The Backend retains ownership; the caller must call release() when done.
+	// on Windows). The Backend retains ownership; the caller must call
+	// release() when done.
 	void *native_handle = nullptr;
 
-	// For test/fallback paths: raw pixel bytes, format described by pixel_format.
-	const uint8_t *cpu_pixels = nullptr;
-	size_t cpu_pixels_size = 0;
+	// The decoder texture-array slice holding THIS frame. DXVA decoders pack
+	// decoded frames as slices of one shared texture array; 0 on platforms
+	// whose handles are per-frame (e.g. macOS CVPixelBuffer).
+	uint32_t plane_slice = 0;
 
 	int width = 0;
 	int height = 0;

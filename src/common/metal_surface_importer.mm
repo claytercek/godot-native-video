@@ -205,9 +205,11 @@ PlaneTextures MetalSurfaceImporter::import(void *cv_pixel_buffer, uint32_t /*pla
 
 // -----------------------------------------------------------------------
 // Platform factory (macOS build). The Windows build provides its own
-// definition of make_surface_importer() in dxgi_surface_importer.cpp; exactly
-// one is compiled per platform (the SConstruct picks the right source set), so
-// the present pipeline links against the correct importer without any #ifdef.
+// definition of make_surface_importer() in surface_importer_factory_windows.cpp
+// (it picks between D3D12SurfaceImporter, DxgiSurfaceImporter, and
+// CpuCopySurfaceImporter at runtime); exactly one definition is linked per
+// platform (the SConstruct picks the right source set), so the present
+// pipeline links against the correct importer without any #ifdef.
 // -----------------------------------------------------------------------
 std::unique_ptr<SurfaceImporter> make_surface_importer() {
 	return std::make_unique<MetalSurfaceImporter>();

@@ -1,5 +1,5 @@
 // -----------------------------------------------------------------------
-// present_pipeline.cpp — zero-copy NV12->RGB present pipeline (ADR-0003).
+// present_pipeline.cpp — zero-copy NV12->RGB present pipeline.
 // -----------------------------------------------------------------------
 
 #include "present_pipeline.h"
@@ -89,7 +89,7 @@ bool PresentPipeline::build_resources(int width, int height) {
 	ERR_FAIL_NULL_V_MSG(rs, false, "RenderingServer unavailable");
 	rd_ = rs->get_rendering_device();
 	ERR_FAIL_NULL_V_MSG(rd_, false,
-			"No RenderingDevice — requires a Forward+/Mobile renderer (ADR-0002).");
+			"No RenderingDevice — requires a Forward+/Mobile renderer.");
 
 	// Build the per-platform surface importer (Metal on macOS, DXGI->Vulkan on
 	// Windows) lazily, then bind it to Godot's RD.
@@ -181,10 +181,9 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	// Import the decoder surface zero-copy into two RD plane textures. No CPU
 	// copy happens here — the importer aliases the decoder's surface memory
 	// (CVMetalTextureCache on macOS; a Vulkan image opened from the DXGI shared
-	// handle on Windows). cpu_pixels_size carries the texture-array slice index
-	// on Windows (see surface_importer.h); the Metal importer ignores it.
-	PlaneTextures planes = importer_->import(
-			frame.native_handle, static_cast<uint32_t>(frame.cpu_pixels_size));
+	// handle on Windows). plane_slice is the texture-array slice index on
+	// Windows (see surface_importer.h); the Metal importer ignores it.
+	PlaneTextures planes = importer_->import(frame.native_handle, frame.plane_slice);
 	if (!planes.valid()) {
 		// Import failed (wrong format / non-Metal). Retire the frame now.
 		if (frame.release) {
@@ -248,10 +247,14 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		memset(w + 8, 0, 8);
 	}
 
-	// On platforms that share the decoder surface across two GPU APIs (Windows:
-	// D3D11 decoder <-> Vulkan present), acquire the DXGI keyed mutex so the
-	// decoder cannot recycle/overwrite the surface while we sample it. No-op on
-	// macOS (acquire is null — one shared Metal device, no cross-API handoff).
+	// On platforms that share the decoder surface across two GPU APIs, wait for
+	// the exporting side's work to be visible before we sample it: a CPU-blocking
+	// wait on a shared D3D11/D3D12 fence on the D3D12 RD path (may stall this
+	// thread until the D3D11 plane-split compute pass finishes on the GPU), or a
+	// DXGI keyed mutex acquire on DxgiSurfaceImporter's Vulkan zero-copy path.
+	// No-op on the CPU-Copy Import Path and on macOS (acquire is null: no
+	// cross-API handoff needed, either because there's nothing left for the GPU
+	// to do by the time this runs, or because one shared Metal device is used).
 	if (planes.acquire) {
 		planes.acquire();
 	}
@@ -278,6 +281,12 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	// Texture2DRD keeps its RenderingServer-side RID stable across this call, so
 	// the player's cached draw commands keep working; only the contents swap.
 	current_texture_->set_texture_rd_rid(slot.rgba_rid);
+
+	// Count this frame if the CPU-Copy Import Path produced the
+	// planes we just sampled. Stays 0 for the zero-copy importers.
+	if (!importer_->is_zero_copy()) {
+		++cpu_copy_count_;
+	}
 
 	// Park this frame's surfaces in the retire-ring for kFrameLatency frames.
 	// We bundle: the transient plane textures + CVMetalTexture wrappers, the

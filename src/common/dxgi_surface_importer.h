@@ -35,9 +35,9 @@
 // pipeline parks that closure in the retire-ring for N frames so the GPU is done
 // sampling before teardown.
 //
-// STATUS: implemented but NOT compiled/run/verified — no Windows toolchain on
-// the authoring host. The GPU-interop chain is novel (see the parent PRD: this
-// is a Human-in-the-Loop slice) and needs on-device visual + correctness checks.
+// STATUS: implemented and verified end-to-end on real hardware, but
+// hard-disabled at the factory — see surface_importer_factory_windows.cpp for
+// why and when to re-enable.
 // -----------------------------------------------------------------------
 
 #include <cstdint>

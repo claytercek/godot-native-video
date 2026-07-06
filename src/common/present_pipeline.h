@@ -1,22 +1,26 @@
 #pragma once
 
 // -----------------------------------------------------------------------
-// present_pipeline.h — the zero-copy NV12->RGB present pipeline (ADR-0003).
+// present_pipeline.h — the zero-copy NV12->RGB present pipeline.
 //
 // Owns, on Godot's RenderingDevice:
 //   - the NV12->RGB compute shader + pipeline + sampler,
 //   - an N-buffered ring of engine-owned RGBA8 storage textures, exposed
 //     through ONE stable Texture2DRD that Godot samples (see get_texture()),
-//   - a SurfaceImporter (Metal on macOS, DXGI->Vulkan on Windows; chosen by the
-//     make_surface_importer() factory) that turns a decoder surface into two RD
-//     plane textures with no CPU copy,
+//   - a SurfaceImporter (Metal on macOS; one of three Windows Import Paths
+//     chosen by the make_surface_importer() factory, see surface_importer.h)
+//     that turns a decoder surface into two RD plane textures — zero-copy on
+//     every path except the Windows CPU-Copy Import Path,
 //   - a RetireRing<N> that holds each frame's transient surfaces for N
 //     rendered frames so the GPU never reads a freed surface.
 //
 // present(frame) runs ONE compute dispatch (NV12->RGB) into the next ring
-// slot and returns the matching Texture2DRD via get_texture(). There is NO
-// Image / ImageTexture / memcpy on this path — the only data movement is on
-// the GPU. A debug cpu_copy_count() counter stays at 0 to make that auditable.
+// slot and returns the matching Texture2DRD via get_texture(). On the two
+// zero-copy Import Paths there is NO Image / ImageTexture / memcpy on this
+// path — the only data movement is on the GPU, and the debug cpu_copy_count()
+// counter stays at 0. On the Windows CPU-Copy Import Path
+// cpu_copy_count() increments once per frame that path presents, so the
+// exception stays auditable.
 // -----------------------------------------------------------------------
 
 #include <cstdint>
@@ -77,8 +81,10 @@ public:
 		return current_texture_;
 	}
 
-	// Debug instrumentation: number of CPU pixel copies performed on the present
-	// path. MUST stay 0 — the perf contract (ADR-0003) forbids CPU copies.
+	// Debug instrumentation: number of frames presented via a CPU pixel copy.
+	// The perf contract forbids CPU copies on the D3D12 and Vulkan
+	// zero-copy Import Paths, so this MUST stay 0 for those; the Windows
+	// CPU-Copy Import Path is the one documented exception.
 	uint64_t cpu_copy_count() const { return cpu_copy_count_; }
 
 	// Tear down all RD resources and drain the retire-ring.
@@ -115,7 +121,7 @@ private:
 	int height_ = 0;
 	bool ready_ = false;
 
-	uint64_t cpu_copy_count_ = 0; // invariant: always 0 on the present path
+	uint64_t cpu_copy_count_ = 0; // invariant: 0 on the two zero-copy Import Paths
 };
 
 } // namespace platform_media

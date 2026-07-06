@@ -41,45 +41,65 @@ Highlights:
 
 ## Scope
 
-v1 targets the **8-bit SDR core matrix**:
+v1 targets the **8-bit SDR core matrix**, tested identically on macOS and
+Windows:
 
-- **Codecs:** H.264, HEVC.
-- **Containers:** MP4, MOV.
+- **Codecs:** H.264, HEVC (with the per-platform caveat below).
+- **Containers:** MP4, MOV — the loader registers `.mp4`, `.mov`, and `.m4v`.
 - **Pixel format:** NV12, BT.709.
 - **Audio:** AAC, stereo.
 
-At runtime the extension will attempt to play whatever the OS can decode, but only
-the matrix above is tested and contractually supported. **Out of scope for v1:**
-10-bit / HDR (P010, PQ/HLG), VP9/AV1, and multi-track audio — these are tracked as
-follow-ups.
+Decoding is delegated to the OS, so what actually plays depends on the
+platform — and on Windows, on the machine:
+
+| Codec | macOS (AVFoundation) | Windows (Media Foundation)                     |
+| ----- | -------------------- | ---------------------------------------------- |
+| H.264 | Built in             | Built in                                       |
+| HEVC  | Built in             | Requires an HEVC decoder MFT — typically the "HEVC Video Extensions" Microsoft Store package. Not present on server SKUs and some desktops. |
+
+Beyond the matrix, the extension will attempt to play anything the OS can
+decode, as long as it arrives in one of the registered container extensions
+above. Such content may well work, but only the matrix is tested and
+contractually supported. **Out of scope for v1:** 10-bit / HDR (P010,
+PQ/HLG), VP9/AV1, and multi-track audio — these are tracked as follow-ups.
 
 ## Platform Support
 
 | Platform | Framework                | Status                                       |
 | -------- | ------------------------ | -------------------------------------------- |
 | macOS    | AVFoundation             | Supported                                    |
-| Windows  | Windows Media Foundation | Decode verified; present path blocked (§below) |
+| Windows  | Windows Media Foundation | Supported ([details](#windows))              |
 | Linux    | GStreamer vs VA-API      | Deferred (decision pending)                  |
 
-### Windows status (QA'd on-device, 2026-07)
+### Windows
 
-The Media Foundation backend is **verified on real hardware**: the full
-`mf_tests` suite passes (synthetic clip + real-clip matrix, H.264 & HEVC
-hardware decode, NV12 D3D11 textures, monotonic PTS, float32 PCM), the
-extension builds and loads in Godot 4.4.1, and playback (loader → backend →
-clock → frame queue) runs end-to-end in the demo.
+Hardware decode is identical on every Windows setup and **verified on real
+hardware**: the full `mf_tests` suite passes (synthetic clip + real-clip
+matrix, H.264 & HEVC hardware decode, NV12 D3D11 textures, monotonic PTS,
+float32 PCM), and playback runs end-to-end in the demo.
 
-The final present step — importing the decoded D3D11 NV12 surface into Godot's
-Vulkan device via `VK_KHR_external_memory_win32` — is **blocked by stock
-Godot**: the engine does not enable that device extension (any version through
-master) and a GDExtension cannot request additional device extensions. Frames
-decode but no texture reaches the screen. Options under evaluation:
+What varies is the **present path** — how decoded frames reach Godot's
+renderer. It is chosen once at runtime from
+`RenderingServer::get_current_rendering_driver_name()` +
+`Engine::get_version_info()` — never as separate build variants, and never a
+try-and-fail probe:
 
-1. **Upstream Godot PR** enabling the external-memory extensions in the Vulkan
-   driver (the existing importer then works as designed).
-2. **A D3D12 importer** targeting Godot's D3D12 rendering driver (Godot 4.5+
-   implements `texture_create_from_extension` there; D3D11↔D3D12 NT-handle
-   sharing needs no extension gating).
+| Your setup                          | Present path     | Zero-copy | Notes                                            |
+| ----------------------------------- | ---------------- | --------- | ------------------------------------------------ |
+| Godot 4.5+, `d3d12` driver          | D3D12 import     | Yes       | **Recommended.** Verified on-device, pixel-correct. |
+| Any Godot, stock `vulkan` driver    | CPU-copy fallback | No        | Verified on-device. Adds one GPU→CPU readback per frame. |
+| Godot patched with PR #114940, `vulkan` | DXGI zero-copy import | Yes  | Built and verified, but hard-disabled on stock Godot (see below). |
+
+**Recommendation:** run Godot 4.5+ with the D3D12 rendering driver. On stock
+Vulkan you still get full hardware decode, but with a per-frame GPU→CPU
+readback before present — the sole, explicit exception to the zero-copy
+contract, and the only drawback of that path.
+
+The Vulkan zero-copy path stays hard-disabled on stock Godot because the
+engine does not enable `VK_KHR_external_memory_win32` on its Vulkan device,
+and even with PR #114940, `texture_create_from_extension`'s hardcoded `COLOR`
+aspect mis-binds the NV12 plane views until godot-proposals#13969 lands
+upstream.
 
 ## Installation
 
@@ -101,11 +121,9 @@ TODO
    scons target=[template_debug|template_release] platform=[macos|windows]
    ```
 
-   On Windows the DXGI→Vulkan importer needs the Vulkan headers and loader
-   import library. Install the [LunarG Vulkan SDK](https://vulkan.lunarg.com/)
-   (its installer sets `VULKAN_SDK`, which SConstruct picks up), or point
-   `VULKAN_SDK` at any directory containing `Include/vulkan/*.h` and
-   `Lib/vulkan-1.lib`.
+   No SDK installs are required: the Vulkan headers the Windows build needs
+   come from the `thirdparty/vulkan-headers` submodule, and the Vulkan loader
+   is resolved from `vulkan-1.dll` at runtime rather than linked.
 
 3. **Run the demo**:
 
@@ -128,11 +146,13 @@ runtime dependency**:
 - `tools/gen_test_media.sh` — synthetic clip with a burned-in per-frame index
   marker and a per-frame sync tone, for deterministic frame/sync assertions.
 - `tools/gen_clip_matrix.sh` — the small real-clip format matrix (H.264/HEVC,
-  24/30/60 fps, MP4/MOV, AAC stereo) consumed by the backend coverage tests.
+  24/30/60 fps, MP4/MOV/M4V, AAC stereo) consumed by the backend coverage
+  tests.
   Nothing is committed: this script is the single source of truth, regenerating
   the clips **and** the manifests (`matrix.list`, parsed by the tests, plus a
-  `matrix.json` mirror) into `tests/fixtures/matrix/`. CI and local runs invoke
-  it before the backend tests.
+  `matrix.json` mirror) into `tests/fixtures/matrix/`. Local runs invoke it
+  before the backend tests; CI generates the media once in a dedicated job
+  (cached across runs) and shares it with the backend jobs as an artifact.
 
 ### Repository Structure
 
@@ -146,3 +166,5 @@ runtime dependency**:
   tests.
 - `demo/` — test Godot project.
 - `godot-cpp/` — Godot C++ bindings (submodule).
+- `thirdparty/vulkan-headers/` — Khronos Vulkan headers (submodule; used by the
+  Windows build only).

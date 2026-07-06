@@ -19,7 +19,7 @@ namespace core {
 // Threading: this is intended for a single producer (decode pump) and single
 // consumer (mix), but unlike FrameQueue it is NOT lock-free — in the binding,
 // audio is pumped and drained from the same place inside _update on the main
-// thread for this slice (the shared decode-worker pool is a later slice, g1c).
+// thread for this slice (the shared decode-worker pool is a later slice).
 // A small ring of plain floats is enough; we guard nothing here and document
 // the single-thread assumption.
 //

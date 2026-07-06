@@ -91,6 +91,12 @@ core::Clock *PlatformVideoStreamPlayback::master() const {
 	return mono_clock_.get();
 }
 
+bool PlatformVideoStreamPlayback::audio_exhausted() const {
+	// True when no real audio samples will ever advance the clock again:
+	// silent clips, and a shorter audio track once it has fully drained.
+	return !has_audio_ || (audio_eos_ && audio_ring_ && audio_ring_->empty());
+}
+
 void PlatformVideoStreamPlayback::fill_audio() {
 	if (!stream_ || !audio_ring_ || audio_eos_) {
 		return;
@@ -116,9 +122,9 @@ void PlatformVideoStreamPlayback::fill_audio() {
 	});
 }
 
-void PlatformVideoStreamPlayback::drive_audio() {
+bool PlatformVideoStreamPlayback::drive_audio() {
 	if (!audio_ring_ || !audio_clock_ || channels_ <= 0) {
-		return;
+		return false;
 	}
 
 	// Offer up to a render-tick worth of audio per call. We request exactly the
@@ -154,12 +160,13 @@ void PlatformVideoStreamPlayback::drive_audio() {
 	// `accepted`), but a tiny amount of audio is lost. In practice mix_audio
 	// accepts the full request, and `request` is capped to what is buffered, so
 	// this only bites under sustained AudioServer back-pressure. Tolerable for
-	// linear playback; the shared decode-pool slice (g1c) can re-offer instead.
+	// linear playback; the shared decode-pool slice can re-offer instead.
 	const int accepted = mix_audio(request, mix_buffer_, 0);
 	const int advance = std::min<int>(accepted, static_cast<int>(real_frames));
 	if (advance > 0) {
 		audio_clock_->on_audio_mixed(advance);
 	}
+	return advance > 0;
 }
 
 void PlatformVideoStreamPlayback::_play() {
@@ -303,12 +310,12 @@ void PlatformVideoStreamPlayback::_seek(double time) {
 }
 
 void PlatformVideoStreamPlayback::_set_audio_track(int /*idx*/) {
-	// Single-track audio only in v1; audio output lands in the A/V-sync slice (dte).
+	// Single-track audio only in v1; audio output lands in the A/V-sync slice.
 }
 
 Ref<Texture2D> PlatformVideoStreamPlayback::_get_texture() const {
 	// The engine-owned RGBA Texture2DRD. Godot samples ONLY this — never the
-	// decoder surface (ADR-0003).
+	// decoder surface.
 	return present_.get_texture();
 }
 
@@ -330,16 +337,18 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 	}
 	core::DecodeScheduler &sched = core::DecodeScheduler::instance();
 
+	// One clock rule: advance from real audio samples when any exist; once no
+	// more can ever come (silent clip, or a shorter audio track fully drained —
+	// legitimate in real-world files), advance by the render delta instead. The
+	// gate on !advanced_from_audio keeps the last partial ring drain from
+	// double-advancing (real leftover frames + delta on the same tick).
+	bool advanced_from_audio = false;
 	if (has_audio_) {
-		// Audio-master path: keep the audio ring fed, then drain it into Godot's
-		// AudioServer. drive_audio() advances the master clock from the samples
-		// actually consumed (the audio clock IS the master here — ADR-0001).
 		fill_audio();
-		drive_audio();
-	} else {
-		// Silent clip: advance the monotonic clock by the render delta so the
-		// video still plays at the correct rate.
-		clock->advance(delta);
+		advanced_from_audio = drive_audio();
+	}
+	if (!advanced_from_audio && audio_exhausted()) {
+		clock->set_time(clock->media_time() + delta);
 	}
 	const double now = clock->media_time();
 
@@ -393,8 +402,7 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 
 	// End-of-playback: video stream drained (Backend EOS + empty queue) and audio
 	// fully consumed. at_end() reflects the worker-reported EOS for our stream.
-	const bool audio_done = !has_audio_ || (audio_eos_ && audio_ring_ && audio_ring_->empty());
-	if (sched.at_end(stream_) && audio_done) {
+	if (sched.at_end(stream_) && audio_exhausted()) {
 		playing_ = false;
 	}
 }

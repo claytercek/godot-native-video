@@ -2,8 +2,7 @@
 #version 450
 
 // -----------------------------------------------------------------------
-// nv12_to_rgb.glsl — the single GPU pass of the zero-copy present pipeline
-// (ADR-0003).
+// nv12_to_rgb.glsl — the single GPU pass of the zero-copy present pipeline.
 //
 // Inputs are the two planes of a hardware-decoded NV12 surface, imported
 // zero-copy from the decoder's CVPixelBuffer/IOSurface via

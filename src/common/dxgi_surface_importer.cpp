@@ -5,6 +5,8 @@
 // The interop chain (the "DXGI dance"), in order:
 //
 //   open() once:
+//     - Load vulkan-1.dll and resolve the loader entry points (no link-time
+//       Vulkan dependency — see VK_NO_PROTOTYPES below).
 //     - Pull Godot's VkInstance / VkPhysicalDevice / VkDevice out of RD.
 //     - Create our OWN ID3D11Device on the same adapter Godot's Vulkan device
 //       runs on (matched by LUID) so the shared handle is openable cross-API.
@@ -13,7 +15,7 @@
 //   import(frame) per frame:
 //     1. Decoder hands us an NV12 ID3D11Texture2D (possibly a texture-array
 //        slice). It is NOT shareable, so we GPU-blit (CopySubresourceRegion —
-//        no CPU copy) the slice into a pooled, shareable NV12 texture created
+//        no CPU copy) the slice into a fresh shareable NV12 texture created
 //        with SHARED_NTHANDLE | SHARED_KEYEDMUTEX, sized to the frame.
 //     2. Acquire the shared texture's IDXGIKeyedMutex on the D3D side (key 0),
 //        do the blit, then ReleaseSync to key 1 — handing the surface to Vulkan.
@@ -31,37 +33,24 @@
 //
 //   release closure (parked in the retire-ring for N frames):
 //     free the RD textures, destroy the VkImages + imported VkDeviceMemory, and
-//     return the pooled shared texture for reuse.
+//     drop the shared texture + keyed mutex.
 //
-// NOTE ON "ZERO COPY": ADR-0003 forbids CPU copies on the present path, not GPU
+// NOTE ON "ZERO COPY": the perf contract forbids CPU copies on the present
+// path, not GPU
 // blits. The one CopySubresourceRegion here is a GPU->GPU copy required only
 // because MF decoder textures are not directly shareable; it never touches the
 // CPU and so does not violate the zero-CPU-copy contract. cpu_copy_count() stays
 // 0. (A future optimization could request shareable decoder textures and drop
 // even this GPU blit.)
 //
-// STATUS (verified on-device 2026-07-03, AMD Radeon RX Vega, Win 11):
-//   - Stock Godot (<= 4.5, master): BLOCKED. initialize() fails at the
-//     vkGetMemoryWin32HandlePropertiesKHR resolve because Godot never enables
-//     VK_KHR_external_memory_win32 on its Vulkan device and provides no way to
-//     request it.
-//   - Godot PR #114940 (adds project setting rendering/rendering_device/vulkan/
-//     additional_device_extensions; demo/project.godot requests the extension):
-//     the FULL import chain below runs and end-to-end zero-copy playback was
-//     verified visually — with ONE remaining engine gap:
-//     RenderingDevice::texture_create_from_extension hardcodes
-//     VK_IMAGE_ASPECT_COLOR_BIT for its view, but the R8/RG8 plane views of the
-//     multi-planar NV12 image require VK_IMAGE_ASPECT_PLANE_0/1_BIT. With COLOR
-//     aspect the AMD driver aliases plane-0 memory for both views (garbage
-//     colors, wrong pitch); with a small local engine patch mapping
-//     R8 -> PLANE_0 / RG8 -> PLANE_1 the output is pixel-correct. Upstream needs
-//     a plane/aspect parameter on texture_create_from_extension (feedback filed
-//     on PR #114940 / proposal godot-proposals#13969).
-// Fallback if the PR route stalls: D3D12 RD driver on Godot 4.5+ (D3D11 -> NT
-// handle -> ID3D12Device::OpenSharedHandle needs no extension gating; NV12
-// PlaneSlice views + fence sync need design work).
-// Everything upstream of this file (MF decode, playback, clock, scheduler) is
-// verified working on Windows via tests/mf and the demo run.
+// STATUS: verified end-to-end on real hardware — pixel-correct zero-copy
+// playback (AMD Radeon RX Vega, Win 11) against a patched Godot: PR #114940 to
+// enable VK_KHR_external_memory_win32, plus a small local engine patch giving
+// texture_create_from_extension the correct NV12 plane aspects. On stock Godot,
+// initialize() fails at the vkGetMemoryWin32HandlePropertiesKHR resolve because
+// the engine never enables that extension. This importer is hard-disabled at
+// the factory — see surface_importer_factory_windows.cpp for why and when to
+// re-enable.
 // -----------------------------------------------------------------------
 
 #include "dxgi_surface_importer.h"
@@ -70,20 +59,78 @@
 
 #include <godot_cpp/core/error_macros.hpp>
 
-#include <cstring> // std::memcmp
+#include <cstring> // std::memcpy
 
-#include <d3d11_1.h> // ID3D11Device, IDXGIKeyedMutex, IDXGIResource1
-#include <dxgi1_2.h>
+#include <d3d11_1.h> // ID3D11Texture2D, IDXGIKeyedMutex
+#include <dxgi1_2.h> // IDXGIResource1
 
+// VK_NO_PROTOTYPES: every Vulkan entry point is resolved at runtime from
+// vulkan-1.dll (below) instead of linking vulkan-1.lib, so building never
+// needs the Vulkan SDK. Removing the prototypes makes an accidental direct
+// call a compile error rather than a silent link dependency.
+#define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
 
 #include "../backends/mf/com_raii.h" // mf::ComPtr
+#include "d3d11_interop_device.h"
 
 using namespace godot;
 using mf::ComPtr;
 
 namespace platform_media {
+
+namespace {
+
+// Loader entry points, named like the functions they replace so call sites
+// read as plain Vulkan. All are vulkan-1.dll exports, dispatched exactly as a
+// vulkan-1.lib link would be; the one extension function
+// (vkGetMemoryWin32HandlePropertiesKHR) is still resolved per-device in
+// initialize(). The release/acquire closures below capture nothing extra —
+// these have process lifetime.
+PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = nullptr;
+PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2 = nullptr;
+PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties = nullptr;
+PFN_vkCreateImage vkCreateImage = nullptr;
+PFN_vkDestroyImage vkDestroyImage = nullptr;
+PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements = nullptr;
+PFN_vkAllocateMemory vkAllocateMemory = nullptr;
+PFN_vkFreeMemory vkFreeMemory = nullptr;
+PFN_vkBindImageMemory vkBindImageMemory = nullptr;
+
+template <typename F>
+bool resolve_export(HMODULE module, F &fn, const char *name) {
+	fn = reinterpret_cast<F>(GetProcAddress(module, name));
+	return fn != nullptr;
+}
+
+// Lazily load vulkan-1.dll and resolve the entry points above. Only ever
+// called on the Vulkan import path, so D3D12/CPU-copy users never touch the
+// loader. The module is deliberately never freed: Godot's Vulkan RD holds it
+// loaded anyway, and the closures handed to the retire-ring call through
+// these pointers. Idempotent; retries on a previous failure.
+bool load_vulkan_loader() {
+	static bool loaded = false;
+	if (loaded) {
+		return true;
+	}
+	HMODULE module = LoadLibraryW(L"vulkan-1.dll");
+	if (module == nullptr) {
+		return false;
+	}
+	loaded = resolve_export(module, vkGetDeviceProcAddr, "vkGetDeviceProcAddr") &&
+			resolve_export(module, vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2") &&
+			resolve_export(module, vkGetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties") &&
+			resolve_export(module, vkCreateImage, "vkCreateImage") &&
+			resolve_export(module, vkDestroyImage, "vkDestroyImage") &&
+			resolve_export(module, vkGetImageMemoryRequirements, "vkGetImageMemoryRequirements") &&
+			resolve_export(module, vkAllocateMemory, "vkAllocateMemory") &&
+			resolve_export(module, vkFreeMemory, "vkFreeMemory") &&
+			resolve_export(module, vkBindImageMemory, "vkBindImageMemory");
+	return loaded;
+}
+
+} // namespace
 
 // PImpl holding the D3D/Vulkan interop state. Raw owning pointer so the header
 // stays plain C++; freed in DxgiSurfaceImporter::~DxgiSurfaceImporter.
@@ -95,21 +142,14 @@ struct DxgiSurfaceImporter::Impl {
 	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 
-	// Our own D3D11 device on the same adapter as Godot's Vulkan device. We own
-	// this; it produces the shareable NV12 staging textures the decoder slice is
-	// blitted into.
-	ComPtr<ID3D11Device> d3d_device;
-	ComPtr<ID3D11DeviceContext> d3d_context;
+	// D3D11 bootstrap (own device on the same adapter as Godot's Vulkan device),
+	// shared with D3D12SurfaceImporter by composition instead of duplication.
+	D3D11InteropDevice interop;
 
 	// VK_KHR_external_memory_win32 entry points (resolved from the device).
 	PFN_vkGetMemoryWin32HandlePropertiesKHR get_mem_handle_props = nullptr;
 
 	bool initialized = false;
-
-	~Impl() {
-		d3d_context.reset();
-		d3d_device.reset();
-	}
 };
 
 DxgiSurfaceImporter::DxgiSurfaceImporter() = default;
@@ -124,6 +164,12 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 		return impl_->initialized;
 	}
 	if (rd == nullptr) {
+		return false;
+	}
+
+	if (!load_vulkan_loader()) {
+		ERR_PRINT("DXGI importer init: vulkan-1.dll is not available or is missing "
+				  "required exports — no Vulkan loader on this system.");
 		return false;
 	}
 
@@ -158,8 +204,8 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 	}
 
 	// Find the DXGI adapter whose LUID matches Godot's Vulkan physical device, so
-	// the D3D11 device we create shares GPU memory with Godot's renderer (a
-	// requirement for cross-API shared handles to be openable).
+	// our D3D11 device shares GPU memory with Godot's renderer (a requirement
+	// for cross-API shared handles to be openable).
 	VkPhysicalDeviceIDProperties id_props = {};
 	id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
 	VkPhysicalDeviceProperties2 props2 = {};
@@ -167,42 +213,11 @@ bool DxgiSurfaceImporter::initialize(RenderingDevice *rd) {
 	props2.pNext = &id_props;
 	vkGetPhysicalDeviceProperties2(impl->physical_device, &props2);
 
-	ComPtr<IDXGIFactory1> factory;
-	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())))) {
-		ERR_PRINT("DXGI importer init: CreateDXGIFactory1 failed.");
-		delete impl;
-		return false;
-	}
-
-	ComPtr<IDXGIAdapter1> chosen;
-	for (UINT i = 0;; ++i) {
-		ComPtr<IDXGIAdapter1> adapter;
-		if (factory->EnumAdapters1(i, adapter.put()) == DXGI_ERROR_NOT_FOUND) {
-			break;
-		}
-		DXGI_ADAPTER_DESC1 desc = {};
-		adapter->GetDesc1(&desc);
-		// LUID match: VkPhysicalDeviceIDProperties.deviceLUID is 8 bytes laid out
-		// to compare equal to the DXGI adapter LUID when deviceLUIDValid is set.
-		if (id_props.deviceLUIDValid &&
-				std::memcmp(&desc.AdapterLuid, id_props.deviceLUID, sizeof(LUID)) == 0) {
-			chosen = std::move(adapter);
-			break;
-		}
-		if (!chosen) {
-			chosen = std::move(adapter); // fallback to the first adapter
-		}
-	}
-
-	UINT d3d_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-	D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_1;
-	HRESULT hr = D3D11CreateDevice(
-			chosen.get(),
-			chosen ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-			nullptr, d3d_flags, nullptr, 0, D3D11_SDK_VERSION,
-			impl->d3d_device.put(), &got, impl->d3d_context.put());
-	if (FAILED(hr) || !impl->d3d_device) {
-		ERR_PRINT("DXGI importer init: D3D11CreateDevice failed on the matched adapter.");
+	// VkPhysicalDeviceIDProperties.deviceLUID is 8 bytes laid out to compare
+	// equal to a Win32 LUID when deviceLUIDValid is set.
+	LUID luid = {};
+	std::memcpy(&luid, id_props.deviceLUID, sizeof(LUID));
+	if (!impl->interop.initialize(id_props.deviceLUIDValid ? &luid : nullptr)) {
 		delete impl;
 		return false;
 	}
@@ -258,7 +273,7 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	const UINT width = src_desc.Width;
 	const UINT height = src_desc.Height;
 
-	// --- 1. Create a shareable NV12 staging texture on OUR D3D device. ---
+	// --- 1. Create a fresh shareable NV12 texture on OUR D3D device. ---
 	D3D11_TEXTURE2D_DESC shared_desc = {};
 	shared_desc.Width = width;
 	shared_desc.Height = height;
@@ -272,7 +287,7 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 			D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
 
 	ComPtr<ID3D11Texture2D> shared_tex;
-	if (FAILED(impl->d3d_device->CreateTexture2D(&shared_desc, nullptr, shared_tex.put()))) {
+	if (FAILED(impl->interop.device()->CreateTexture2D(&shared_desc, nullptr, shared_tex.put()))) {
 		ERR_PRINT("DXGI importer: shareable NV12 texture create failed.");
 		return out;
 	}
@@ -292,17 +307,16 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	}
 	// Source subresource: DXVA decoder MFTs pack decoded frames as slices of one
 	// shared texture array, so the slice for THIS frame is the plane_slice the
-	// backend recorded in VideoFrame.cpu_pixels_size and the present pipeline
+	// backend recorded in VideoFrame::plane_slice and the present pipeline
 	// forwarded here. (Verified on real hardware: the MF decoder does emit a
 	// texture array — always blitting slice 0 shows stale/wrong frames.)
-	const UINT src_subresource = static_cast<UINT>(plane_slice);
-	impl->d3d_context->CopySubresourceRegion(
+	impl->interop.context()->CopySubresourceRegion(
 			shared_tex.get(), 0, 0, 0, 0,
-			decoded.get(), src_subresource, nullptr);
-	impl->d3d_context->Flush();
+			decoded.get(), static_cast<UINT>(plane_slice), nullptr);
+	impl->interop.context()->Flush();
 	keyed->ReleaseSync(1); // hand to Vulkan
 
-	// --- 3. Export an NT shared handle and open it in Vulkan. ---
+	// Export an NT shared handle for Vulkan to open below.
 	ComPtr<IDXGIResource1> dxgi_res;
 	if (FAILED(shared_tex->QueryInterface(IID_PPV_ARGS(dxgi_res.put())))) {
 		ERR_PRINT("DXGI importer: IDXGIResource1 query failed.");
@@ -317,9 +331,10 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 		return out;
 	}
 
-	// Query the import properties for this handle to pick a compatible memory
-	// type. A D3D11 shared NT handle imports as VK_EXTERNAL_MEMORY_HANDLE_TYPE_
-	// D3D11_TEXTURE_BIT (KMT/global-share would differ).
+	// --- 3. Open the shared handle in Vulkan. Query the import properties for
+	// this handle to pick a compatible memory type. A D3D11 shared NT handle
+	// imports as VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT (KMT/
+	// global-share would differ).
 	const VkExternalMemoryHandleTypeFlagBits handle_type =
 			VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
 
@@ -496,14 +511,8 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 	return out;
 }
 
-// -----------------------------------------------------------------------
-// Platform factory (Windows build). The macOS build defines its own
-// make_surface_importer() in metal_surface_importer.mm; exactly one is compiled
-// per platform.
-// -----------------------------------------------------------------------
-std::unique_ptr<SurfaceImporter> make_surface_importer() {
-	return std::make_unique<DxgiSurfaceImporter>();
-}
+// make_surface_importer() lives in surface_importer_factory_windows.cpp, which
+// selects among the three Windows importers (and currently hard-disables this one).
 
 } // namespace platform_media
 

@@ -2,7 +2,7 @@
 // avf_backend.mm — AVFoundation Decoder-mode Backend (macOS).
 //
 // Drives AVAssetReader + AVAssetReaderTrackOutput as a pure hardware
-// decoder per ADR-0001. Video is configured for NV12 / BT.709 8-bit (D12);
+// decoder by design. Video is configured for NV12 / BT.709 8-bit (D12);
 // audio is configured for interleaved float32 LPCM. Each decoded video
 // frame hands out the underlying CVPixelBuffer as a native surface handle
 // owned by a move-only RAII wrapper (avf::PixelBufferRef) and released via

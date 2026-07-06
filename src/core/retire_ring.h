@@ -16,7 +16,7 @@ namespace core {
 // If the Backend recycles the surface immediately, the GPU reads freed
 // memory — a use-after-free that corrupts the frame or crashes.
 //
-// Per ADR-0003 we do NOT use per-platform GPU fences. Instead we hold each
+// We deliberately do NOT use per-platform GPU fences. Instead we hold each
 // source surface's release closure for exactly N *rendered* frames: a
 // bounded ring keyed on Godot's frame latency. After a surface has survived
 // N calls to advance(), the GPU is guaranteed to be done with it and we run

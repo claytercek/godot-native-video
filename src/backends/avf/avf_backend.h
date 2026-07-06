@@ -4,7 +4,7 @@
 // avf_backend.h — macOS AVFoundation Backend in Decoder mode.
 //
 // Implements core::Backend by driving an AVAssetReader as a pure hardware
-// decoder (ADR-0001). It pulls hardware-decoded NV12 CVPixelBuffers (with
+// decoder. It pulls hardware-decoded NV12 CVPixelBuffers (with
 // PTS) for video and PCM float32 (with PTS) for audio. It produces native
 // surface handles only; it does NOT import to GPU and references NO Godot /
 // RenderingDevice symbols.

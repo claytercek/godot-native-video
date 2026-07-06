@@ -10,7 +10,8 @@
 #
 #   - codecs:      H.264 (libx264) and HEVC (libx265)
 #   - frame rates: 24, 30, 60 fps
-#   - containers:  .mp4 and .mov
+#   - containers:  .mp4, .mov, and .m4v (an MP4 remux under the loader's
+#                  third registered extension)
 #   - audio:       AAC stereo, 48 kHz
 #
 # Each clip still carries the same machine-readable white index block + burned
@@ -76,6 +77,7 @@ HEIGHT=240
 #   h264_60_mp4 : H.264 / high 60 fps / mp4
 #   hevc_30_mp4 : HEVC / 30 fps / mp4
 #   hevc_24_mov : HEVC / 24 fps / mov container
+#   h264_30_m4v : H.264 / 30 fps / m4v container
 #
 # This array is the single source of truth; the matrix.list / matrix.json
 # manifests the tests read are generated from it (see write_manifests below).
@@ -86,6 +88,7 @@ MATRIX=(
     "h264_60_mp4 h264 60 mp4 60"
     "hevc_30_mp4 hevc 30 mp4 30"
     "hevc_24_mov hevc 24 mov 24"
+    "h264_30_m4v h264 30 m4v 30"
 )
 
 # Write the manifests the coverage tests consume, derived from MATRIX so the
@@ -165,6 +168,16 @@ gen_clip() {
         *) echo "ERROR: unknown codec ${codec}" >&2; return 1 ;;
     esac
 
+    # Explicit muxer per container: ffmpeg maps the .m4v extension to its raw
+    # MPEG-4 elementary-stream muxer, not MP4 — .m4v is plain MP4 under an
+    # alternate extension, so force the mp4 muxer for it.
+    local muxer
+    case "${container}" in
+        mp4|m4v) muxer=mp4 ;;
+        mov)     muxer=mov ;;
+        *) echo "ERROR: unknown container ${container}" >&2; return 1 ;;
+    esac
+
     echo "Generating ${name}: ${codec} ${fps}fps ${container} (${frames} frames) -> ${out}"
     ffmpeg -y \
         -filter_complex "${video_filter};${audio_filter}" \
@@ -173,6 +186,7 @@ gen_clip() {
         -c:a aac -b:a 128k -ac 2 -ar "${SAMPLE_RATE}" \
         -t "${duration}" \
         -movflags +faststart \
+        -f "${muxer}" \
         "${out}" </dev/null
 }
 

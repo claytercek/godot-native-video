@@ -12,21 +12,22 @@
 // and presents it through the zero-copy PresentPipeline. _get_texture() returns
 // the engine-owned RGBA Texture2DRD.
 //
-// SCOPE (dte — this slice): linear playback + audio-master A/V sync. Audio is
+// SCOPE (linear-playback slice): linear playback + audio-master A/V sync. Audio is
 // drained into Godot via mix_audio(); the master clock is derived from the
 // audio samples Godot actually consumes (latency-compensated AudioMasterClock),
 // with a MonotonicClock delta fallback for silent clips. The present step runs
 // the Godot-free drop-late / hold-early present-selector.
 //
-// SCOPE (g1c — this slice): decode is moved OFF the main thread onto a bounded
+// SCOPE (decode-pool slice): decode is moved OFF the main thread onto a bounded
 // shared core::DecodeScheduler pool. Each playback registers its core::Backend
 // with the process-wide scheduler and receives a StreamHandle; a pool worker
 // fills that stream's decode-ahead queue while the main/render thread still does
 // the present + GPU pass via next_frame() + PresentPipeline. Many
 // VideoStreamPlayers share one bounded set of worker threads (no thread-per-
-// video). The present/clock/audio logic from dte is unchanged.
+// video). The present/clock/audio logic from the linear-playback slice is
+// unchanged.
 //
-// SCOPE (o3h — this slice): adaptive scrubbing. Godot only signals seeking via
+// SCOPE (scrubbing slice): adaptive scrubbing. Godot only signals seeking via
 // repeated _seek(time): a fast burst is a drag, a debounced gap (or playback
 // resume) is a settle. The Godot-free core::Scrubber turns that bare seek stream
 // into a per-seek decision — a fast drag presents the nearest KEYFRAME for
@@ -87,7 +88,13 @@ private:
 	void fill_audio();
 	// Drain decoded PCM from the ring into Godot's AudioServer via mix_audio(),
 	// and advance the audio-master clock by the frames Godot actually consumed.
-	void drive_audio();
+	// Returns true iff the clock was advanced this call — _update() uses this to
+	// avoid double-advancing on the tick real audio runs out.
+	bool drive_audio();
+	// True once no real audio samples will ever advance the clock again: silent
+	// clips, and a shorter audio track once it has fully drained. From then on
+	// _update() advances the master clock by the render delta instead.
+	bool audio_exhausted() const;
 	// The current master clock (audio-master when audio present, else monotonic).
 	core::Clock *master() const;
 
@@ -116,8 +123,9 @@ private:
 
 	// Master-clock implementations. Exactly one is "the master" per clip:
 	//  - audio_clock_ when the clip has an audio track (samples-consumed ÷ rate,
-	//    latency-compensated). Driven by drive_audio() from real consumption.
-	//  - mono_clock_  for silent clips (advanced by _update's render delta).
+	//    latency-compensated), driven by drive_audio() from real consumption.
+	//  - mono_clock_  for silent clips.
+	// Either way, once audio_exhausted() the master advances by render delta.
 	std::unique_ptr<core::AudioMasterClock> audio_clock_;
 	std::unique_ptr<core::MonotonicClock> mono_clock_;
 
