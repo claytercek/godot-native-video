@@ -173,12 +173,9 @@ private:
 	int width_ = 0;
 	int height_ = 0;
 
-	// Cached colorimetry from the backend (populated at load() time).
-	int color_matrix_ = 1;      // core::ColorMatrix::BT709
-	int color_primaries_ = 1;   // core::ColorPrimaries::BT709
-	int color_transfer_ = 1;    // core::TransferFunction::BT709
-	int color_range_ = 1;       // core::ColorRange::Video
-	int color_bit_depth_ = 8;
+	// Cached colorimetry from the backend. Default-constructed (all Unspecified,
+	// 8-bit) until load() overwrites it with the backend's negotiated values.
+	core::Colorimetry color_;
 };
 
 } // namespace godot
