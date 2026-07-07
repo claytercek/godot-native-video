@@ -170,9 +170,6 @@ struct AudioChunk {
 // -----------------------------------------------------------------------
 class Backend {
 public:
-	// Namespace for the default-track fallback sentinel used by
-	// select_audio_track when no valid selection has been made.
-	static constexpr int kDefaultAudioTrack = 0;
 	virtual ~Backend() = default;
 
 	// --- Lifecycle ---
@@ -204,8 +201,9 @@ public:
 	// else 0 (single-track compat).
 	virtual int audio_track_count() const;
 
-	// Per-track metadata. Index must be in [0, audio_track_count()); behaviour
-	// is undefined for an out-of-range index.
+	// Per-track metadata. Index must be in [0, audio_track_count()); every
+	// implementation (base, MF, AVF) bounds-checks and returns a
+	// default-constructed AudioTrackInfo for an out-of-range index.
 	virtual AudioTrackInfo audio_track_info(int index) const;
 
 	// Select which audio track to decode. The index must be in
@@ -220,13 +218,11 @@ public:
 	// `pts_seconds`. Video frames continue to flow uninterrupted from the
 	// existing video decode session.
 	//
-	// On AVFoundation this creates a dedicated audio-only AVAssetReader
-	// (since a shared reader cannot reseek audio without destroying the
-	// video decode session). On Media Foundation this toggles per-stream
-	// selection on the existing IMFSourceReader — the shared reader's
-	// position is unchanged, so `pts_seconds` is advisory (the audio
-	// starts from wherever the reader currently is, which should be at
-	// the same position as the video stream).
+	// Both backends implement this with a dedicated audio-only reader
+	// primed at `pts_seconds` (AVFoundation: a second AVAssetReader;
+	// Media Foundation: a second IMFSourceReader), because neither can
+	// reposition audio on the shared reader without also disturbing the
+	// video decode session.
 	//
 	// Returns true on success. On failure the audio decode path is left in
 	// an undefined state; the caller should seek() to recover.

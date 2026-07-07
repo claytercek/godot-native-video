@@ -154,6 +154,17 @@ public:
 	ComPtr<IMFDXGIDeviceManager> dxgi_manager;
 	ComPtr<IMFSourceReader> reader;
 
+	// Non-null only after reselect_audio_track(); reset by open()/seek().
+	// Dedicated audio-only source reader so a mid-decode track switch can
+	// prime the new track at the requested position without repositioning
+	// (and thus disturbing) the shared reader's video stream. Toggling
+	// per-stream selection on the shared reader alone cannot implement
+	// reselect: a stream that was deselected when the media source last
+	// started never delivers samples — ReadSample reports end-of-stream —
+	// until the source is restarted by a position change.
+	// next_audio_chunk() reads from audio_reader when it is non-null.
+	ComPtr<IMFSourceReader> audio_reader;
+
 	std::wstring path;
 
 	double duration = 0.0;
@@ -212,10 +223,19 @@ public:
 	// the old stream selection is left deselected and audio_stream_index
 	// is set to -1 (no audio).
 	bool switch_audio_track(int track_index);
+	// Select stream `aidx` on `target_reader` and negotiate interleaved
+	// float32 PCM output, updating audio_channels / audio_rate from the
+	// negotiated type. Shared by the combined reader and the dedicated
+	// audio-only reader.
+	bool configure_pcm_output(IMFSourceReader *target_reader, DWORD aidx);
+	// Build a dedicated audio-only source reader for `track_index`,
+	// positioned at `start_time`. Used by reselect_audio_track().
+	bool build_audio_reader(int track_index, double start_time);
 	void read_duration();
 	void read_colorimetry(IMFMediaType *type);
 
 	void teardown() {
+		audio_reader.reset();
 		reader.reset();
 		dxgi_manager.reset();
 		d3d_context.reset();
@@ -475,27 +495,34 @@ bool MfBackend::Impl::switch_audio_track(int track_index) {
 	audio_stream_index = new_mf_index;
 	selected_audio_track = track_index;
 
-	// Apply the PCM output type on the new stream.
 	const DWORD aidx = static_cast<DWORD>(new_mf_index);
-	reader->SetStreamSelection(aidx, TRUE);
+	if (!configure_pcm_output(reader.get(), aidx)) {
+		// PCM negotiation failed; deselect this stream too.
+		reader->SetStreamSelection(aidx, FALSE);
+		audio_stream_index = -1;
+		return false;
+	}
+	return true;
+}
+
+bool MfBackend::Impl::configure_pcm_output(
+		IMFSourceReader *target_reader, DWORD aidx) {
+	target_reader->SetStreamSelection(aidx, TRUE);
 
 	ComPtr<IMFMediaType> pcm;
 	HRESULT hr = MFCreateMediaType(pcm.put());
 	if (SUCCEEDED(hr)) {
 		pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
 		pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
-		hr = reader->SetCurrentMediaType(aidx, nullptr, pcm.get());
+		hr = target_reader->SetCurrentMediaType(aidx, nullptr, pcm.get());
 	}
 	if (FAILED(hr)) {
-		// Fallback failed; deselect this stream too.
-		reader->SetStreamSelection(aidx, FALSE);
-		audio_stream_index = -1;
 		return false;
 	}
 
 	// Read back the negotiated type to get actual channels and rate.
 	ComPtr<IMFMediaType> current;
-	hr = reader->GetCurrentMediaType(aidx, current.put());
+	hr = target_reader->GetCurrentMediaType(aidx, current.put());
 	if (SUCCEEDED(hr) && current) {
 		UINT32 ch = 0, rate = 0;
 		current->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch);
@@ -503,6 +530,39 @@ bool MfBackend::Impl::switch_audio_track(int track_index) {
 		audio_channels = static_cast<int>(ch);
 		audio_rate = static_cast<int>(rate);
 	}
+	return true;
+}
+
+bool MfBackend::Impl::build_audio_reader(int track_index, double start_time) {
+	audio_reader.reset();
+
+	// Plain source reader from the same URL — audio decode needs no DXGI
+	// device manager or hardware transforms.
+	ComPtr<IMFSourceReader> ar;
+	HRESULT hr = MFCreateSourceReaderFromURL(path.c_str(), nullptr, ar.put());
+	if (FAILED(hr) || !ar) {
+		return false;
+	}
+	ar->SetStreamSelection(
+			static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+
+	const DWORD aidx = static_cast<DWORD>(
+			audio_stream_indices[static_cast<size_t>(track_index)]);
+	if (!configure_pcm_output(ar.get(), aidx)) {
+		return false;
+	}
+
+	// Prime at the requested position (nearest sample at or before it —
+	// compressed audio frames are all sync points, so this is ~exact).
+	PROPVARIANT pos;
+	InitPropVariantFromInt64(seconds_to_mf_ticks(start_time), &pos);
+	hr = ar->SetCurrentPosition(GUID_NULL, pos);
+	PropVariantClear(&pos);
+	if (FAILED(hr)) {
+		return false;
+	}
+
+	audio_reader = std::move(ar);
 	return true;
 }
 
@@ -644,7 +704,7 @@ void MfBackend::select_audio_track(int index) {
 	impl_->switch_audio_track(clamped);
 }
 
-bool MfBackend::reselect_audio_track(int index, double /*pts_seconds*/) {
+bool MfBackend::reselect_audio_track(int index, double pts_seconds) {
 	if (!impl_ || impl_->audio_stream_indices.empty()) {
 		return false;
 	}
@@ -653,20 +713,26 @@ bool MfBackend::reselect_audio_track(int index, double /*pts_seconds*/) {
 		return false;
 	}
 	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
-	// MF supports per-stream selection on the existing IMFSourceReader.
-	// switch_audio_track deselects the old audio stream and selects the new
-	// one, applying float PCM output on the new stream. The reader's current
-	// position is left unchanged (video decode stays undisturbed), so the new
-	// audio track starts from wherever the reader currently is — the caller
-	// is expected to pass the current video position as `pts_seconds`.
-	//
-	// Unlike AVFoundation, MF cannot seek the shared reader's audio position
-	// without also disturbing the video side, so `pts_seconds` is intentionally
-	// advisory: it documents the intended prime position but the actual start
-	// depends on the reader's interleaved position.
-	if (!impl_->switch_audio_track(clamped)) {
+	const double target = pts_seconds < 0.0 ? 0.0 : pts_seconds;
+
+	// Mirror the AVF design: a dedicated audio-only reader for the new track,
+	// primed at `target`, while the shared reader keeps decoding video from
+	// its current position. Toggling per-stream selection on the shared
+	// reader alone does not work — an MF stream that was deselected when the
+	// source last started reports end-of-stream instead of delivering, and
+	// restarting the source to fix that would also reposition video.
+	if (!impl_->build_audio_reader(clamped, target)) {
 		return false;
 	}
+
+	// Stop the shared reader from queueing the old track's audio.
+	if (impl_->audio_stream_index >= 0) {
+		impl_->reader->SetStreamSelection(
+				static_cast<DWORD>(impl_->audio_stream_index), FALSE);
+	}
+	impl_->audio_stream_index =
+			impl_->audio_stream_indices[static_cast<size_t>(clamped)];
+	impl_->selected_audio_track = clamped;
 	return true;
 }
 
@@ -684,6 +750,15 @@ bool MfBackend::seek(double pts_seconds) {
 	}
 	if (pts_seconds < 0.0) {
 		pts_seconds = 0.0;
+	}
+	// Tear down any dedicated audio-only reader and re-home audio on the
+	// shared reader (mirrors AVF rebuilding its combined reader on seek).
+	// Re-selecting the stream is safe here because SetCurrentPosition below
+	// restarts the media source, which is what makes a newly selected stream
+	// actually deliver samples.
+	if (impl_->audio_reader) {
+		impl_->audio_reader.reset();
+		impl_->switch_audio_track(impl_->selected_audio_track);
 	}
 	// Unlike AVAssetReader (single-pass, recreated on seek), IMFSourceReader can
 	// be repositioned in place. SetCurrentPosition seeks to the nearest keyframe
@@ -803,13 +878,18 @@ std::optional<core::AudioChunk> MfBackend::next_audio_chunk() {
 		return std::nullopt;
 	}
 
+	// When a dedicated audio-only reader is active (from
+	// reselect_audio_track), read from it; otherwise use the shared reader.
+	// Both readers enumerate the same source, so the stream index matches.
+	IMFSourceReader *active_reader =
+			impl_->audio_reader ? impl_->audio_reader.get() : impl_->reader.get();
 	const DWORD aidx = static_cast<DWORD>(impl_->audio_stream_index);
 
 	for (;;) {
 		DWORD stream_flags = 0;
 		LONGLONG timestamp = 0;
 		ComPtr<IMFSample> sample;
-		HRESULT hr = impl_->reader->ReadSample(
+		HRESULT hr = active_reader->ReadSample(
 				aidx, 0, nullptr, &stream_flags, &timestamp, sample.put());
 		if (FAILED(hr)) {
 			impl_->error = true;
