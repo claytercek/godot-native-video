@@ -79,6 +79,8 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_color_matrix.cpp",
         "tests/core/test_hdr_color_math.cpp",
         "tests/core/test_colorimetry.cpp",
+        "tests/core/test_push_constant.cpp",
+        "tests/core/test_surface_importer_factory.cpp",
         "src/core/decode_scheduler.cpp",
         "src/core/backend.cpp",
     ]
