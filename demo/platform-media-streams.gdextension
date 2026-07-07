@@ -1,0 +1,15 @@
+[configuration]
+
+entry_symbol = "platform_media_streams_init"
+compatibility_minimum = "4.4"
+
+[libraries]
+
+macos.debug = "res://bin/macos/libplatform-media-streams.macos.template_debug.dylib"
+macos.release = "res://bin/macos/libplatform-media-streams.macos.template_release.dylib"
+
+ios.debug = "res://bin/ios/libplatform-media-streams.ios.template_debug.arm64.dylib"
+ios.release = "res://bin/ios/libplatform-media-streams.ios.template_release.arm64.dylib"
+
+windows.debug.x86_64 = "res://bin/windows/platform-media-streams.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/windows/platform-media-streams.windows.template_release.x86_64.dll"
