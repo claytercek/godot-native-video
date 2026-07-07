@@ -135,11 +135,16 @@ for ((track=0; track<AUDIO_STREAMS; track++)); do
     echo "    track ${track}: base=${BASE} Hz, lang=${LANG}"
 done
 
+# -g 1 (all-intra): every frame is a keyframe, so a backend seek — contract:
+# "nearest keyframe at or before pts" — lands on the requested frame. The
+# near-end-of-stream reselect tests assert the first post-seek video pts is
+# close to the seek target, which needs this cadence; with x264's default GOP
+# these short clips get a single keyframe at t=0 and every seek snaps there.
 ffmpeg -y \
     -filter_complex "${FILTERGRAPH}" \
     -map "[video_out]" \
     "${AUDIO_MAPS[@]}" \
-    -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p \
+    -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -g 1 \
     "${AUDIO_CODEC_ARGS[@]}" \
     "${METADATA_ARGS[@]}" \
     -t "${DURATION}" \
