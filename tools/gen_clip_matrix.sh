@@ -311,7 +311,7 @@ gen_multi_track_clip() {
     # Build video filter (same as gen_clip).
     local video_filter="color=black:size=${WIDTH}x${HEIGHT}:rate=${fps}:duration=${duration}[base];"
     video_filter+="[base]drawbox=x=0:y=0:w=80:h=80:color=white:t=fill,"
-    video_filter+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:font=monospace[video_out]"
+    video_filter+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:${DRAWTEXT_FONT}[video_out]"
 
     local audio_filter=""
     local audio_maps=()
