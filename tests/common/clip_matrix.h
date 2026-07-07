@@ -110,4 +110,17 @@ inline std::string clip_path(const Clip &c) {
 	return matrix_dir() + "/" + c.file;
 }
 
+// First clip in the manifest with at least `min_tracks` audio tracks, or
+// nullptr if none qualifies. Shared by the AVF/MF multi-track matrix cases,
+// which all drive their pre-play-selection / reselect coverage off the first
+// available multi-track real clip.
+inline const Clip *find_multi_track_clip(const std::vector<Clip> &clips, int min_tracks = 2) {
+	for (const auto &clip : clips) {
+		if (clip.audio_tracks >= min_tracks) {
+			return &clip;
+		}
+	}
+	return nullptr;
+}
+
 } // namespace clip_matrix
