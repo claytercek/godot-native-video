@@ -276,9 +276,10 @@ TEST_CASE("MF backend enumerates audio tracks for single-track clip") {
 	CHECK(info.channels >= 1);
 	CHECK(info.sample_rate == 48000);
 	CHECK(info.is_default == true);
-	// MF v1 skips language/name; accept empty.
-	CHECK(info.language.empty());
-	CHECK(info.name.empty());
+	// gen_test_media.sh tags track 0 as 'eng' with a stream title; the backend
+	// normalizes MF's RFC 1766 tag back to the ISO 639-2 code AVF reports.
+	CHECK(info.language == "eng");
+	CHECK(info.name == "Track 0 (eng)");
 }
 
 TEST_CASE("MF backend enumerates audio tracks for multi-track clip") {
@@ -293,25 +294,29 @@ TEST_CASE("MF backend enumerates audio tracks for multi-track clip") {
 
 	CHECK(backend.audio_track_count() == kMultiTracks);
 
-	// Track 0: first audio stream is default
+	// Track 0: eng, default — indices follow container track order, matching AVF.
 	const auto t0 = backend.audio_track_info(0);
+	CHECK(t0.language == "eng");
 	CHECK(t0.is_default == true);
 	CHECK(t0.channels >= 1);
 	CHECK(t0.sample_rate == 48000);
 
-	// Track 1: non-default
+	// Track 1: fra, non-default
 	const auto t1 = backend.audio_track_info(1);
+	CHECK(t1.language == "fra");
 	CHECK(t1.is_default == false);
 	CHECK(t1.channels >= 1);
 	CHECK(t1.sample_rate == 48000);
 
-	// Track 2: non-default
+	// Track 2: deu, non-default
 	const auto t2 = backend.audio_track_info(2);
+	CHECK(t2.language == "deu");
 	CHECK(t2.is_default == false);
 
 	// Out-of-range: empty struct.
 	const auto t99 = backend.audio_track_info(99);
 	CHECK(t99.channels == 0);
+	CHECK(t99.language.empty());
 	CHECK(t99.sample_rate == 0);
 	CHECK(t99.is_default == false);
 }
@@ -327,8 +332,9 @@ TEST_CASE("MF backend selects audio track pre-play for multi-track clip") {
 	mf::MfBackend backend;
 	REQUIRE(backend.open(fixture));
 	CHECK(backend.audio_track_count() == kMultiTracks);
-	// Track 0: first stream, default
+	// Track 0: eng, default
 	const auto t0 = backend.audio_track_info(0);
+	CHECK(t0.language == "eng");
 	CHECK(t0.is_default == true);
 	CHECK(t0.channels >= 1);
 	CHECK(t0.sample_rate == 48000);
@@ -340,6 +346,7 @@ TEST_CASE("MF backend selects audio track pre-play for multi-track clip") {
 
 	// Verify the metadata still reports track 1 correctly.
 	const auto t1_check = backend.audio_track_info(1);
+	CHECK(t1_check.language == "fra");
 	CHECK(t1_check.is_default == false);
 	CHECK(t1_check.channels >= 1);
 	CHECK(t1_check.sample_rate == 48000);
