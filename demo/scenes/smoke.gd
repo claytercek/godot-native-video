@@ -1,10 +1,10 @@
 extends Control
 
-# Demo driver for the native media streams GDExtension.
+# Demo driver for the Native Video GDExtension.
 #
 # Loads a clip (by default the synthetic fixture from tools/gen_test_media.sh)
 # into a stock VideoStreamPlayer and plays it. The VideoStreamPlayer pulls a
-# PlatformVideoStreamPlayback, which decodes NV12 via the platform backend
+# NativeVideoStreamPlayback, which decodes NV12 via the platform backend
 # (AVFoundation on macOS, Media Foundation on Windows) and presents zero-copy
 # through the NV12->RGB compute pipeline. If the frames appear and advance, the
 # present path is working.
@@ -17,7 +17,7 @@ extends Control
 #   the extended range; an SDR clip in HDR mode is linearized onto the same
 #   scale so both render correctly in the same HDR viewport.
 #
-#   The mode is driven through the PlatformVideoStream resource
+#   The mode is driven through the NativeVideoStream resource
 #   (player.stream.set_output_mode), which forwards to the live playback.
 #   Stock Godot 4.4/4.5 has no VideoStreamPlayer.get_stream_playback(), so the
 #   playback object is only used opportunistically for richer color info.

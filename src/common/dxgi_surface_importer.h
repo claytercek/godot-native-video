@@ -49,7 +49,7 @@
 
 #include "surface_importer.h" // PlaneTextures, SurfaceImporter
 
-namespace platform_media {
+namespace native_video {
 
 class DxgiSurfaceImporter final : public SurfaceImporter {
 public:
@@ -81,4 +81,4 @@ private:
 	Impl *impl_ = nullptr; // raw owning PImpl so the header stays plain C++
 };
 
-} // namespace platform_media
+} // namespace native_video

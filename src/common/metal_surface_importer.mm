@@ -19,7 +19,7 @@
 
 using namespace godot;
 
-namespace platform_media {
+namespace native_video {
 
 // PImpl holding the ObjC/CoreVideo state. Raw owning pointer so the header can
 // stay plain C++; freed in MetalSurfaceImporter::~MetalSurfaceImporter.
@@ -241,4 +241,4 @@ std::unique_ptr<SurfaceImporter> make_surface_importer() {
 	return std::make_unique<MetalSurfaceImporter>();
 }
 
-} // namespace platform_media
+} // namespace native_video

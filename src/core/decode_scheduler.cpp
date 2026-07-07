@@ -10,7 +10,7 @@
 namespace core {
 
 DecodeScheduler::DecodeScheduler(size_t worker_count, bool force_synchronous) {
-#if PLATFORM_MEDIA_FORCE_SYNC_AVAILABLE
+#if NATIVE_VIDEO_FORCE_SYNC_AVAILABLE
 	synchronous_ = force_synchronous;
 #else
 	// Release builds: the synchronous lifetime-debug path is compiled out, so the

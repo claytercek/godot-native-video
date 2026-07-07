@@ -1,9 +1,9 @@
 // -----------------------------------------------------------------------
-// platform_video_stream.cpp — see header.
+// native_video_stream.cpp — see header.
 // -----------------------------------------------------------------------
 
-#include "platform_video_stream.h"
-#include "platform_video_stream_playback.h"
+#include "native_video_stream.h"
+#include "native_video_stream_playback.h"
 
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/object.hpp> // ObjectDB::get_instance
@@ -15,22 +15,22 @@
 
 using namespace godot;
 
-void PlatformVideoStream::_bind_methods() {
-	ClassDB::bind_static_method("PlatformVideoStream", D_METHOD("hdr_decode_supported"),
-			&PlatformVideoStream::hdr_decode_supported);
+void NativeVideoStream::_bind_methods() {
+	ClassDB::bind_static_method("NativeVideoStream", D_METHOD("hdr_decode_supported"),
+			&NativeVideoStream::hdr_decode_supported);
 
-	ClassDB::bind_method(D_METHOD("set_output_mode", "mode"), &PlatformVideoStream::set_output_mode);
-	ClassDB::bind_method(D_METHOD("get_output_mode"), &PlatformVideoStream::get_output_mode);
+	ClassDB::bind_method(D_METHOD("set_output_mode", "mode"), &NativeVideoStream::set_output_mode);
+	ClassDB::bind_method(D_METHOD("get_output_mode"), &NativeVideoStream::get_output_mode);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "output_mode", PROPERTY_HINT_ENUM, "SDR,HDR"),
 			"set_output_mode", "get_output_mode");
 
 	// Expose the audio-track probe so GDScript can enumerate tracks before
 	// playback. Returns an Array of Dictionaries with per-track metadata;
 	// array position is the track index for VideoStreamPlayer.audio_track.
-	ClassDB::bind_method(D_METHOD("get_audio_tracks"), &PlatformVideoStream::get_audio_tracks);
+	ClassDB::bind_method(D_METHOD("get_audio_tracks"), &NativeVideoStream::get_audio_tracks);
 }
 
-bool PlatformVideoStream::hdr_decode_supported() {
+bool NativeVideoStream::hdr_decode_supported() {
 #if defined(__APPLE__)
 	// macOS (and iOS) have Metal-accelerated VideoToolbox which can produce
 	// 10-bit biplanar surfaces (x420) that we import zero-copy via
@@ -49,14 +49,14 @@ bool PlatformVideoStream::hdr_decode_supported() {
 #endif
 }
 
-std::vector<PlatformVideoStreamPlayback *> PlatformVideoStream::live_playbacks() {
-	std::vector<PlatformVideoStreamPlayback *> live;
+std::vector<NativeVideoStreamPlayback *> NativeVideoStream::live_playbacks() {
+	std::vector<NativeVideoStreamPlayback *> live;
 	std::vector<uint64_t> alive;
 	live.reserve(playback_ids_.size());
 	alive.reserve(playback_ids_.size());
 	for (uint64_t id : playback_ids_) {
 		auto *playback =
-				Object::cast_to<PlatformVideoStreamPlayback>(ObjectDB::get_instance(id));
+				Object::cast_to<NativeVideoStreamPlayback>(ObjectDB::get_instance(id));
 		if (playback != nullptr) {
 			live.push_back(playback);
 			alive.push_back(id);
@@ -66,22 +66,22 @@ std::vector<PlatformVideoStreamPlayback *> PlatformVideoStream::live_playbacks()
 	return live;
 }
 
-void PlatformVideoStream::set_output_mode(int mode) {
+void NativeVideoStream::set_output_mode(int mode) {
 	if (mode < 0 || mode > 1) {
 		return;
 	}
 	output_mode_ = mode;
 	// Forward to every still-alive playback instantiated from this stream.
-	for (PlatformVideoStreamPlayback *playback : live_playbacks()) {
+	for (NativeVideoStreamPlayback *playback : live_playbacks()) {
 		playback->set_output_mode(output_mode_);
 	}
 }
 
-int PlatformVideoStream::get_output_mode() const {
+int NativeVideoStream::get_output_mode() const {
 	return output_mode_;
 }
 
-Array PlatformVideoStream::get_audio_tracks() {
+Array NativeVideoStream::get_audio_tracks() {
 	if (audio_tracks_probed_) {
 		return cached_audio_tracks_;
 	}
@@ -91,7 +91,7 @@ Array PlatformVideoStream::get_audio_tracks() {
 	// close the backend. The result (including empty, on failure or for a
 	// legitimately audio-less clip) is cached so subsequent queries are free
 	// and the probe only ever happens once.
-	std::unique_ptr<core::Backend> backend = platform_media::make_backend();
+	std::unique_ptr<core::Backend> backend = native_video::make_backend();
 
 	String os_path = ProjectSettings::get_singleton()->globalize_path(get_file());
 	const std::string utf8 = os_path.utf8().get_data();
@@ -122,8 +122,8 @@ Array PlatformVideoStream::get_audio_tracks() {
 	return cached_audio_tracks_;
 }
 
-Ref<VideoStreamPlayback> PlatformVideoStream::_instantiate_playback() {
-	Ref<PlatformVideoStreamPlayback> playback;
+Ref<VideoStreamPlayback> NativeVideoStream::_instantiate_playback() {
+	Ref<NativeVideoStreamPlayback> playback;
 	playback.instantiate();
 	playback->set_output_mode(output_mode_);
 

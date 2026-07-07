@@ -30,7 +30,7 @@
 
 #include "../core/backend.h"
 
-namespace platform_media {
+namespace native_video {
 
 // Size in bytes of the packed push-constant block (see layout above).
 inline constexpr uint32_t kPushConstantSize = 32;
@@ -64,4 +64,4 @@ inline void pack_push_constants(
 	std::memcpy(dst + 28, &sample_scale, sizeof(float));
 }
 
-} // namespace platform_media
+} // namespace native_video

@@ -1,12 +1,12 @@
 #pragma once
 
 // -----------------------------------------------------------------------
-// platform_video_stream.h — the VideoStream resource for native clips.
+// native_video_stream.h — the VideoStream resource for native clips.
 //
 // A stock VideoStreamPlayer holds a VideoStream and calls
 // _instantiate_playback() to get a VideoStreamPlayback. This resource carries
 // the clip's file path (set by the ResourceFormatLoader) and instantiates a
-// PlatformVideoStreamPlayback bound to it.
+// NativeVideoStreamPlayback bound to it.
 //
 // Additionally, the stream exposes a lazy, cached audio-track probe via
 // get_audio_tracks() so GDScript can query per-track metadata (language,
@@ -24,14 +24,14 @@
 
 namespace godot {
 
-class PlatformVideoStreamPlayback;
+class NativeVideoStreamPlayback;
 
-class PlatformVideoStream : public VideoStream {
-	GDCLASS(PlatformVideoStream, VideoStream)
+class NativeVideoStream : public VideoStream {
+	GDCLASS(NativeVideoStream, VideoStream)
 
 public:
-	PlatformVideoStream() = default;
-	~PlatformVideoStream() override = default;
+	NativeVideoStream() = default;
+	~NativeVideoStream() override = default;
 
 	Ref<VideoStreamPlayback> _instantiate_playback() override;
 
@@ -40,7 +40,7 @@ public:
 	// it via VideoStreamPlayer.stream on stock Godot 4.4 (no get_stream_playback()).
 	// Applied to new playbacks at instantiation and forwarded to live ones.
 	// Known limitation: this mirror is one-way. Calling set_output_mode directly
-	// on a PlatformVideoStreamPlayback changes that playback's pipeline but does
+	// on a NativeVideoStreamPlayback changes that playback's pipeline but does
 	// NOT update output_mode_ here, so callers should always drive the mode
 	// through the stream rather than the playback.
 	void set_output_mode(int mode);
@@ -69,9 +69,9 @@ protected:
 
 private:
 	// Resolve playback_ids_ to the playbacks still alive, pruning dead ids.
-	std::vector<PlatformVideoStreamPlayback *> live_playbacks();
+	std::vector<NativeVideoStreamPlayback *> live_playbacks();
 
-	int output_mode_ = 0; // matches PlatformVideoStreamPlayback::OutputMode
+	int output_mode_ = 0; // matches NativeVideoStreamPlayback::OutputMode
 
 	// Instance ids of playbacks instantiated from this stream. ObjectIDs, not
 	// Refs, on purpose: the stream must never extend a playback's lifetime

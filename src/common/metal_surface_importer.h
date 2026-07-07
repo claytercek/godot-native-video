@@ -28,7 +28,7 @@
 
 #include "surface_importer.h" // PlaneTextures, SurfaceImporter
 
-namespace platform_media {
+namespace native_video {
 
 // Owns the CVMetalTextureCache bound to Godot's MTLDevice. Construct once per
 // present pipeline; reuse across frames (the cache pools the transient
@@ -62,4 +62,4 @@ private:
 	Impl *impl_ = nullptr; // raw ObjC-holding PImpl, deleted in dtor
 };
 
-} // namespace platform_media
+} // namespace native_video

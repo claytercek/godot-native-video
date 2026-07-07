@@ -40,7 +40,7 @@
 // See required_pool_depth().
 //
 // FORCE-SYNC DEBUG MODE (acceptance criterion): when force_synchronous is set
-// (debug builds only — gated OFF in release, see PLATFORM_MEDIA_DEBUG below) the
+// (debug builds only — gated OFF in release, see NATIVE_VIDEO_DEBUG below) the
 // scheduler runs NO worker threads. Decode happens synchronously on the calling
 // (main) thread inside pump_stream(), so a decode->convert->present lifetime bug
 // reproduces deterministically with no worker handoff and no deferred timing.
@@ -65,15 +65,15 @@
 #include "frame_queue.h"
 
 // Debug gate. The force-synchronous-conversion mode and other lifetime-debug
-// affordances are compiled in only when PLATFORM_MEDIA_DEBUG is defined. The
+// affordances are compiled in only when NATIVE_VIDEO_DEBUG is defined. The
 // build defines it for template_debug / the headless test targets and leaves it
 // undefined for template_release, so release binaries cannot accidentally run
 // the synchronous path. (We also keep the *field* present in release so the ABI
 // is identical; it is simply forced false and never read on a hot path.)
-#if defined(PLATFORM_MEDIA_DEBUG) || defined(DEBUG_ENABLED) || !defined(NDEBUG)
-#define PLATFORM_MEDIA_FORCE_SYNC_AVAILABLE 1
+#if defined(NATIVE_VIDEO_DEBUG) || defined(DEBUG_ENABLED) || !defined(NDEBUG)
+#define NATIVE_VIDEO_FORCE_SYNC_AVAILABLE 1
 #else
-#define PLATFORM_MEDIA_FORCE_SYNC_AVAILABLE 0
+#define NATIVE_VIDEO_FORCE_SYNC_AVAILABLE 0
 #endif
 
 namespace core {

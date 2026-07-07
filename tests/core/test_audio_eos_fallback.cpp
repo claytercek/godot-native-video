@@ -18,7 +18,7 @@
 // on_audio_mixed() again, so the clock would freeze permanently unless
 // something else advances it.
 //
-// This models PlatformVideoStreamPlayback::_update()'s unified clock rule:
+// This models NativeVideoStreamPlayback::_update()'s unified clock rule:
 //
 //   bool advanced_from_audio = false;
 //   if (has_audio_) { fill_audio(); advanced_from_audio = drive_audio(); }

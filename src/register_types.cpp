@@ -6,9 +6,9 @@
 
 #include "register_types.h"
 
-#include "common/platform_media_resource_format_loader.h"
-#include "common/platform_video_stream.h"
-#include "common/platform_video_stream_playback.h"
+#include "common/native_video_resource_format_loader.h"
+#include "common/native_video_stream.h"
+#include "common/native_video_stream_playback.h"
 
 #include <gdextension_interface.h>
 #include <godot_cpp/classes/resource_loader.hpp>
@@ -18,22 +18,22 @@
 
 using namespace godot;
 
-static Ref<PlatformMediaResourceFormatLoader> s_loader;
+static Ref<NativeVideoResourceFormatLoader> s_loader;
 
-void initialize_platform_media_module(ModuleInitializationLevel p_level) {
+void initialize_native_video_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
 
-	ClassDB::register_class<PlatformVideoStreamPlayback>();
-	ClassDB::register_class<PlatformVideoStream>();
-	ClassDB::register_class<PlatformMediaResourceFormatLoader>();
+	ClassDB::register_class<NativeVideoStreamPlayback>();
+	ClassDB::register_class<NativeVideoStream>();
+	ClassDB::register_class<NativeVideoResourceFormatLoader>();
 
 	s_loader.instantiate();
 	ResourceLoader::get_singleton()->add_resource_format_loader(s_loader);
 }
 
-void uninitialize_platform_media_module(ModuleInitializationLevel p_level) {
+void uninitialize_native_video_module(ModuleInitializationLevel p_level) {
 	if (p_level != MODULE_INITIALIZATION_LEVEL_SCENE) {
 		return;
 	}
@@ -45,14 +45,14 @@ void uninitialize_platform_media_module(ModuleInitializationLevel p_level) {
 }
 
 extern "C" {
-GDExtensionBool GDE_EXPORT platform_media_streams_init(
+GDExtensionBool GDE_EXPORT native_video_init(
 		GDExtensionInterfaceGetProcAddress p_get_proc_address,
 		const GDExtensionClassLibraryPtr p_library,
 		GDExtensionInitialization *r_initialization) {
 	GDExtensionBinding::InitObject init_obj(p_get_proc_address, p_library, r_initialization);
 
-	init_obj.register_initializer(initialize_platform_media_module);
-	init_obj.register_terminator(uninitialize_platform_media_module);
+	init_obj.register_initializer(initialize_native_video_module);
+	init_obj.register_terminator(uninitialize_native_video_module);
 	init_obj.set_minimum_library_initialization_level(MODULE_INITIALIZATION_LEVEL_SCENE);
 
 	return init_obj.init();

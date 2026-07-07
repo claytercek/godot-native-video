@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace platform_media {
+namespace native_video {
 
 // -----------------------------------------------------------------------
 // ImporterKind — the three Windows import paths.
@@ -76,4 +76,4 @@ inline ImporterKind select_importer(
 	return ImporterKind::CpuCopy;
 }
 
-} // namespace platform_media
+} // namespace native_video

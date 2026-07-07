@@ -1,0 +1,12 @@
+[configuration]
+
+entry_symbol = "native_video_init"
+compatibility_minimum = "4.4"
+
+[libraries]
+
+macos.debug = "res://bin/macos/libnative-video.macos.template_debug.dylib"
+macos.release = "res://bin/macos/libnative-video.macos.template_release.dylib"
+
+windows.debug.x86_64 = "res://bin/windows/native-video.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://bin/windows/native-video.windows.template_release.x86_64.dll"
