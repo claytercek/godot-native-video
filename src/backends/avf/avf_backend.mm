@@ -18,6 +18,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -48,14 +49,7 @@ public:
 	int selected_audio_track_index = 0;
 
 	// Per-track audio metadata. Populated during open().
-	struct TrackMeta {
-		std::string language;
-		std::string name;
-		int channels = 0;
-		int sample_rate = 0;
-		bool is_default = false;
-	};
-	std::vector<TrackMeta> audio_tracks;
+	std::vector<core::AudioTrackInfo> audio_tracks;
 
 	std::string path;
 
@@ -266,18 +260,9 @@ bool AvfBackend::Impl::build_reader(double start_time) {
 	teardown();
 	error = false;
 
-	// Resolve the audio track to use: selected index or fallback to default.
-	AVAssetTrack *use_audio = nil;
-	if (audio_tracks.empty()) {
-		use_audio = nil;
-	} else if (selected_audio_track_index >= 0 &&
-			static_cast<size_t>(selected_audio_track_index) < audio_tracks.size() &&
-			all_audio_tracks &&
-			selected_audio_track_index < static_cast<int>(all_audio_tracks.count)) {
-		use_audio = all_audio_tracks[selected_audio_track_index];
-	} else if (all_audio_tracks && all_audio_tracks.count > 0) {
-		use_audio = all_audio_tracks[0];
-	}
+	// apply_track_selection() guarantees selected_audio_track_index is valid
+	// whenever any audio tracks exist, so it is safe to index directly here.
+	AVAssetTrack *use_audio = (all_audio_tracks.count > 0) ? all_audio_tracks[selected_audio_track_index] : nil;
 
 	NSError *err = nil;
 	AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
@@ -518,7 +503,7 @@ bool AvfBackend::open(const std::string &url_or_path) {
 		// Enumerate all audio tracks with per-track metadata.
 		impl_->audio_tracks.clear();
 		for (AVAssetTrack *at in atracks) {
-			Impl::TrackMeta meta;
+			core::AudioTrackInfo meta;
 
 			// Language: use the extended language tag (BCP 47) when available,
 			// falling back to the ISO 639-2 language code.
@@ -603,14 +588,7 @@ core::AudioTrackInfo AvfBackend::audio_track_info(int index) const {
 			static_cast<size_t>(index) >= impl_->audio_tracks.size()) {
 		return {};
 	}
-	const auto &t = impl_->audio_tracks[static_cast<size_t>(index)];
-	core::AudioTrackInfo info;
-	info.language = t.language;
-	info.name = t.name;
-	info.channels = t.channels;
-	info.sample_rate = t.sample_rate;
-	info.is_default = t.is_default;
-	return info;
+	return impl_->audio_tracks[static_cast<size_t>(index)];
 }
 void AvfBackend::select_audio_track(int index) {
 	if (!impl_) {
@@ -621,7 +599,7 @@ void AvfBackend::select_audio_track(int index) {
 		return; // no audio tracks to select from
 	}
 	// Clamp out-of-range to the nearest valid index.
-	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
+	const int clamped = std::clamp(index, 0, count - 1);
 	impl_->apply_track_selection(clamped);
 }
 
@@ -634,7 +612,7 @@ bool AvfBackend::reselect_audio_track(int index, double pts_seconds) {
 		return false; // no audio tracks to select
 	}
 	// Clamp out-of-range to the nearest valid index.
-	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
+	const int clamped = std::clamp(index, 0, count - 1);
 	const double target = pts_seconds < 0.0 ? 0.0 : pts_seconds;
 
 	@autoreleasepool {
