@@ -369,7 +369,7 @@ bool AvfBackend::Impl::build_video_reader(double start_time) {
 		r.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
 	}
 
-	AVAssetReaderTrackOutput *vo = make_video_output(video_track);
+	AVAssetReaderTrackOutput *vo = make_video_output(video_track, color_);
 	vo.alwaysCopiesSampleData = NO;
 	if (![r canAddOutput:vo]) {
 		error = true;
