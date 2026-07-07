@@ -80,7 +80,8 @@ struct Colorimetry {
 
 // -----------------------------------------------------------------------
 // Pixel format tag — surface types produced by a hardware decoder.
-// Only 8-bit SDR formats are in scope for v1.
+// In scope for v1: 8-bit NV12 semi-planar, 10-bit x420/P010 semi-planar
+// (imported as 16-bit R16/RG16 plane views), and the BGRA8 software fallback.
 // -----------------------------------------------------------------------
 enum class PixelFormat : uint8_t {
 	Unknown = 0,

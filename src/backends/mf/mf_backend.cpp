@@ -626,10 +626,10 @@ std::optional<core::VideoFrame> MfBackend::next_video_frame() {
 		// subresource of the shared decoder texture array.
 		frame.plane_slice = static_cast<uint32_t>(subresource);
 
-		// Tag with the stream's negotiated colorimetry (refreshed above on a
-		// native-type change). MF does not expose per-IMFSample colorimetry
-		// overrides the way CoreVideo attaches per-buffer keys, so the current
-		// media type is the most granular source available.
+		// Tag with the stream's negotiated colorimetry. MF does not expose
+		// per-IMFSample colorimetry overrides the way CoreVideo attaches
+		// per-buffer keys, so the current media type is the most granular
+		// source available.
 		frame.color = impl_->color_;
 
 		// Move the texture owner into the release closure so the D3D11 texture is
