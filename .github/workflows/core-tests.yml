@@ -6,17 +6,23 @@ on:
     paths:
       - "src/core/**"
       - "src/backends/**"
+      - "src/common/**"
       - "tests/**"
       - "tools/**"
       - "SConstruct"
+      - ".gitmodules"
+      - ".github/godot-version"
       - ".github/workflows/core-tests.yml"
   pull_request:
     paths:
       - "src/core/**"
       - "src/backends/**"
+      - "src/common/**"
       - "tests/**"
       - "tools/**"
       - "SConstruct"
+      - ".gitmodules"
+      - ".github/godot-version"
       - ".github/workflows/core-tests.yml"
   workflow_dispatch:
 
@@ -47,8 +53,9 @@ jobs:
         with:
           path: |
             tests/fixtures/synthetic.mp4
+            tests/fixtures/synthetic-mt.mp4
             tests/fixtures/matrix
-          key: test-media-v1-${{ hashFiles('tools/gen_test_media.sh', 'tools/gen_clip_matrix.sh') }}
+          key: test-media-v2-${{ hashFiles('tools/gen_test_media.sh', 'tools/gen_clip_matrix.sh') }}
 
       - name: Install ffmpeg
         if: steps.media-cache.outputs.cache-hit != 'true'
@@ -69,6 +76,18 @@ jobs:
           test -s tests/fixtures/synthetic.mp4 && \
             echo "Synthetic clip generated: $(du -sh tests/fixtures/synthetic.mp4 | cut -f1)"
 
+      - name: Generate multi-track synthetic clip
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        # Multi-track variant (2 audio tracks) for the headless Godot smoke
+        # suite's audio track enumeration and mid-play track switch tests.
+        run: |
+          bash tools/gen_test_media.sh \
+            --frames 60 \
+            --multi-track 2 \
+            --output tests/fixtures/synthetic-mt.mp4
+          test -s tests/fixtures/synthetic-mt.mp4 && \
+            echo "Multi-track clip generated: $(du -sh tests/fixtures/synthetic-mt.mp4 | cut -f1)"
+
       - name: Generate real-clip matrix
         if: steps.media-cache.outputs.cache-hit != 'true'
         run: bash tools/gen_clip_matrix.sh
@@ -79,6 +98,7 @@ jobs:
           name: test-media
           path: |
             tests/fixtures/synthetic.mp4
+            tests/fixtures/synthetic-mt.mp4
             tests/fixtures/matrix
           if-no-files-found: error
           retention-days: 1
@@ -163,3 +183,204 @@ jobs:
 
       - name: Run MF backend integration + matrix coverage
         run: bin\mf_tests.exe --reporters=console --no-intro
+
+  godot-smoke:
+    name: Godot Smoke (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    needs: test-media
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS
+            os: macos-latest
+            platform: macos
+            godot-bin: .godot/Godot.app/Contents/MacOS/Godot
+            install-scons: brew install scons
+            install-ffmpeg: brew install ffmpeg
+            lib-name: libplatform-media-streams.macos.template_debug.dylib
+          - label: Windows
+            os: windows-latest
+            platform: windows
+            godot-bin: .godot/Godot.exe
+            install-scons: pip3 install scons
+            install-ffmpeg: choco install ffmpeg -y --no-progress
+            lib-name: platform-media-streams.windows.template_debug.x86_64.dll
+
+    env:
+      GODOT_BIN: ${{ github.workspace }}/${{ matrix.godot-bin }}
+      SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The extension build requires godot-cpp (submodule).
+          submodules: true
+
+      - name: Read Godot version
+        id: godot-version
+        shell: bash
+        run: |
+          VER=$(cat .github/godot-version | tr -d '[:space:]')
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "Godot version = ${VER}"
+
+      - name: Cache Godot binary
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: .godot
+          key: godot-${{ hashFiles('.github/godot-version') }}-${{ runner.os }}
+
+      - name: Download Godot (macOS)
+        if: steps.cache-godot.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          VER="${{ steps.godot-version.outputs.version }}"
+          URL="https://github.com/godotengine/godot/releases/download/${VER}/Godot_v${VER}_macos.universal.zip"
+          echo "Downloading Godot ${VER} (macOS)..."
+          curl -fL -o godot.zip "$URL"
+          mkdir -p .godot
+          unzip -q godot.zip -d .godot/
+          rm -f godot.zip
+          # Gatekeeper bypass: Godot binaries from GitHub releases are not
+          # notarized and will be blocked by macOS quarantine on first launch.
+          xattr -dr com.apple.quarantine .godot/Godot.app 2>/dev/null || true
+          ls -la .godot/Godot.app/Contents/MacOS/Godot
+
+      - name: Download Godot (Windows)
+        if: steps.cache-godot.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.godot-version.outputs.version }}"
+          $url = "https://github.com/godotengine/godot/releases/download/${ver}/Godot_v${ver}_win64.exe.zip"
+          Write-Output "Downloading Godot ${ver} (Windows)..."
+          Invoke-WebRequest -Uri $url -OutFile godot.zip
+          New-Item -ItemType Directory -Force -Path .godot | Out-Null
+          Expand-Archive -Path godot.zip -DestinationPath .godot
+          Get-ChildItem .godot/Godot*.exe | Rename-Item -NewName "Godot.exe" -Force
+          Remove-Item godot.zip
+          Get-ChildItem .godot/Godot.exe
+
+      - name: Verify Godot binary
+        shell: bash
+        run: |
+          "${{ env.GODOT_BIN }}" --version 2>&1 | head -1
+
+      - name: Install SCons
+        run: ${{ matrix.install-scons }}
+
+      - name: Install ffmpeg
+        run: ${{ matrix.install-ffmpeg }}
+
+      - name: Cache SCons build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.scons-cache/
+            ${{ github.workspace }}/**/.sconsign.dblite
+          key: godot-smoke-${{ matrix.platform }}-${{ hashFiles('src/**', 'SConstruct', 'build_profile.json', '.github/godot-version') }}
+          restore-keys: |
+            godot-smoke-${{ matrix.platform }}-
+
+      - name: Build extension
+        shell: bash
+        run: |
+          scons platform=${{ matrix.platform }} target=template_debug
+
+      - name: Verify library installed
+        shell: bash
+        run: |
+          test -f "tests/headless-smoke/bin/${{ matrix.platform }}/${{ matrix.lib-name }}" && \
+            echo "Library installed to smoke project"
+
+      - name: Download test media
+        uses: actions/download-artifact@v4
+        with:
+          name: test-media
+          path: tests/fixtures
+
+      - name: Stage clips for smoke test
+        shell: bash
+        run: |
+          mkdir -p tests/headless-smoke
+          # Copy the multi-track clip (generated by test-media) into the
+          # smoke test project as synthetic.mp4
+          cp tests/fixtures/synthetic-mt.mp4 tests/headless-smoke/synthetic.mp4
+          # Remux to .mov and .m4v for ResourceLoader extension coverage
+          ffmpeg -y -i tests/headless-smoke/synthetic.mp4 -c copy tests/headless-smoke/synthetic.mov 2>/dev/null
+          ffmpeg -y -i tests/headless-smoke/synthetic.mp4 -c copy tests/headless-smoke/synthetic.m4v 2>/dev/null
+          ls -lh tests/headless-smoke/synthetic.*
+
+      - name: Check H.264 + AAC decoder availability (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Regression check: verify the runner image still ships the H.264 and
+          # AAC decoder MFTs the Media Foundation backend depends on. A missing
+          # decoder means a runner-image regression, not a code bug — fail fast
+          # with a clear message instead of a playback timeout.
+          $dlls = @{
+              "msmpeg2vdec.dll" = "H.264 Video Decoder"
+              "msauddecmft.dll" = "AAC Audio Decoder"
+          }
+          $missing = @()
+          foreach ($dll in $dlls.Keys) {
+              $path = Join-Path $env:SystemRoot "System32" $dll
+              if (-not (Test-Path $path)) {
+                  $missing += "$($dlls[$dll]) ($dll)"
+              }
+          }
+          if ($missing.Count -gt 0) {
+              $msg = "FATAL: Required Media Foundation decoders missing on runner. " +
+                     "This is a runner-image regression, not a code bug.`n" +
+                     "Missing: $($missing -join ', ')"
+              Write-Error $msg
+              exit 1
+          }
+          $h264ver = (Get-Item "$env:SystemRoot\System32\msmpeg2vdec.dll").VersionInfo.FileVersion
+          $aacver  = (Get-Item "$env:SystemRoot\System32\msauddecmft.dll").VersionInfo.FileVersion
+          Write-Output "H.264 Video Decoder: $h264ver"
+          Write-Output "AAC Audio Decoder:   $aacver"
+          Write-Output "All decoder MFTs available."
+
+      - name: Headless import pass
+        shell: bash
+        run: |
+          "${{ env.GODOT_BIN }}" --headless --import --path "${{ github.workspace }}/tests/headless-smoke" 2>&1
+
+      - name: Run smoke suite
+        shell: bash
+        run: |
+          STDERR_LOG=$(mktemp)
+          set +e
+          "${{ env.GODOT_BIN }}" --headless --path "${{ github.workspace }}/tests/headless-smoke" 2>"$STDERR_LOG"
+          SMOKE_EXIT=$?
+          STDERR_CONTENT=$(cat "$STDERR_LOG")
+          rm -f "$STDERR_LOG"
+          set -e
+
+          if [ -n "$STDERR_CONTENT" ]; then
+              echo "[GODOT STDERR]" >&2
+              echo "$STDERR_CONTENT" >&2
+          fi
+
+          if echo "$STDERR_CONTENT" | grep -q '^ERROR:' 2>/dev/null; then
+              echo "" >&2
+              echo "FAIL: Engine ERROR(s) detected in stderr" >&2
+              SMOKE_EXIT=1
+          fi
+
+          if [ "$SMOKE_EXIT" -eq 0 ]; then
+              echo ""
+              echo "======================================================================"
+              echo "  SUITE PASSED"
+              echo "======================================================================"
+          else
+              echo ""
+              echo "======================================================================"
+              echo "  SUITE FAILED (exit code $SMOKE_EXIT)"
+              echo "======================================================================"
+          fi
+          exit "$SMOKE_EXIT"
