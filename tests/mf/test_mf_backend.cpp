@@ -62,6 +62,14 @@ std::string repo_root() {
 // empty on failure.
 std::string ensure_fixture() {
 	const std::string root = repo_root();
+	// CI generates one shared synthetic clip (30 frames @ 30 fps, 320x240 —
+	// exactly the kFrames/kFps/kWidth/kHeight contract) on a media runner and
+	// ships it as an artifact; prefer it so the decode assertions run on
+	// runners without ffmpeg.
+	const std::string shared = root + "/tests/fixtures/synthetic.mp4";
+	if (file_exists(shared)) {
+		return shared;
+	}
 	const std::string fixture = root + "/tests/fixtures/synthetic_mf.mp4";
 	if (file_exists(fixture)) {
 		return fixture;
