@@ -5,6 +5,11 @@ extends Node
 # GDExtension. Runs headless with --headless (Dummy audio driver).
 # Exits 0 on all-pass, 1 on any failure.
 #
+# The suite is a single sequential coroutine: _ready() runs the static
+# groups, then awaits phase 1 (linear playback) and phase 2 (mid-play
+# track switch) in order. Nothing runs concurrently with a frequency
+# capture, so a capture can never observe state from a later step.
+#
 # Groups 5 and 6 use AudioEffectCapture to sample the Master bus and
 # measure the dominant frequency via zero-crossing. The synthetic clip
 # encodes a per-frame Sync Ladder (tools/multitrack_lib.sh): track k's
@@ -40,42 +45,25 @@ const SYNC_STRIDE := 3000.0    # Hz — frequency gap between tracks
 const SYNC_PER_FRAME := 200.0  # Hz — frequency step per frame
 const FPS := 30.0
 
-var _elapsed := 0.0
+# Position-monotonicity tolerances and messages per phase. Phase 2 allows
+# more jitter because the track switch itself may nudge the clock.
+const P1_TOLERANCE := 0.01
+const P1_REGRESS_FMT := "Position regressed: %.3f -> %.3f"
+const P2_TOLERANCE := 0.05
+const P2_REGRESS_FMT := "Position regressed significantly after track switch: %.3f -> %.3f"
+
 var _errors := 0
 var _player: VideoStreamPlayer
 var _prev_pos := -1.0
-
-# Phase: 0=static-tests, 1=play-to-eos, 2=track-switch, 3=done
-var _phase := 0
-var _switch_done := false
-var _stream: VideoStream
+var _phase_start_ms := 0
 
 # AudioEffectCapture setup
 var _capture: AudioEffectCapture
 var _capture_bus_idx := -1
 
-# Phase 1 frequency samples. The _p1_capturedN flags are one-shot gates
-# that stay true even when _capture_and_measure_freq() returns -1.0 (silence
-# / timeout), so a failed capture fails Group 5 once instead of busy-looping
-# re-capturing the drained buffer until TIMEOUT fires.
-var _p1_freq0 := -1.0
-var _p1_freq1 := -1.0
-var _p1_pos0 := -1.0
-var _p1_pos1 := -1.0
-var _p1_captured0 := false
-var _p1_captured1 := false
-
-# Phase 2 frequency samples
-var _p2_pre_freq := -1.0
-var _p2_post_freq := -1.0
-var _p2_pre_pos := -1.0
-var _p2_post_pos := -1.0
-var _p2_captured_pre := false
-var _p2_captured_post := false
-
 
 # ===================================================
-# Lifecycle
+# Lifecycle — one sequential pass over all groups
 # ===================================================
 
 func _ready():
@@ -91,6 +79,8 @@ func _ready():
 	AudioServer.add_bus_effect(_capture_bus_idx, _capture, 0)
 	_capture.set_buffer_length(2.0)
 
+	_player = $VideoStreamPlayer
+
 	# --- Group 1: classes registered ---
 	test_classes_registered()
 
@@ -100,32 +90,15 @@ func _ready():
 	# --- Group 4: audio track enumeration ---
 	test_audio_track_enumeration()
 
-	# --- Group 3 & 5 (async): playback progress + frequency tracking ---
-	if _errors > 0:
-		_finish()
-		return
+	# --- Groups 3 & 5: playback progress + frequency tracking ---
+	if _errors == 0:
+		await _run_phase1()
 
-	var ok := _start_phase1()
-	if ok:
-		_phase = 1
-	else:
-		_finish()
+	# --- Group 6: mid-play track switch + post-switch frequency ---
+	if _errors == 0:
+		await _run_phase2()
 
-
-func _process(delta):
-	if _phase == 0 or _phase == 3:
-		return
-
-	_elapsed += delta
-	if _elapsed > TIMEOUT:
-		_fail("TIMEOUT — no EOS after %.1fs" % TIMEOUT)
-		_finish()
-		return
-
-	if _phase == 1:
-		_phase1_process()
-	elif _phase == 2:
-		_phase2_process()
+	_finish()
 
 
 # ===================================================
@@ -187,106 +160,6 @@ func test_resource_loader_resolution():
 
 
 # ===================================================
-# Group 3 — playback progress (phase 1)
-# Group 5 — Sync Ladder frequency tracking during linear playback
-# ===================================================
-
-func _start_phase1() -> bool:
-	print("[PHASE 1] Playing clip to EOS...")
-	_player = $VideoStreamPlayer
-	_stream = ResourceLoader.load(CLIP, "VideoStream")
-	if _stream == null:
-		_fail("Could not load clip for playback")
-		return false
-	_player.stream = _stream
-	_elapsed = 0.0
-	_prev_pos = -1.0
-	_p1_freq0 = -1.0
-	_p1_freq1 = -1.0
-	_p1_pos0 = -1.0
-	_p1_pos1 = -1.0
-	_p1_captured0 = false
-	_p1_captured1 = false
-	_player.play()
-	return true
-
-
-func _phase1_process():
-	# --- Group 3: position monotonic ---
-	if _player.is_playing():
-		var pos := _player.stream_position
-		if _prev_pos >= 0 and pos < _prev_pos - 0.01:
-			_fail("Position regressed: %.3f -> %.3f" % [_prev_pos, pos])
-			_finish()
-			return
-		_prev_pos = pos
-
-		# --- Group 5: frequency tracking ---
-		# Capture frequency at two positions during playback. The Sync Ladder
-		# encodes position: frequency rises ~6000 Hz/s (theoretical) as playback
-		# advances. We measure through the full AudioServer mix pipeline from
-		# AAC-encoded audio, so the zero-crossing estimate is NOT reliable in
-		# absolute terms (see the header CAVEAT). We therefore gate the captures
-		# on one-shot bools (not on freq < 0) and assert only the SIGN of the
-		# trend later. Sample late to avoid startup transients.
-		if not _p1_captured0 and pos >= 0.8:
-			_p1_captured0 = true  # one-shot: stays true even if capture fails
-			_p1_freq0 = await _capture_and_measure_freq()
-			_p1_pos0 = pos
-			print("[PHASE 1] freq sample at pos=%.3f: %.0f Hz" % [pos, _p1_freq0])
-		elif not _p1_captured1 and _p1_captured0 and _p1_freq0 > 0 and pos >= 1.3:
-			_p1_captured1 = true
-			_p1_freq1 = await _capture_and_measure_freq()
-			_p1_pos1 = pos
-			print("[PHASE 1] freq sample at pos=%.3f: %.0f Hz" % [pos, _p1_freq1])
-
-	elif _elapsed > 0.5:
-		# EOS reached
-		var pos := _player.stream_position
-		if pos > 0.0:
-			print("[PHASE 1] EOS at pos=%.3fs — position advanced monotonically" % pos)
-			print("[PASS] Group 3 — playback progress")
-		else:
-			_fail("EOS at zero position — no advance")
-			_finish()
-			return
-
-		# --- Group 5 frequency assertion ---
-		# See the capture block above and the header CAVEAT for why the exact
-		# 6000 Hz/s slope is NOT asserted: AAC + AudioServer make the
-		# zero-crossing estimate unreliable in absolute terms. We assert a
-		# clearly-positive trend (above the noise floor, below a
-		# double-crossing-artifact ceiling), not a match against 6000.
-		if _p1_freq0 > 0 and _p1_freq1 > 0:
-			var ok := true
-			# The Sync Ladder frequency must rise with playback position.
-			if _p1_freq1 <= _p1_freq0:
-				_fail("Phase 1 freq did not increase: %.0f -> %.0f Hz" % [_p1_freq0, _p1_freq1])
-				ok = false
-			else:
-				# Lower bound rejects a near-flat signal (noise/silence);
-				# upper bound rejects double-crossing artifacts from AAC
-				# harmonic distortion. Theoretical slope is 6000 Hz/s; the
-				# measured slope is often ~half and varies run-to-run, so the
-				# band is a noise-rejection window, not a 6000 match.
-				var dt := _p1_pos1 - _p1_pos0
-				var slope := (_p1_freq1 - _p1_freq0) / dt if dt > 0 else 0.0
-				if slope < 1500.0 or slope > 9000.0:
-					_fail("Phase 1 freq slope %.0f Hz/s outside expected range 1500-9000 Hz/s" % slope)
-					ok = false
-				if ok:
-					print("[PHASE 1] freq slope %.0f Hz/s (theoretical ~6000; measured varies via AAC) — Sync Ladder tracks position" % slope)
-			if ok:
-				print("[PASS] Group 5 — Sync Ladder frequency tracks playback position")
-		else:
-			_fail("Could not capture frequency samples for Group 5")
-			_finish()
-			return
-
-		_start_phase2()
-
-
-# ===================================================
 # Group 4 — audio track enumeration
 # ===================================================
 
@@ -328,89 +201,146 @@ func test_audio_track_enumeration():
 
 
 # ===================================================
-# Group 6 — mid-play track switch + post-switch frequency band
-# (The mid-play switch is setup for Group 6's band assertion, not a
-# separate group. Group 5 is the Phase 1 frequency-tracking check.)
+# Group 3 — playback progress
+# Group 5 — Sync Ladder frequency tracking during linear playback
 # ===================================================
 
-func _start_phase2():
-	print("[PHASE 2] Track switch test...")
+func _run_phase1():
+	print("[PHASE 1] Playing clip to EOS...")
+	var stream: VideoStream = ResourceLoader.load(CLIP, "VideoStream")
+	if stream == null:
+		_fail("Could not load clip for playback")
+		return
+	_player.stream = stream
+	_phase_start_ms = Time.get_ticks_msec()
+	_prev_pos = -1.0
+	_player.play()
 
-	_stream = ResourceLoader.load(CLIP, "VideoStream")
-	if _stream == null:
-		_fail("Could not load clip for phase 2")
-		_finish()
+	# Capture frequency at two positions during playback. The Sync Ladder
+	# encodes position: frequency rises ~6000 Hz/s (theoretical) as playback
+	# advances. We measure through the full AudioServer mix pipeline from
+	# AAC-encoded audio, so the estimate is unreliable in absolute terms (see
+	# the header CAVEAT) and only the trend is asserted at EOS. Sample late
+	# to avoid startup transients.
+	var s0 := {"pos": -1.0, "freq": -1.0}
+	var s1 := {"pos": -1.0, "freq": -1.0}
+	var reached := await _wait_for_position(0.8, P1_TOLERANCE, P1_REGRESS_FMT)
+	if reached >= 0.0:
+		s0 = await _capture_sample()
+		print("[PHASE 1] freq sample at pos=%.3f: %.0f Hz" % [s0.pos, s0.freq])
+		if s0.freq > 0:
+			reached = await _wait_for_position(1.3, P1_TOLERANCE, P1_REGRESS_FMT)
+			if reached >= 0.0:
+				s1 = await _capture_sample()
+				print("[PHASE 1] freq sample at pos=%.3f: %.0f Hz" % [s1.pos, s1.freq])
+	if _errors > 0:
 		return
 
-	_phase = 2
-	_elapsed = 0.0
-	_prev_pos = -1.0
-	_switch_done = false
-	_p2_pre_freq = -1.0
-	_p2_post_freq = -1.0
-	_p2_pre_pos = -1.0
-	_p2_post_pos = -1.0
-	_p2_captured_pre = false
-	_p2_captured_post = false
+	var final_pos := await _wait_for_eos(P1_TOLERANCE, P1_REGRESS_FMT)
+	if _errors > 0:
+		return
 
-	_player.stream = _stream
+	# --- Group 3: position monotonic, advanced to EOS ---
+	if final_pos > 0.0:
+		print("[PHASE 1] EOS at pos=%.3fs — position advanced monotonically" % final_pos)
+		print("[PASS] Group 3 — playback progress")
+	else:
+		_fail("EOS at zero position — no advance")
+		return
+
+	# --- Group 5 frequency assertion ---
+	# See the header CAVEAT for why the exact 6000 Hz/s slope is NOT
+	# asserted: AAC + AudioServer make the zero-crossing estimate unreliable
+	# in absolute terms. We assert a clearly-positive trend (above the noise
+	# floor, below a double-crossing-artifact ceiling), not a match against
+	# 6000.
+	if s0.freq > 0 and s1.freq > 0:
+		var ok := true
+		# The Sync Ladder frequency must rise with playback position.
+		if s1.freq <= s0.freq:
+			_fail("Phase 1 freq did not increase: %.0f -> %.0f Hz" % [s0.freq, s1.freq])
+			ok = false
+		else:
+			# Lower bound rejects a near-flat signal (noise/silence);
+			# upper bound rejects double-crossing artifacts from AAC
+			# harmonic distortion. Theoretical slope is 6000 Hz/s; the
+			# measured slope is often ~half and varies run-to-run, so the
+			# band is a noise-rejection window, not a 6000 match.
+			var dt: float = s1.pos - s0.pos
+			var slope: float = (s1.freq - s0.freq) / dt if dt > 0 else 0.0
+			if slope < 1500.0 or slope > 9000.0:
+				_fail("Phase 1 freq slope %.0f Hz/s outside expected range 1500-9000 Hz/s" % slope)
+				ok = false
+			if ok:
+				print("[PHASE 1] freq slope %.0f Hz/s (theoretical ~6000; measured varies via AAC) — Sync Ladder tracks position" % slope)
+		if ok:
+			print("[PASS] Group 5 — Sync Ladder frequency tracks playback position")
+	else:
+		_fail("Could not capture frequency samples for Group 5")
+
+
+# ===================================================
+# Group 6 — mid-play track switch + post-switch frequency band
+# ===================================================
+
+func _run_phase2():
+	print("[PHASE 2] Track switch test...")
+	var stream: VideoStream = ResourceLoader.load(CLIP, "VideoStream")
+	if stream == null:
+		_fail("Could not load clip for phase 2")
+		return
+	_phase_start_ms = Time.get_ticks_msec()
+	_prev_pos = -1.0
+	_player.stream = stream
 	_player.audio_track = 1  # Start on the non-default track
 	_player.play()
 	print("[PHASE 2] Playing with track=1")
 
+	var pre := {"pos": -1.0, "freq": -1.0}
+	var post := {"pos": -1.0, "freq": -1.0}
+	var switched := false
 
-func _phase2_process():
-	if not _player.is_playing():
-		if _elapsed > 0.5:
-			var pos := _player.stream_position
-			if pos > 0.0 and _switch_done:
-				print("[PHASE 2] EOS at pos=%.3fs after track switch" % pos)
-				print("[PASS] mid-play track switch — playback continued after switching audio track")
+	# Pre-switch capture (track 1 audio). Because this coroutine is the only
+	# driver of phase 2, the track switch below cannot run until the capture
+	# has fully returned — the pre-switch sample can never contain track 0
+	# audio.
+	var reached := await _wait_for_position(0.8, P2_TOLERANCE, P2_REGRESS_FMT)
+	if reached >= 0.0:
+		pre = await _capture_sample()
+		print("[PHASE 2] Pre-switch freq at pos=%.3f (track 1): %.0f Hz" % [pre.pos, pre.freq])
 
-				# --- Group 6 frequency band assertion ---
-				_assert_post_switch_freq()
-			elif pos > 0.0:
-				_fail("Track switch never executed (clip ended before switch point)")
-			else:
-				_fail("No position advance in phase 2")
-			_finish()
+		# Switch tracks at ~1 second in.
+		var switch_pos := await _wait_for_position(1.0, P2_TOLERANCE, P2_REGRESS_FMT)
+		if switch_pos >= 0.0:
+			_player.audio_track = 0
+			switched = true
+			print("[PHASE 2] Switched to track 0 at pos=%.3fs" % switch_pos)
+
+			# Post-switch capture: wait ~0.7s after the switch for the audio
+			# pipeline to deliver track 0 audio.
+			reached = await _wait_for_position(1.7, P2_TOLERANCE, P2_REGRESS_FMT)
+			if reached >= 0.0:
+				post = await _capture_sample()
+				print("[PHASE 2] Post-switch freq at pos=%.3f (track 0): %.0f Hz" % [post.pos, post.freq])
+	if _errors > 0:
 		return
 
-	var pos := _player.stream_position
-
-	# --- Pre-switch frequency capture (track 1 audio) ---
-	if not _p2_captured_pre and pos >= 0.8:
-		_p2_captured_pre = true  # mark in-progress
-		_p2_pre_freq = await _capture_and_measure_freq()
-		_p2_pre_pos = pos
-		print("[PHASE 2] Pre-switch freq at pos=%.3f (track 1): %.0f Hz" % [pos, _p2_pre_freq])
-
-	# Switch tracks at ~1 second in
-	if not _switch_done and pos > 1.0:
-		_player.audio_track = 0
-		print("[PHASE 2] Switched to track 0 at pos=%.3fs" % pos)
-		_prev_pos = pos
-		_switch_done = true
+	var final_pos := await _wait_for_eos(P2_TOLERANCE, P2_REGRESS_FMT)
+	if _errors > 0:
 		return
 
-	# --- Post-switch frequency capture (should be track 0 audio) ---
-	# Wait ~0.7s after switch for the audio pipeline to deliver track 0 audio
-	if _switch_done and not _p2_captured_post and pos >= 1.7:
-		_p2_captured_post = true  # mark in-progress
-		_p2_post_freq = await _capture_and_measure_freq()
-		_p2_post_pos = pos
-		print("[PHASE 2] Post-switch freq at pos=%.3f (track 0): %.0f Hz" % [pos, _p2_post_freq])
-
-	# Verify monotonic position after switch.
-	if _prev_pos >= 0 and pos < _prev_pos - 0.05:
-		_fail("Position regressed significantly after track switch: %.3f -> %.3f" % [_prev_pos, pos])
-		_finish()
-		return
-	_prev_pos = pos
+	if final_pos > 0.0 and switched:
+		print("[PHASE 2] EOS at pos=%.3fs after track switch" % final_pos)
+		print("[PASS] mid-play track switch — playback continued after switching audio track")
+		_assert_post_switch_freq(pre, post)
+	elif final_pos > 0.0:
+		_fail("Track switch never executed (clip ended before switch point)")
+	else:
+		_fail("No position advance in phase 2")
 
 
-func _assert_post_switch_freq():
-	if _p2_pre_freq < 0 or _p2_post_freq < 0:
+func _assert_post_switch_freq(pre: Dictionary, post: Dictionary):
+	if pre.freq < 0 or post.freq < 0:
 		# Frequency capture failed — not a hard failure if capture is
 		# impossible, but log it.
 		print("[INFO] Group 6 skipped — frequency samples not available")
@@ -437,12 +367,12 @@ func _assert_post_switch_freq():
 	# to measure (both give a low slope). So this proves we did NOT stay on
 	# track 1, NOT that clean track-0 audio reached the output.
 
-	var dt := _p2_post_pos - _p2_pre_pos
-	var diff := _p2_post_freq - _p2_pre_freq
-	var slope := diff / dt if dt > 0 else 0.0
+	var dt: float = post.pos - pre.pos
+	var diff: float = post.freq - pre.freq
+	var slope: float = diff / dt if dt > 0 else 0.0
 
-	print("[PHASE 2] Pre-switch: %.0f Hz at pos %.3f (track 1)" % [_p2_pre_freq, _p2_pre_pos])
-	print("[PHASE 2] Post-switch: %.0f Hz at pos %.3f (track 0)" % [_p2_post_freq, _p2_post_pos])
+	print("[PHASE 2] Pre-switch: %.0f Hz at pos %.3f (track 1)" % [pre.freq, pre.pos])
+	print("[PHASE 2] Post-switch: %.0f Hz at pos %.3f (track 0)" % [post.freq, post.pos])
 	print("[PHASE 2] Δfreq=%.0f Hz over Δt=%.3fs (slope=%.0f Hz/s)" % [diff, dt, slope])
 
 	# Still on track 1 => slope ~6000 Hz/s. Switch to track 0 => slope well
@@ -461,15 +391,78 @@ func _assert_post_switch_freq():
 		print("[PHASE 2] Post-switch slope %.0f Hz/s (< 5000) confirms we did not stay on track 1" % slope)
 		print("[PASS] Group 6 — post-switch slope confirms audio track changed (not still track 1)")
 
-	return
+
+# ===================================================
+# Playback polling
+# ===================================================
+
+func _phase_elapsed() -> float:
+	return float(Time.get_ticks_msec() - _phase_start_ms) / 1000.0
+
+
+# Poll frame-by-frame until stream_position reaches `target`, checking the
+# per-phase timeout and position monotonicity on every frame. Returns the
+# position at which the target was reached, or -1.0 if playback stopped
+# first (EOS — not a failure; the caller decides) or on timeout/regression
+# (both _fail()).
+func _wait_for_position(target: float, tolerance: float, regress_fmt: String) -> float:
+	while true:
+		await get_tree().process_frame
+		if _phase_elapsed() > TIMEOUT:
+			_fail("TIMEOUT — no EOS after %.1fs" % TIMEOUT)
+			return -1.0
+		if not _player.is_playing():
+			# Ignore the not-yet-started window right after play().
+			if _phase_elapsed() > 0.5:
+				return -1.0
+			continue
+		var pos := _player.stream_position
+		if _prev_pos >= 0 and pos < _prev_pos - tolerance:
+			_fail(regress_fmt % [_prev_pos, pos])
+			return -1.0
+		_prev_pos = pos
+		if pos >= target:
+			return pos
+	return -1.0  # unreachable
+
+
+# Poll frame-by-frame until the player stops (EOS), with the same timeout
+# and monotonicity checks. Returns the final stream position, or -1.0 on
+# timeout/regression (both _fail()).
+func _wait_for_eos(tolerance: float, regress_fmt: String) -> float:
+	while true:
+		await get_tree().process_frame
+		if _phase_elapsed() > TIMEOUT:
+			_fail("TIMEOUT — no EOS after %.1fs" % TIMEOUT)
+			return -1.0
+		if not _player.is_playing():
+			# Ignore the not-yet-started window right after play().
+			if _phase_elapsed() > 0.5:
+				return _player.stream_position
+			continue
+		var pos := _player.stream_position
+		if _prev_pos >= 0 and pos < _prev_pos - tolerance:
+			_fail(regress_fmt % [_prev_pos, pos])
+			return -1.0
+		_prev_pos = pos
+	return -1.0  # unreachable
 
 
 # ===================================================
 # Audio capture and frequency measurement
 # ===================================================
 
+# Read the position first, then capture: the sample's position is the
+# moment the capture was requested, matching how the Sync Ladder encodes
+# position into frequency.
+func _capture_sample() -> Dictionary:
+	var pos := _player.stream_position
+	var freq := await _capture_and_measure_freq()
+	return {"pos": pos, "freq": freq}
+
+
 func _capture_and_measure_freq() -> float:
-	# Wait for at least 2048 frames of captured audio
+	# Wait for at least 4800 frames (100 ms) of captured audio
 	var deadline := 2.0  # max seconds to wait
 	var waited := 0.0
 	var step := 0.01
@@ -529,8 +522,6 @@ func _fail(msg: String):
 
 
 func _finish():
-	_phase = 3
-
 	# Remove the AudioEffectCapture we added at effect index 0 on Master.
 	if _capture_bus_idx >= 0 and _capture:
 		AudioServer.remove_bus_effect(_capture_bus_idx, 0)
