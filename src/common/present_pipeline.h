@@ -77,16 +77,19 @@ public:
 	// Returns false if RD is unavailable or the device is not Metal.
 	bool ensure_ready(int width, int height);
 
-	bool is_ready() const { return ready_; }
+	bool is_ready() const { return state_ == State::Ready; }
 
 	// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
 	// next ensure_ready() call — the ring texture format changes too (rgba8 vs
 	// rgba16f), so build_resources() has to rebuild everything anyway, shader
-	// included. Default SDR.
+	// included. Default SDR. No-op if the pipeline is Disabled: there is
+	// nothing to rebuild, and Disabled never leaves that state.
 	void set_output_mode(OutputMode mode) {
 		if (mode != output_mode_) {
 			output_mode_ = mode;
-			ready_ = false; // force rebuild on next ensure_ready
+			if (state_ == State::Ready) {
+				state_ = State::Unbuilt; // force rebuild on next ensure_ready
+			}
 		}
 	}
 
@@ -133,6 +136,15 @@ private:
 	bool build_resources(int width, int height);
 	void free_resources();
 
+	// -----------------------------------------------------------------------
+	// State — the pipeline's RD-resource lifecycle.
+	// -----------------------------------------------------------------------
+	enum class State : uint8_t {
+		Unbuilt,  // resources not built (initial, or after free/dimension change)
+		Ready,    // resources built and usable
+		Disabled, // no RenderingServer/RenderingDevice — terminal, never leaves
+	};
+
 	godot::RenderingDevice *rd_ = nullptr; // borrowed: the global RD
 	// Per-platform importer chosen at link time by make_surface_importer().
 	std::unique_ptr<SurfaceImporter> importer_;
@@ -159,13 +171,11 @@ private:
 
 	int width_ = 0;
 	int height_ = 0;
-	bool ready_ = false;
-	// Set once when we detect no RenderingDevice is available (e.g. headless
-	// mode). Once true, ensure_ready() short-circuits without calling
-	// build_resources(), which would re-query the same absent RD every frame.
-	// build_resources() prints the one-shot headless notice at the moment it
-	// flips this flag, so no separate "notice shown" bool is needed.
-	bool no_rd_ = false;
+	// Disabled is terminal: once the pipeline lands there (no RenderingServer
+	// or no RenderingDevice, e.g. headless mode), ensure_ready() short-circuits
+	// without calling build_resources() again, which would otherwise re-query
+	// the same absent RD and re-print its notice every frame.
+	State state_ = State::Unbuilt;
 
 	OutputMode output_mode_ = OutputMode::SDR;
 
