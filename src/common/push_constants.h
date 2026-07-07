@@ -16,7 +16,7 @@
 //   offset 20: transfer_select (uint32) — core::TransferFunction
 //   offset 24: primaries_select (uint32) — core::ColorPrimaries
 //   offset 28: sample_scale   (float)
-//   Total: 32 bytes
+//   Total: kPushConstantSize (32) bytes
 //
 // A 16-byte multiple is required because pre-4.7 Godot rounds the required
 // push-constant size up to 32 and 4.7+ validates the exact declared size of
@@ -32,9 +32,13 @@
 
 namespace platform_media {
 
-// Pack the seven push-constant fields into the 32-byte buffer `dst`.
-// `dst` must point to at least 32 bytes of writable memory. The encoding
-// matches the GLSL std430 layout declared in nv12_to_rgb.glsl.
+// Size in bytes of the packed push-constant block (see layout above).
+inline constexpr uint32_t kPushConstantSize = 32;
+
+// Pack the frame's colorimetry and output dimensions into the
+// kPushConstantSize-byte buffer `dst`. `dst` must point to at least
+// kPushConstantSize bytes of writable memory. The encoding matches the
+// GLSL std430 layout declared in nv12_to_rgb.glsl.
 //
 // This is a pure function: no side effects on anything outside `dst`,
 // no heap allocation, no Godot API calls.
@@ -42,13 +46,14 @@ inline void pack_push_constants(
 		uint8_t *dst,
 		uint32_t width,
 		uint32_t height,
-		uint32_t matrix_select,
-		uint32_t range_select,
-		uint32_t bit_depth,
-		uint32_t transfer_select,
-		uint32_t primaries_select,
+		const core::Colorimetry &color,
 		float sample_scale) noexcept {
-	std::memset(dst, 0, 32);
+	std::memset(dst, 0, kPushConstantSize);
+	const uint32_t matrix_select = static_cast<uint32_t>(color.matrix);
+	const uint32_t range_select = static_cast<uint32_t>(color.range);
+	const uint32_t bit_depth = static_cast<uint32_t>(color.bit_depth);
+	const uint32_t transfer_select = static_cast<uint32_t>(color.transfer);
+	const uint32_t primaries_select = static_cast<uint32_t>(color.primaries);
 	std::memcpy(dst + 0, &width, sizeof(uint32_t));
 	std::memcpy(dst + 4, &height, sizeof(uint32_t));
 	std::memcpy(dst + 8, &matrix_select, sizeof(uint32_t));
@@ -57,26 +62,6 @@ inline void pack_push_constants(
 	std::memcpy(dst + 20, &transfer_select, sizeof(uint32_t));
 	std::memcpy(dst + 24, &primaries_select, sizeof(uint32_t));
 	std::memcpy(dst + 28, &sample_scale, sizeof(float));
-}
-
-// Convenience overload: takes the frame's core::Colorimetry struct
-// (its uint8 enums are cast to uint32 automatically) and the sample_scale.
-inline void pack_push_constants(
-		uint8_t *dst,
-		uint32_t width,
-		uint32_t height,
-		const core::Colorimetry &color,
-		float sample_scale) noexcept {
-	pack_push_constants(
-		dst,
-		width,
-		height,
-		static_cast<uint32_t>(color.matrix),
-		static_cast<uint32_t>(color.range),
-		static_cast<uint32_t>(color.bit_depth),
-		static_cast<uint32_t>(color.transfer),
-		static_cast<uint32_t>(color.primaries),
-		sample_scale);
 }
 
 } // namespace platform_media
