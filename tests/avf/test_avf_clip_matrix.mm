@@ -2,8 +2,11 @@
 // test_avf_clip_matrix.mm — real-clip format-matrix coverage for the AVF
 // (macOS) Decoder-mode Backend. NO Godot, NO RenderingDevice.
 //
-// Drives every clip in tests/fixtures/matrix/matrix.list through
-// avf::AvfBackend and asserts the real-world decode contract:
+// Structural mirror of tests/mf/test_mf_clip_matrix.cpp: both platform files
+// are thin TEST_CASE wrappers around the shared case bodies in
+// tests/common/clip_matrix_cases.h, which drive every clip in
+// tests/fixtures/matrix/matrix.list through the platform's Backend and assert
+// the same real-world decode contract:
 //   - dimensions exact (width/height match the manifest);
 //   - decode succeeds with no error;
 //   - decoded video frame count within +/-1 of the manifest (GOP/timebase slack);
@@ -12,9 +15,8 @@
 //     of its ideal index*interval position (real encoder timebase quirks must
 //     not accumulate drift).
 //   - colorimetry: per-clip matrix/primaries/transfer/range assertions, keyed
-//     by clip filename. Untagged clips default to BT.709 video-range (pixel-
-//     identical to the old hard-coded constants). BT.601-tagged clips decode
-//     with the SD matrix.
+//     by clip filename. Untagged clips default to BT.709 video-range. BT.601-
+//     tagged clips decode with the SD matrix.
 //
 // For multi-track clips (audio_tracks > 1 in the manifest) the test also
 // verifies track enumeration (count, language tags, default flag) against the
@@ -31,565 +33,57 @@
 // -----------------------------------------------------------------------
 
 #include "vendor/doctest.h"
-#include "common/clip_matrix.h"
+#include "common/clip_matrix_cases.h"
 
 #include "avf_backend.h"
 
-#include <cmath>
-#include <string>
-
-// -----------------------------------------------------------------------
-// Colorimetry expectations per clip filename.
-// Untagged clips are not listed here; they must default to BT.709 video range.
-// -----------------------------------------------------------------------
-struct ColorimetryExpect {
-	core::ColorMatrix matrix = core::ColorMatrix::BT709;
-	core::ColorPrimaries primaries = core::ColorPrimaries::BT709;
-	core::TransferFunction transfer = core::TransferFunction::BT709;
-	core::ColorRange range = core::ColorRange::Video;
-	int bit_depth = 8;
-};
-
-static bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) {
-	// BT.601 NTSC-tagged clip. The generator forces the ISOBMFF 'colr' box
-	// (-movflags +write_colr), so the format description extensions carry the
-	// full SD tags: BT.601 matrix and SMPTE-C primaries. The SMPTE 170M
-	// transfer function is curve-identical to BT.709 and CoreMedia
-	// canonicalizes it as such.
-	if (file == "h264_30_bt601_mp4.mp4") {
-		out.matrix = core::ColorMatrix::BT601;
-		out.primaries = core::ColorPrimaries::BT601_525;
-		out.transfer = core::TransferFunction::BT709;
-		out.range = core::ColorRange::Video;
-		out.bit_depth = 8;
-		return true;
-	}
-	// HEVC Main10 SDR clip. Negotiates as 10-bit biplanar (x420). The bit
-	// depth is detected from the format description's BitsPerComponent (10).
-	// The format description extensions have no colorimetry tags (ffmpeg
-	// default), so open-time defaults to BT.709 video range. Per-frame CV
-	// attachments carry BT.601 matrix (ffmpeg color filter default).
-	if (file == "hevc_main10_30_mp4.mp4") {
-		out.matrix = core::ColorMatrix::BT709;
-		out.primaries = core::ColorPrimaries::BT709;
-		out.transfer = core::TransferFunction::BT709;
-		out.range = core::ColorRange::Video;
-		out.bit_depth = 10;
-		return true;
-	}
-	// HDR10 clip: PQ transfer, BT.2020 primaries, BT.2020 non-constant
-	// luminance matrix. 10-bit.
-	if (file == "hevc_pq_bt2020_30_mp4.mp4") {
-		out.matrix = core::ColorMatrix::BT2020;
-		out.primaries = core::ColorPrimaries::BT2020;
-		out.transfer = core::TransferFunction::PQ;
-		out.range = core::ColorRange::Video;
-		out.bit_depth = 10;
-		return true;
-	}
-	// HLG clip: HLG transfer, BT.2020 primaries, BT.2020 non-constant
-	// luminance matrix. 10-bit.
-	if (file == "hevc_hlg_bt2020_30_mp4.mp4") {
-		out.matrix = core::ColorMatrix::BT2020;
-		out.primaries = core::ColorPrimaries::BT2020;
-		out.transfer = core::TransferFunction::HLG;
-		out.range = core::ColorRange::Video;
-		out.bit_depth = 10;
-		return true;
-	}
-
-	// Untagged — return defaults (which the caller can skip asserting).
-	return false;
-}
-
-// Assert that the backend's open-time colorimetry matches expectations.
-static void check_backend_colorimetry(avf::AvfBackend &backend,
-		const std::string &file) {
-	const core::Colorimetry color = backend.colorimetry();
-	ColorimetryExpect exp;
-	if (!expect_colorimetry(file, exp)) {
-		// Untagged clip: assert defaults (BT.709 video range).
-		CHECK(color.matrix == core::ColorMatrix::BT709);
-		CHECK(color.primaries == core::ColorPrimaries::BT709);
-		CHECK(color.transfer == core::TransferFunction::BT709);
-		CHECK(color.range == core::ColorRange::Video);
-		CHECK(color.bit_depth == 8);
-		return;
-	}
-	CHECK(color.matrix == exp.matrix);
-	CHECK(color.primaries == exp.primaries);
-	CHECK(color.transfer == exp.transfer);
-	CHECK(color.range == exp.range);
-	CHECK(color.bit_depth == exp.bit_depth);
-}
-
-// True for clips whose format description carries explicit colorimetry tags
-// (matrix, primaries, transfer function). Untagged clips (including ffmpeg
-// defaults) return false; the per-frame CV attachments may carry arbitrary
-// decoder defaults that differ from the open-time negotiated values.
-static bool has_explicit_colorimetry(const std::string &file) {
-	return file == "h264_30_bt601_mp4.mp4" ||
-		file == "hevc_pq_bt2020_30_mp4.mp4" ||
-		file == "hevc_hlg_bt2020_30_mp4.mp4";
-}
-
-// Assert that the per-frame colorimetry matches expectations.
-// Only meaningful for clips with explicit colorimetry tags in the format
-// description; untagged clips have decoder-default CV attachments that vary.
-static void check_frame_colorimetry(const core::VideoFrame &frame,
-		const std::string &file) {
-	if (!has_explicit_colorimetry(file)) {
-		// Untagged frame: default fields are Unspecified or decoder-defaults,
-		// which the shader handles as BT.709/video-range — same as today.
-		return;
-	}
-	ColorimetryExpect exp;
-	expect_colorimetry(file, exp);
-	// Tagged clip: CV attachments carry the exact metadata.
-	CHECK(static_cast<int>(frame.color.matrix) == static_cast<int>(exp.matrix));
-	CHECK(static_cast<int>(frame.color.range) == static_cast<int>(exp.range));
-}
-
-// -----------------------------------------------------------------------
-// Helper: find the first n-track clip in the manifest.
-// Returns nullptr when none exists.
-// -----------------------------------------------------------------------
 namespace {
 
-const clip_matrix::Clip *find_multi_track_clip(const std::vector<clip_matrix::Clip> &clips, int min_tracks = 2) {
-	for (const auto &clip : clips) {
-		if (clip.audio_tracks >= min_tracks) {
-			return &clip;
-		}
+// AVF always has hardware HEVC decode available on the macOS hosts used for
+// CI, so the format-matrix case's hevc_available customization point is
+// always true here. MF's twin probes for an optional MFT — see
+// hevc_decoder_available() in test_mf_clip_matrix.cpp.
+constexpr bool kHevcAvailable = true;
+
+// AVF's per-frame CV attachments only carry reliable colorimetry for clips
+// with an explicit container tag, and even then only matrix + range (not
+// primaries/transfer) — decoder-default attachments on untagged clips vary
+// and are not asserted. MF's twin checks all four fields on every frame,
+// tagged or not — see check_frame_colorimetry() in test_mf_clip_matrix.cpp.
+bool has_explicit_colorimetry(const std::string &file) {
+	return file == "h264_30_bt601_mp4.mp4" ||
+			file == "hevc_pq_bt2020_30_mp4.mp4" ||
+			file == "hevc_hlg_bt2020_30_mp4.mp4";
+}
+
+void check_frame_colorimetry(const core::VideoFrame &frame, const std::string &file) {
+	if (!has_explicit_colorimetry(file)) {
+		return;
 	}
-	return nullptr;
+	clip_matrix_cases::ColorimetryExpect exp;
+	clip_matrix_cases::expect_colorimetry(file, exp);
+	CHECK(static_cast<int>(frame.color.matrix) == static_cast<int>(exp.matrix));
+	CHECK(static_cast<int>(frame.color.range) == static_cast<int>(exp.range));
 }
 
 } // namespace
 
 TEST_CASE("AVF backend decodes the real-clip format matrix") {
-	const auto clips = clip_matrix::load();
-	if (clips.empty()) {
-		WARN_MESSAGE(false, "clip matrix manifest absent — skipping real-clip coverage");
-		return;
-	}
-
-	int decoded_clips = 0;
-
-	for (const auto &clip : clips) {
-		const std::string path = clip_matrix::clip_path(clip);
-
-		if (!clip_matrix::file_exists(path)) {
-			WARN_MESSAGE(false, ("matrix clip missing (run tools/gen_clip_matrix.sh): " + clip.file).c_str());
-			continue;
-		}
-
-		CAPTURE(clip.file);
-
-		avf::AvfBackend backend;
-		REQUIRE(backend.open(path));
-
-		// --- Dimensions: exact ---
-		CHECK(backend.video_width() == clip.width);
-		CHECK(backend.video_height() == clip.height);
-
-		// --- Colorimetry: open-time values ---
-		check_backend_colorimetry(backend, clip.file);
-
-		// --- Audio track shape: AAC stereo @ 48 kHz ---
-		CHECK(backend.audio_sample_rate() == clip.audio_rate);
-		CHECK(backend.audio_channel_count() == clip.audio_channels);
-
-		// --- Multi-track enumeration verification ---
-		if (clip.audio_tracks > 1) {
-			CHECK(backend.audio_track_count() == clip.audio_tracks);
-
-			// Default track (index 0) metadata.
-			const auto t0 = backend.audio_track_info(0);
-			CHECK(t0.channels == clip.audio_channels);
-			CHECK(t0.sample_rate == clip.audio_rate);
-			CHECK(t0.is_default == true);
-			if (!clip.track_languages.empty()) {
-				CHECK(t0.language == clip.track_languages[0]);
-			}
-
-			// Second track metadata.
-			const auto t1 = backend.audio_track_info(1);
-			CHECK(t1.is_default == false);
-			CHECK(t1.channels == clip.audio_channels);
-			CHECK(t1.sample_rate == clip.audio_rate);
-			if (clip.track_languages.size() > 1) {
-				CHECK(t1.language == clip.track_languages[1]);
-			}
-
-			// Out-of-range returns empty info.
-			const auto t99 = backend.audio_track_info(99);
-			CHECK(t99.channels == 0);
-			CHECK(t99.sample_rate == 0);
-			CHECK(t99.is_default == false);
-		} else {
-			// Single-track clip: default enumeration contract.
-			CHECK(backend.audio_track_count() == 1);
-			const auto t0 = backend.audio_track_info(0);
-			CHECK(t0.channels == clip.audio_channels);
-			CHECK(t0.sample_rate == clip.audio_rate);
-			CHECK(t0.is_default == true);
-			// Language may or may not be present on single-track clips; accept both.
-		}
-
-		// --- Video: decode-success + count + PTS drift within budget ---
-		const double interval = 1.0 / static_cast<double>(clip.fps);
-		const double budget = interval * 0.5; // half a frame interval
-
-		int video_count = 0;
-		double last_pts = -1.0;
-		double max_drift = 0.0;
-		bool first_frame = true;
-		while (auto frame = backend.next_video_frame()) {
-			// 8-bit sources produce NV12; 10-bit sources produce x420.
-			ColorimetryExpect exp;
-			const bool is_10bit = expect_colorimetry(clip.file, exp) && exp.bit_depth >= 10;
-			if (is_10bit) {
-				CHECK(frame->pixel_format == core::PixelFormat::x420);
-				CHECK(frame->color.bit_depth == 10);
-			} else {
-				CHECK(frame->pixel_format == core::PixelFormat::NV12);
-				CHECK(frame->color.bit_depth == 8);
-			}
-			CHECK(frame->native_handle != nullptr);
-			CHECK(frame->width == clip.width);
-			CHECK(frame->height == clip.height);
-
-			// Colorimetry per frame: check the first frame's attachments.
-			if (first_frame) {
-				check_frame_colorimetry(*frame, clip.file);
-				first_frame = false;
-			}
-
-			// Monotonic non-decreasing PTS.
-			CHECK(frame->pts_seconds >= last_pts);
-			last_pts = frame->pts_seconds;
-
-			// Drift of this frame's PTS from its ideal index*interval slot.
-			const double ideal = static_cast<double>(video_count) * interval;
-			const double drift = std::fabs(frame->pts_seconds - ideal);
-			if (drift > max_drift) {
-				max_drift = drift;
-			}
-
-			frame->release();
-			++video_count;
-		}
-
-		CHECK_FALSE(backend.had_error());
-		CHECK(video_count >= clip.frames - 1);
-		CHECK(video_count <= clip.frames + 1);
-		CHECK(max_drift <= budget);
-
-		// --- Audio: re-open (single-pass reader), pump PCM, monotonic PTS ---
-		REQUIRE(backend.open(path));
-		long audio_frames_total = 0;
-		double last_audio_pts = -1.0;
-		int audio_chunks = 0;
-		while (auto chunk = backend.next_audio_chunk()) {
-			CHECK(chunk->samples != nullptr);
-			CHECK(chunk->frame_count > 0);
-			CHECK(chunk->channel_count == clip.audio_channels);
-			CHECK(chunk->sample_rate == clip.audio_rate);
-			CHECK(chunk->pts_seconds >= last_audio_pts);
-			last_audio_pts = chunk->pts_seconds;
-			audio_frames_total += chunk->frame_count;
-			++audio_chunks;
-		}
-		CHECK_FALSE(backend.had_error());
-		CHECK(audio_chunks > 0);
-
-		// At least half the nominal duration of samples (AAC priming/padding fuzz).
-		const long nominal =
-				static_cast<long>(static_cast<double>(clip.audio_rate) * clip.frames / clip.fps);
-		CHECK(audio_frames_total >= nominal / 2);
-
-		++decoded_clips;
-	}
-
-	// If the manifest listed clips but none were decodable (all missing), warn
-	// loudly so an operator knows coverage didn't actually run.
-	if (decoded_clips == 0) {
-		WARN_MESSAGE(false, "no matrix clips were decodable — run tools/gen_clip_matrix.sh");
-	}
+	clip_matrix_cases::run_format_matrix_case<avf::AvfBackend>(kHevcAvailable, check_frame_colorimetry);
 }
 
 TEST_CASE("AVF backend selects pre-play audio track from multi-track matrix clip") {
-	const auto clips = clip_matrix::load();
-	if (clips.empty()) {
-		WARN_MESSAGE(false, "clip matrix manifest absent — skipping multi-track selection");
-		return;
-	}
-
-	const clip_matrix::Clip *clip = find_multi_track_clip(clips);
-	if (!clip) {
-		WARN_MESSAGE(false, "no multi-track clip in matrix — skipping multi-track selection");
-		return;
-	}
-
-	const std::string path = clip_matrix::clip_path(*clip);
-	if (!clip_matrix::file_exists(path)) {
-		WARN_MESSAGE(false, ("multi-track clip missing (run tools/gen_clip_matrix.sh): " + clip->file).c_str());
-		return;
-	}
-
-	CAPTURE(clip->file);
-
-	// ---- Open with default (track 0), verify metadata ----
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(path));
-	CHECK(backend.audio_track_count() == clip->audio_tracks);
-
-	const auto t0 = backend.audio_track_info(0);
-	CHECK(t0.is_default == true);
-	CHECK(t0.channels == clip->audio_channels);
-	CHECK(t0.sample_rate == clip->audio_rate);
-	if (!clip->track_languages.empty()) {
-		CHECK(t0.language == clip->track_languages[0]);
-	}
-
-	// ---- Select track 1 and verify decode ----
-	REQUIRE(backend.open(path));
-	backend.select_audio_track(1);
-
-	const auto t1_check = backend.audio_track_info(1);
-	CHECK(t1_check.is_default == false);
-	CHECK(t1_check.channels == clip->audio_channels);
-	CHECK(t1_check.sample_rate == clip->audio_rate);
-
-	int audio_chunks = 0;
-	long audio_frames_total = 0;
-	double last_audio_pts = -1.0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->samples != nullptr);
-		CHECK(chunk->frame_count > 0);
-		CHECK(chunk->channel_count >= 1);
-		CHECK(chunk->sample_rate == clip->audio_rate);
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-		audio_frames_total += chunk->frame_count;
-		++audio_chunks;
-	}
-	CHECK_FALSE(backend.had_error());
-	CHECK(audio_chunks > 0);
-
-	const long nominal = static_cast<long>(static_cast<double>(clip->audio_rate) * clip->frames / clip->fps);
-	CHECK(audio_frames_total >= nominal / 2);
-
-	// ---- Out-of-range selection clamps to default ----
-	REQUIRE(backend.open(path));
-	backend.select_audio_track(99);
-	CHECK(backend.audio_channel_count() >= 1);
-	CHECK(backend.audio_sample_rate() == clip->audio_rate);
-
-	audio_chunks = 0;
-	audio_frames_total = 0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->samples != nullptr);
-		CHECK(chunk->frame_count > 0);
-		audio_frames_total += chunk->frame_count;
-		++audio_chunks;
-	}
-	CHECK_FALSE(backend.had_error());
-	CHECK(audio_chunks > 0);
-	CHECK(audio_frames_total >= nominal / 2);
+	clip_matrix_cases::run_preplay_selection_case<avf::AvfBackend>();
 }
 
 TEST_CASE("AVF backend performs mid-stream audio track switch on multi-track matrix clip") {
-	const auto clips = clip_matrix::load();
-	if (clips.empty()) {
-		WARN_MESSAGE(false, "clip matrix manifest absent — skipping multi-track reselect");
-		return;
-	}
-
-	const clip_matrix::Clip *clip = find_multi_track_clip(clips);
-	if (!clip) {
-		WARN_MESSAGE(false, "no multi-track clip in matrix — skipping multi-track reselect");
-		return;
-	}
-
-	const std::string path = clip_matrix::clip_path(*clip);
-	if (!clip_matrix::file_exists(path)) {
-		WARN_MESSAGE(false, ("multi-track clip missing (run tools/gen_clip_matrix.sh): " + clip->file).c_str());
-		return;
-	}
-
-	CAPTURE(clip->file);
-
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(path));
-	CHECK(backend.audio_track_count() == clip->audio_tracks);
-
-	// --- Decode some video + audio frames from default track (0) ---
-	double last_video_pts = -1.0;
-	int video_pre = 0;
-	for (int i = 0; i < 4 && video_pre < 4; ++i) {
-		auto frame = backend.next_video_frame();
-		REQUIRE(frame.has_value());
-		CHECK(frame->pts_seconds >= last_video_pts);
-		last_video_pts = frame->pts_seconds;
-		frame->release();
-		++video_pre;
-	}
-	CHECK(video_pre >= 1);
-
-	int audio_pre = 0;
-	double last_audio_pts = -1.0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-		++audio_pre;
-		if (audio_pre >= 3) break;
-	}
-	CHECK(audio_pre >= 1);
-	CHECK_FALSE(backend.had_error());
-
-	// --- Reselect to track 1 at current position ---
-	double reselect_time = last_video_pts;
-	REQUIRE(backend.reselect_audio_track(1, reselect_time));
-
-	// --- Video keeps flowing after reselect ---
-	int video_post = 0;
-	last_video_pts = -1.0;
-	while (auto frame = backend.next_video_frame()) {
-		CHECK(frame->pixel_format == core::PixelFormat::NV12);
-		CHECK(frame->native_handle != nullptr);
-		CHECK(frame->pts_seconds >= last_video_pts);
-		last_video_pts = frame->pts_seconds;
-		frame->release();
-		++video_post;
-		if (video_post >= 3) break;
-	}
-	CHECK(video_post >= 1);
-
-	// --- Audio from the new track ---
-	int audio_post = 0;
-	last_audio_pts = -1.0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->samples != nullptr);
-		CHECK(chunk->frame_count > 0);
-		CHECK(chunk->channel_count >= 1);
-		CHECK(chunk->sample_rate == clip->audio_rate);
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-		++audio_post;
-		if (audio_post >= 3) break;
-	}
-	CHECK(audio_post >= 1);
-	CHECK_FALSE(backend.had_error());
-
-	// --- Drain remaining to verify no errors ---
-	while (auto frame = backend.next_video_frame()) {
-		CHECK(frame->pts_seconds >= last_video_pts);
-		last_video_pts = frame->pts_seconds;
-		frame->release();
-	}
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-	}
-	CHECK_FALSE(backend.had_error());
+	clip_matrix_cases::run_midstream_switch_case<avf::AvfBackend>();
 }
 
 TEST_CASE("AVF backend reselects to same track on multi-track matrix clip") {
-	const auto clips = clip_matrix::load();
-	if (clips.empty()) {
-		WARN_MESSAGE(false, "clip matrix manifest absent — skipping same-track reselect");
-		return;
-	}
-
-	const clip_matrix::Clip *clip = find_multi_track_clip(clips);
-	if (!clip) {
-		WARN_MESSAGE(false, "no multi-track clip in matrix — skipping same-track reselect");
-		return;
-	}
-
-	const std::string path = clip_matrix::clip_path(*clip);
-	if (!clip_matrix::file_exists(path)) {
-		WARN_MESSAGE(false, ("multi-track clip missing (run tools/gen_clip_matrix.sh): " + clip->file).c_str());
-		return;
-	}
-
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(path));
-
-	// Decode one video + one audio chunk to establish position.
-	auto frame = backend.next_video_frame();
-	REQUIRE(frame.has_value());
-	frame->release();
-
-	auto chunk = backend.next_audio_chunk();
-	REQUIRE(chunk.has_value());
-
-	// Reselect to the same track.
-	REQUIRE(backend.reselect_audio_track(0, chunk->pts_seconds));
-
-	// Video still flows.
-	int video_count = 0;
-	while (auto f = backend.next_video_frame()) {
-		f->release();
-		++video_count;
-	}
-	CHECK(video_count >= 1);
-
-	// Audio from the reselected (same) track.
-	int audio_count = 0;
-	while (auto ac = backend.next_audio_chunk()) {
-		CHECK(ac->samples != nullptr);
-		++audio_count;
-	}
-	CHECK(audio_count >= 1);
-	CHECK_FALSE(backend.had_error());
+	clip_matrix_cases::run_same_track_reselect_case<avf::AvfBackend>();
 }
 
 TEST_CASE("AVF backend reselect clamps out-of-range index on multi-track matrix clip") {
-	const auto clips = clip_matrix::load();
-	if (clips.empty()) {
-		WARN_MESSAGE(false, "clip matrix manifest absent — skipping reselect clamp test");
-		return;
-	}
-
-	const clip_matrix::Clip *clip = find_multi_track_clip(clips);
-	if (!clip) {
-		WARN_MESSAGE(false, "no multi-track clip in matrix — skipping reselect clamp test");
-		return;
-	}
-
-	const std::string path = clip_matrix::clip_path(*clip);
-	if (!clip_matrix::file_exists(path)) {
-		WARN_MESSAGE(false, ("multi-track clip missing (run tools/gen_clip_matrix.sh): " + clip->file).c_str());
-		return;
-	}
-
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(path));
-
-	// Decode one video frame.
-	auto frame = backend.next_video_frame();
-	REQUIRE(frame.has_value());
-	frame->release();
-
-	// Out-of-range index should clamp and succeed.
-	REQUIRE(backend.reselect_audio_track(99, 0.0));
-
-	int video_count = 0;
-	while (auto f = backend.next_video_frame()) {
-		f->release();
-		++video_count;
-	}
-	CHECK(video_count >= 1);
-	CHECK_FALSE(backend.had_error());
-
-	int audio_count = 0;
-	while (auto ac = backend.next_audio_chunk()) {
-		CHECK(ac->samples != nullptr);
-		++audio_count;
-	}
-	CHECK(audio_count >= 1);
-	CHECK_FALSE(backend.had_error());
+	clip_matrix_cases::run_reselect_clamp_case<avf::AvfBackend>();
 }

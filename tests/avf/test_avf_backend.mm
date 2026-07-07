@@ -11,6 +11,12 @@
 //   - PCM float32 audio is extracted with sane PTS;
 //   - no decode errors occur.
 //
+// The multi-track audio-track selection/reselect coverage below is a thin
+// TEST_CASE layer over the shared case bodies in
+// tests/common/multi_track_cases.h — see that header for the cross-platform
+// contract and the two customization points (track-name checking, and the
+// post-reselect video-PTS bound near end-of-stream) it exposes.
+//
 // If ffmpeg is unavailable the fixture cannot be built and the assertions are
 // skipped gracefully (WARN, not fail). On this build machine ffmpeg IS present
 // so the assertions run for real.
@@ -18,6 +24,7 @@
 
 #include "vendor/doctest.h"
 
+#include "common/multi_track_cases.h"
 #include "avf_backend.h"
 #include "cf_raii.h"
 
@@ -27,7 +34,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <vector>
 
 namespace {
 
@@ -89,14 +95,8 @@ std::string ensure_fixture() {
 	return file_exists(fixture) ? fixture : std::string{};
 }
 
-// Generate a 3-track multi-track fixture on demand. The fixture is a small
-// clip (6 frames at 3 fps) with 3 audio streams at disjoint frequency bands.
-// Kept small so the test is fast; only track-level metadata is probed, not
-// decoded.
-constexpr int kMultiFrames = 6;
-constexpr int kMultiFps = 3;
-constexpr int kMultiTracks = 3;
-
+// Multi-track fixture: same shape as MF's (see multi_track_cases::kMulti*).
+// Only the shell invocation differs (no bash prefix, /dev/null vs NUL).
 std::string ensure_multi_track_fixture() {
 	const std::string root = repo_root();
 	const std::string fixture = root + "/tests/fixtures/synthetic_multitrack_avf.mp4";
@@ -110,7 +110,8 @@ std::string ensure_multi_track_fixture() {
 	std::snprintf(cmd, sizeof(cmd),
 			"%s/tools/gen_test_media.sh --frames %d --fps %d --output %s --multi-track %d "
 			">/dev/null 2>&1",
-			root.c_str(), kMultiFrames, kMultiFps, fixture.c_str(), kMultiTracks);
+			root.c_str(), multi_track_cases::kMultiFrames, multi_track_cases::kMultiFps,
+			fixture.c_str(), multi_track_cases::kMultiTracks);
 	if (std::system(cmd) != 0) {
 		return {};
 	}
@@ -147,6 +148,21 @@ double mean_block_luma(CVPixelBufferRef pb) {
 	}
 	CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 	return n > 0 ? sum / n : 0.0;
+}
+
+// AVF's AudioTrackInfo::name is always empty in v1 (see the single-track
+// enumeration test below); MF synthesizes a "Track N (lang)" display name —
+// see check_track0_name() in test_mf_backend.cpp.
+void check_track0_name(const core::AudioTrackInfo &t0) {
+	CHECK(t0.name.empty());
+}
+
+// AVF resumes video decode near the seek target after
+// reselect_audio_track(), so the first post-reselect frame should stay close
+// to `near_end` rather than jumping back to position 0 — see the opposite
+// (lower-bound) assertion at the MF call site in test_mf_backend.cpp.
+void check_near_end_pts_bound(double first_video_pts, double near_end) {
+	CHECK(first_video_pts < near_end + 1.0);
 }
 
 } // namespace
@@ -267,335 +283,33 @@ TEST_CASE("AVF backend enumerates audio tracks for single-track clip") {
 }
 
 TEST_CASE("AVF backend enumerates audio tracks for multi-track clip") {
-	const std::string fixture = ensure_multi_track_fixture();
-	if (fixture.empty()) {
-		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed — skipping multi-track audio enumeration");
-		return;
-	}
-
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(fixture));
-
-	CHECK(backend.audio_track_count() == kMultiTracks);
-
-	// Track 0: eng, default
-	const auto t0 = backend.audio_track_info(0);
-	// gen_test_media.sh tags track 0 as 'eng'
-	CHECK(t0.language == "eng");
-	CHECK(t0.is_default == true);
-	CHECK(t0.channels >= 1);
-	CHECK(t0.sample_rate == 48000);
-	CHECK(t0.name.empty());
-
-	// Track 1: fra, non-default
-	const auto t1 = backend.audio_track_info(1);
-	CHECK(t1.language == "fra");
-	CHECK(t1.is_default == false);
-	CHECK(t1.channels >= 1);
-	CHECK(t1.sample_rate == 48000);
-
-	// Track 2: deu, non-default
-	const auto t2 = backend.audio_track_info(2);
-	CHECK(t2.language == "deu");
-	CHECK(t2.is_default == false);
-
-	// Out-of-range index returns empty AudioTrackInfo (defined behaviour
-	// in the concrete backend, not UB per the virtual contract).
-	const auto t99 = backend.audio_track_info(99);
-	CHECK(t99.channels == 0);
-	CHECK(t99.language.empty());
-	CHECK(t99.sample_rate == 0);
-	CHECK(t99.is_default == false);
+	multi_track_cases::run_multi_track_enumeration_case<avf::AvfBackend>(ensure_multi_track_fixture(), check_track0_name);
 }
 
 TEST_CASE("AVF backend selects audio track pre-play for multi-track clip") {
-	const std::string fixture = ensure_multi_track_fixture();
-	if (fixture.empty()) {
-		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping multi-track selection");
-		return;
-	}
-
-	// ---- Open with default (track 0), verify default metadata ----
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(fixture));
-	CHECK(backend.audio_track_count() == kMultiTracks);
-	// Track 0: eng, default
-	const auto t0 = backend.audio_track_info(0);
-	CHECK(t0.language == "eng");
-	CHECK(t0.is_default == true);
-	CHECK(t0.channels >= 1);
-	CHECK(t0.sample_rate == 48000);
-
-	// ---- Select track 1 (fra, non-default) ----
-	backend.select_audio_track(1);
-	const auto t1_check = backend.audio_track_info(1);
-	CHECK(t1_check.language == "fra");
-	// After selection, audio_channel_count/audio_sample_rate should reflect
-	// the selected track. Re-open to force a fresh reader so the selection
-	// takes effect (select_audio_track with a fresh open applies immediately).
-	REQUIRE(backend.open(fixture));
-	backend.select_audio_track(1);
-
-	// Decode audio from the selected track and verify valid PCM output.
-	int audio_chunks = 0;
-	long audio_frames_total = 0;
-	double last_audio_pts = -1.0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->samples != nullptr);
-		CHECK(chunk->frame_count > 0);
-		CHECK(chunk->channel_count >= 1);
-		CHECK(chunk->sample_rate == 48000);
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-		audio_frames_total += chunk->frame_count;
-		++audio_chunks;
-	}
-	CHECK_FALSE(backend.had_error());
-	CHECK(audio_chunks > 0);
-	const long nominal = static_cast<long>(48000.0 * kMultiFrames / kMultiFps);
-	CHECK(audio_frames_total >= nominal / 2);
-
-	// ---- Out-of-range selection falls back to default ----
-	// The backend clamps to the nearest valid index. Track 0 (the default)
-	// is nearest to index -1 or index >= count.
-	REQUIRE(backend.open(fixture));
-	backend.select_audio_track(99); // out of range
-	// audio_channel_count should still be valid (from track 0, clamped).
-	CHECK(backend.audio_channel_count() >= 1);
-	CHECK(backend.audio_sample_rate() == 48000);
-
-	// Decode should still produce valid PCM from the fallback (track 0).
-	audio_chunks = 0;
-	audio_frames_total = 0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->samples != nullptr);
-		CHECK(chunk->frame_count > 0);
-		CHECK(chunk->channel_count >= 1);
-		CHECK(chunk->sample_rate == 48000);
-		audio_frames_total += chunk->frame_count;
-		++audio_chunks;
-	}
-	CHECK_FALSE(backend.had_error());
-	CHECK(audio_chunks > 0);
-	CHECK(audio_frames_total >= nominal / 2);
+	multi_track_cases::run_preplay_selection_case<avf::AvfBackend>(ensure_multi_track_fixture());
 }
 
 TEST_CASE("AVF backend reselects audio track mid-decode without disturbing video") {
-	const std::string fixture = ensure_multi_track_fixture();
-	if (fixture.empty()) {
-		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping reselect test");
-		return;
-	}
-
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(fixture));
-	CHECK(backend.audio_track_count() == kMultiTracks);
-
-	// --- Decode some video + audio frames from track 0 ---
-	double last_video_pts = -1.0;
-	for (int i = 0; i < 4; ++i) {
-		auto frame = backend.next_video_frame();
-		REQUIRE(frame.has_value());
-		CHECK(frame->pts_seconds >= last_video_pts);
-		last_video_pts = frame->pts_seconds;
-		frame->release();
-	}
-
-	int audio_pre = 0;
-	double last_audio_pts = -1.0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-		++audio_pre;
-		// Read a limited number of chunks before triggering reselect.
-		if (audio_pre >= 3) {
-			break;
-		}
-	}
-	CHECK(audio_pre >= 3);
-	CHECK_FALSE(backend.had_error());
-
-	// --- Reselect to track 1 (fra) at current position ---
-	double reselect_time = last_video_pts;
-	REQUIRE(backend.reselect_audio_track(1, reselect_time));
-
-	// --- Video keeps flowing after reselect ---
-	int video_post = 0;
-	last_video_pts = -1.0;
-	while (auto frame = backend.next_video_frame()) {
-		CHECK(frame->pixel_format == core::PixelFormat::NV12);
-		CHECK(frame->native_handle != nullptr);
-		CHECK(frame->pts_seconds >= last_video_pts);
-		last_video_pts = frame->pts_seconds;
-		frame->release();
-		++video_post;
-		if (video_post >= 3) {
-			break;
-		}
-	}
-	CHECK(video_post >= 1);
-
-	// --- Audio from the new track ---
-	int audio_post = 0;
-	last_audio_pts = -1.0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->samples != nullptr);
-		CHECK(chunk->frame_count > 0);
-		CHECK(chunk->channel_count >= 1);
-		CHECK(chunk->sample_rate == 48000);
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-		++audio_post;
-		if (audio_post >= 3) {
-			break;
-		}
-	}
-	CHECK(audio_post >= 1);
-	CHECK_FALSE(backend.had_error());
-
-	// --- Drain remaining video + audio to verify no errors ---
-	while (auto frame = backend.next_video_frame()) {
-		CHECK(frame->pts_seconds >= last_video_pts);
-		last_video_pts = frame->pts_seconds;
-		frame->release();
-	}
-	// Note: audio may already be at EOS after the early break above, so we
-	// drain whatever remains but don't require more chunks.
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->pts_seconds >= last_audio_pts);
-		last_audio_pts = chunk->pts_seconds;
-	}
-	CHECK_FALSE(backend.had_error());
+	multi_track_cases::run_midstream_reselect_case<avf::AvfBackend>(ensure_multi_track_fixture());
 }
 
 TEST_CASE("AVF backend reselects audio track near end-of-stream") {
-	const std::string fixture = ensure_multi_track_fixture();
-	if (fixture.empty()) {
-		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping end-of-stream reselect test");
-		return;
-	}
-
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(fixture));
-
-	// Drain video to end-of-stream.
-	int video_total = 0;
-	while (auto frame = backend.next_video_frame()) {
-		frame->release();
-		++video_total;
-	}
-	CHECK(video_total >= kMultiFrames - 1);
-	CHECK_FALSE(backend.had_error());
-
-	// Re-open and reselect near end.
-	REQUIRE(backend.open(fixture));
-	// Seek near the end (last keyframe before the last few frames).
-	const double near_end = static_cast<double>(kMultiFrames) / static_cast<double>(kMultiFps) - 0.5;
-	REQUIRE(backend.seek(near_end));
-
-	// Reselect to track 1 near end-of-stream.
-	REQUIRE(backend.reselect_audio_track(1, near_end));
-
-	// Video still flows after reselect.
-	int video_after = 0;
-	double first_video_pts = -1.0;
-	while (auto frame = backend.next_video_frame()) {
-		if (first_video_pts < 0.0) {
-			first_video_pts = frame->pts_seconds;
-		}
-		frame->release();
-		++video_after;
-	}
-	// The first post-reselect frame should start near `near_end` (within one
-	// keyframe interval), not jump back to position 0.
-	CHECK(first_video_pts >= 0.0);
-	CHECK(first_video_pts < near_end + 1.0);
-	CHECK(video_after >= 1);
-
-	// Audio from the new track.
-	int audio_after = 0;
-	while (auto chunk = backend.next_audio_chunk()) {
-		CHECK(chunk->samples != nullptr);
-		CHECK(chunk->frame_count > 0);
-		++audio_after;
-	}
-	CHECK(audio_after >= 1);
-	CHECK_FALSE(backend.had_error());
+	multi_track_cases::run_near_end_reselect_case<avf::AvfBackend>(ensure_multi_track_fixture(), check_near_end_pts_bound);
 }
 
 TEST_CASE("AVF backend reselect to same track is valid") {
-	const std::string fixture = ensure_multi_track_fixture();
-	if (fixture.empty()) {
-		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping same-track reselect test");
-		return;
-	}
-
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(fixture));
-
-	// Decode a few frames.
-	auto frame = backend.next_video_frame();
-	REQUIRE(frame.has_value());
-	frame->release();
-
-	auto chunk = backend.next_audio_chunk();
-	REQUIRE(chunk.has_value());
-
-	// Reselect to the same track at the current position.
-	REQUIRE(backend.reselect_audio_track(0, chunk->pts_seconds));
-
-	// Video still flows.
-	int video_count = 0;
-	while (auto f = backend.next_video_frame()) {
-		f->release();
-		++video_count;
-	}
-	CHECK(video_count >= 1);
-
-	// Audio from the reselected (same) track.
-	int audio_count = 0;
-	while (auto ac = backend.next_audio_chunk()) {
-		CHECK(ac->samples != nullptr);
-		CHECK(ac->frame_count > 0);
-		++audio_count;
-	}
-	CHECK(audio_count >= 1);
-	CHECK_FALSE(backend.had_error());
+	multi_track_cases::run_same_track_reselect_case<avf::AvfBackend>(ensure_multi_track_fixture());
 }
 
 TEST_CASE("AVF backend reselect clamps out-of-range index") {
-	const std::string fixture = ensure_multi_track_fixture();
-	if (fixture.empty()) {
-		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping reselect clamp test");
-		return;
-	}
+	multi_track_cases::run_reselect_clamp_case<avf::AvfBackend>(ensure_multi_track_fixture());
+}
 
-	avf::AvfBackend backend;
-	REQUIRE(backend.open(fixture));
+TEST_CASE("AVF backend defers select_audio_track() until the next seek") {
+	multi_track_cases::run_defers_select_until_seek_case<avf::AvfBackend>(ensure_multi_track_fixture());
+}
 
-	// Decode one video frame.
-	auto frame = backend.next_video_frame();
-	REQUIRE(frame.has_value());
-	frame->release();
-
-	// Out-of-range index should clamp and succeed.
-	REQUIRE(backend.reselect_audio_track(99, 0.0));
-
-	// Video still flows.
-	int video_count = 0;
-	while (auto f = backend.next_video_frame()) {
-		f->release();
-		++video_count;
-	}
-	CHECK(video_count >= 1);
-	CHECK_FALSE(backend.had_error());
-
-	// Audio from the clamped track (last valid track, kMultiTracks-1).
-	int audio_count = 0;
-	while (auto ac = backend.next_audio_chunk()) {
-		CHECK(ac->samples != nullptr);
-		++audio_count;
-	}
-	CHECK(audio_count >= 1);
-	CHECK_FALSE(backend.had_error());
+TEST_CASE("AVF backend keeps a reselected audio track across a later seek") {
+	multi_track_cases::run_reselect_keeps_across_seek_case<avf::AvfBackend>(ensure_multi_track_fixture());
 }
