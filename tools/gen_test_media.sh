@@ -37,6 +37,8 @@
 # -----------------------------------------------------------------------
 set -euo pipefail
 
+source "$(dirname "$0")/multitrack_lib.sh"
+
 FRAMES=60
 FPS=30
 WIDTH=320
@@ -74,7 +76,6 @@ else
 fi
 
 SAMPLE_RATE=48000
-TRACK_STRIDE=3000
 
 DURATION=$(awk "BEGIN{printf \"%.6f\", $FRAMES / $FPS}")
 FRAME_DUR=$(awk "BEGIN{printf \"%.10f\", 1 / $FPS}")
@@ -84,44 +85,20 @@ AUDIO_STREAMS=$(( MULTI_TRACK > 0 ? MULTI_TRACK : 1 ))
 # -----------------------------------------------------------------------
 # Build the filtergraph as a single string.
 # ffmpeg's filter_complex uses ; between filter chains.
-# Lazily-defined language tag list cycles for N tracks.
+# The multi-track audio chains (frequency stride, language cycling, per-
+# track sine/concat) live in multitrack_lib.sh so both generators share
+# one implementation; this clip stays mono (no stereo upmix) and uses the
+# library's default cycling language list.
 # -----------------------------------------------------------------------
 FILTERGRAPH="color=black:size=${WIDTH}x${HEIGHT}:rate=${FPS}:duration=${DURATION}[base];"
 FILTERGRAPH+="[base]drawbox=x=0:y=0:w=80:h=80:color=white:t=fill,"
 FILTERGRAPH+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:${DRAWTEXT_FONT}[video_out];"
 
-LANG_TAGS=(eng fra deu spa ita jpn kor chi)
-AUDIO_MAPS=()
-AUDIO_CODEC_ARGS=()
-METADATA_ARGS=()
-
-for ((track=0; track<AUDIO_STREAMS; track++)); do
-    TRACK_BASE=$(( track * TRACK_STRIDE + 200 ))
-    LABEL="audio_out_${track}"
-    AUDIO_MAPS+=(-map "[${LABEL}]")
-    AUDIO_CODEC_ARGS+=(-c:a:${track} aac -b:a:${track} 128k)
-
-    LANG="${LANG_TAGS[$(( track % ${#LANG_TAGS[@]} ))]}"
-    METADATA_ARGS+=(-metadata:s:a:${track} "language=${LANG}")
-    METADATA_ARGS+=(-metadata:s:a:${track} "title=Track ${track} (${LANG})")
-
-    # Per-track Sync Ladder: N sine segments (one per frame) concatenated.
-    # Frequency = TRACK_BASE + 200 * frame_index — disjoint per track.
-    for ((i=0; i<FRAMES; i++)); do
-        FREQ=$(( TRACK_BASE + 200 * i ))
-        FILTERGRAPH+="sine=frequency=${FREQ}:sample_rate=${SAMPLE_RATE}:duration=${FRAME_DUR}[t${track}f${i}];"
-    done
-    # Concatenate all segments for this track.
-    for ((i=0; i<FRAMES; i++)); do
-        FILTERGRAPH+="[t${track}f${i}]"
-    done
-    FILTERGRAPH+="concat=n=${FRAMES}:v=0:a=1[${LABEL}]"
-    # Separate per-track audio filter chains with ; so ffmpeg treats them
-    # as independent chains. The last one does not get a trailing separator.
-    if [[ $track -lt $(( AUDIO_STREAMS - 1 )) ]]; then
-        FILTERGRAPH+=";"
-    fi
-done
+gen_multi_track_audio_args "${AUDIO_STREAMS}" "${FRAMES}" "${FRAME_DUR}" "${SAMPLE_RATE}" 0
+FILTERGRAPH+="${MT_AUDIO_FILTER}"
+AUDIO_MAPS=("${MT_AUDIO_MAPS[@]}")
+AUDIO_CODEC_ARGS=("${MT_AUDIO_CODEC_ARGS[@]}")
+METADATA_ARGS=("${MT_METADATA_ARGS[@]}")
 
 # -----------------------------------------------------------------------
 # Encode to H.264 + AAC MP4
@@ -130,9 +107,7 @@ echo "Generating ${FRAMES}-frame synthetic clip -> ${OUTPUT}"
 echo "  video: ${WIDTH}x${HEIGHT} @ ${FPS} fps, black+index block"
 echo "  audio: ${AUDIO_STREAMS} track(s), per-frame Sync Ladder, ${SAMPLE_RATE} Hz"
 for ((track=0; track<AUDIO_STREAMS; track++)); do
-    BASE=$(( track * TRACK_STRIDE + 200 ))
-    LANG="${LANG_TAGS[$(( track % ${#LANG_TAGS[@]} ))]}"
-    echo "    track ${track}: base=${BASE} Hz, lang=${LANG}"
+    echo "    track ${track}: base=${MT_TRACK_BASES[$track]} Hz, lang=${MT_TRACK_LANGS[$track]}"
 done
 
 # -g 1 (all-intra): every frame is a keyframe, so a backend seek — contract:
