@@ -1,4 +1,4 @@
-# Native Media Streams — demo
+# Native Video — demo
 
 A minimal Godot project that plays a video clip through this extension's
 zero-copy present pipeline. Use it to confirm the extension works end-to-end on
@@ -8,9 +8,9 @@ your machine: that frames appear, advance, and look correct.
 
 A stock Godot `VideoStreamPlayer` plays a clip through this extension:
 
-1. `PlatformMediaResourceFormatLoader` loads `.mp4/.mov/.m4v` into a
-   `PlatformVideoStream`.
-2. `PlatformVideoStreamPlayback` drives the platform decoder backend
+1. `NativeVideoResourceFormatLoader` loads `.mp4/.mov/.m4v` into a
+   `NativeVideoStream`.
+2. `NativeVideoStreamPlayback` drives the platform decoder backend
    (AVFoundation on macOS, Media Foundation on Windows), queues decoded NV12
    frames, and on each `_update()` picks the frame for the clock and presents it.
 3. The present pipeline imports the NV12 planes **zero-copy** via

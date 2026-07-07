@@ -9,10 +9,10 @@
 
 #include "../backends/avf/avf_backend.h"
 
-namespace platform_media {
+namespace native_video {
 
 std::unique_ptr<core::Backend> make_backend() {
 	return std::make_unique<avf::AvfBackend>();
 }
 
-} // namespace platform_media
+} // namespace native_video

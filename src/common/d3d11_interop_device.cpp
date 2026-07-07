@@ -11,7 +11,7 @@
 
 using mf::ComPtr;
 
-namespace platform_media {
+namespace native_video {
 
 bool D3D11InteropDevice::initialize(const LUID *luid) {
 	ComPtr<IDXGIFactory1> factory;
@@ -52,6 +52,6 @@ bool D3D11InteropDevice::initialize(const LUID *luid) {
 	return true;
 }
 
-} // namespace platform_media
+} // namespace native_video
 
 #endif // _WIN32

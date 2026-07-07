@@ -12,8 +12,8 @@
 
 #include "importer_selector.h"
 
-using platform_media::ImporterKind;
-using platform_media::select_importer;
+using native_video::ImporterKind;
+using native_video::select_importer;
 
 // =======================================================================
 // D3D12 driver

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/headless-smoke/run.sh
 # -----------------------------------------------------------------------
-# One-command headless smoke test for the Platform Media Streams extension.
+# One-command headless smoke test for the Native Video extension.
 #
 # Generates a multi-track marker clip (2 Audio Tracks) into the test project
 # if missing, builds the extension for the host platform, locates Godot via
@@ -38,7 +38,7 @@ case "$(uname -s)" in
         ;;
 esac
 
-LIB_NAME="libplatform-media-streams"
+LIB_NAME="libnative-video"
 SUFFIX="template_debug"
 if [ "$PLATFORM" = "macos" ]; then
     LIB_FILE="${LIB_NAME}.${PLATFORM}.${SUFFIX}.dylib"

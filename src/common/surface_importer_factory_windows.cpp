@@ -33,7 +33,7 @@
 
 using namespace godot;
 
-namespace platform_media {
+namespace native_video {
 
 namespace {
 
@@ -82,6 +82,6 @@ std::unique_ptr<SurfaceImporter> make_surface_importer() {
 	return std::make_unique<CpuCopySurfaceImporter>();
 }
 
-} // namespace platform_media
+} // namespace native_video
 
 #endif // _WIN32

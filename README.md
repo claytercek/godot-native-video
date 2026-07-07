@@ -1,9 +1,10 @@
-# Platform Media Streams for Godot
+# Native Video for Godot
 
-A high-performance GDExtension for native, hardware-accelerated video playback in
-Godot. Instead of bundling a software decoder, it uses each OS's media framework
-purely as a **hardware decoder** and presents decoded frames to the GPU
-**zero-copy**. It is drop-in compatible with Godot's stock `VideoStreamPlayer`.
+Hardware-accelerated MP4 video playback (H.264/HEVC) using the OS's own
+decoders — zero-copy to the GPU, drop-in compatible with Godot's
+`VideoStreamPlayer`. Instead of bundling a software decoder, this GDExtension
+uses each OS's media framework purely as a **hardware decoder** and presents
+decoded frames to the GPU with no CPU copies.
 
 ## Architecture
 

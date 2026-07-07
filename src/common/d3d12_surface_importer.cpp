@@ -97,7 +97,7 @@
 using namespace godot;
 using mf::ComPtr;
 
-namespace platform_media {
+namespace native_video {
 
 namespace {
 
@@ -592,6 +592,6 @@ PlaneTextures D3D12SurfaceImporter::import(void *d3d11_texture, uint32_t plane_s
 	return out;
 }
 
-} // namespace platform_media
+} // namespace native_video
 
 #endif // _WIN32

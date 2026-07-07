@@ -1,7 +1,7 @@
 extends Node
 
 # -----------------------------------------------------------------------
-# Headless Smoke Suite — 6 assertion groups for the native media streams
+# Headless Smoke Suite — 6 assertion groups for the Native Video
 # GDExtension. Runs headless with --headless (Dummy audio driver).
 # Exits 0 on all-pass, 1 on any failure.
 #
@@ -134,9 +134,9 @@ func _process(delta):
 
 func test_classes_registered():
 	var expected := [
-		"PlatformVideoStream",
-		"PlatformVideoStreamPlayback",
-		"PlatformMediaResourceFormatLoader",
+		"NativeVideoStream",
+		"NativeVideoStreamPlayback",
+		"NativeVideoResourceFormatLoader",
 	]
 	var all_ok := true
 	for cls in expected:
@@ -168,20 +168,20 @@ func test_resource_loader_resolution():
 	if s == null:
 		_fail("Could not load %s" % CLIP)
 		return
-	if s.get_class() == "PlatformVideoStream":
-		print("[OK] %s loads as PlatformVideoStream" % CLIP)
+	if s.get_class() == "NativeVideoStream":
+		print("[OK] %s loads as NativeVideoStream" % CLIP)
 	else:
-		_fail("%s is %s, expected PlatformVideoStream" % [CLIP, s.get_class()])
+		_fail("%s is %s, expected NativeVideoStream" % [CLIP, s.get_class()])
 
 	for path in [CLIP_MOV, CLIP_M4V]:
 		s = ResourceLoader.load(path, "VideoStream")
 		if s == null:
 			_fail("Could not load %s" % path)
 			continue
-		if s.get_class() == "PlatformVideoStream":
-			print("[OK] %s loads as PlatformVideoStream" % path)
+		if s.get_class() == "NativeVideoStream":
+			print("[OK] %s loads as NativeVideoStream" % path)
 		else:
-			_fail("%s is %s, expected PlatformVideoStream" % [path, s.get_class()])
+			_fail("%s is %s, expected NativeVideoStream" % [path, s.get_class()])
 
 	print("[PASS] Group 2 — ResourceLoader resolution")
 

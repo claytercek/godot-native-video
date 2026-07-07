@@ -20,7 +20,7 @@
 
 #include "../backends/mf/com_raii.h" // mf::ComPtr
 
-namespace platform_media {
+namespace native_video {
 
 class D3D11InteropDevice {
 public:
@@ -52,6 +52,6 @@ private:
 	mf::ComPtr<ID3D11DeviceContext> d3d_context_;
 };
 
-} // namespace platform_media
+} // namespace native_video
 
 #endif // _WIN32

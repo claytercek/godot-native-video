@@ -19,8 +19,8 @@
 
 #include "push_constants.h"
 
-using platform_media::kPushConstantSize;
-using platform_media::pack_push_constants;
+using native_video::kPushConstantSize;
+using native_video::pack_push_constants;
 
 static_assert(kPushConstantSize == 32, "push-constant block must stay 32 bytes");
 

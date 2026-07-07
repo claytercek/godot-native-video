@@ -12,12 +12,12 @@
 
 #include "../backends/mf/mf_backend.h"
 
-namespace platform_media {
+namespace native_video {
 
 std::unique_ptr<core::Backend> make_backend() {
 	return std::make_unique<mf::MfBackend>();
 }
 
-} // namespace platform_media
+} // namespace native_video
 
 #endif // _WIN32
