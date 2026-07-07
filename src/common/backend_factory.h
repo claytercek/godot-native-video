@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------
 // backend_factory.h — platform-agnostic decoder Backend factory.
 //
-// The Binding (PlatformVideoStreamPlayback) must not name a concrete backend
+// The Binding (NativeVideoStreamPlayback) must not name a concrete backend
 // type, so adding a platform doesn't touch shared logic. make_backend() returns
 // the right core::Backend for the platform this translation unit was compiled
 // for:
@@ -20,10 +20,10 @@
 
 #include "../core/backend.h" // core::Backend
 
-namespace platform_media {
+namespace native_video {
 
 // Construct the decoder Backend for this platform. Never returns null; the
 // returned Backend is closed/unopened until open() succeeds.
 std::unique_ptr<core::Backend> make_backend();
 
-} // namespace platform_media
+} // namespace native_video

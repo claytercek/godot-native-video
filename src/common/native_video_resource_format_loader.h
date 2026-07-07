@@ -1,8 +1,8 @@
 #pragma once
 
 // -----------------------------------------------------------------------
-// platform_media_resource_format_loader.h — loads a clip path into a
-// PlatformVideoStream resource so VideoStreamPlayer can play it.
+// native_video_resource_format_loader.h — loads a clip path into a
+// NativeVideoStream resource so VideoStreamPlayer can play it.
 //
 // Registered with ResourceLoader for the video container extensions the OS
 // decodes (mp4/mov/m4v). It does NOT decode anything here — it just produces a
@@ -13,8 +13,8 @@
 
 namespace godot {
 
-class PlatformMediaResourceFormatLoader : public ResourceFormatLoader {
-	GDCLASS(PlatformMediaResourceFormatLoader, ResourceFormatLoader)
+class NativeVideoResourceFormatLoader : public ResourceFormatLoader {
+	GDCLASS(NativeVideoResourceFormatLoader, ResourceFormatLoader)
 
 public:
 	PackedStringArray _get_recognized_extensions() const override;

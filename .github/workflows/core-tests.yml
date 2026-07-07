@@ -198,14 +198,14 @@ jobs:
             godot-bin: .godot/Godot.app/Contents/MacOS/Godot
             install-scons: brew install scons
             install-ffmpeg: brew install ffmpeg
-            lib-name: libplatform-media-streams.macos.template_debug.dylib
+            lib-name: libnative-video.macos.template_debug.dylib
           - label: Windows
             os: windows-latest
             platform: windows
             godot-bin: .godot/Godot.exe
             install-scons: pip3 install scons
             install-ffmpeg: choco install ffmpeg -y --no-progress
-            lib-name: platform-media-streams.windows.template_debug.x86_64.dll
+            lib-name: native-video.windows.template_debug.x86_64.dll
 
     env:
       GODOT_BIN: ${{ github.workspace }}/${{ matrix.godot-bin }}

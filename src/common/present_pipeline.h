@@ -48,7 +48,7 @@
 #include "../core/retire_ring.h"
 #include "surface_importer.h"   // SurfaceImporter, PlaneTextures, factory
 
-namespace platform_media {
+namespace native_video {
 
 // -----------------------------------------------------------------------
 // OutputMode — present-pipeline output format.
@@ -182,4 +182,4 @@ private:
 	uint64_t cpu_copy_count_ = 0; // invariant: 0 on the two zero-copy Import Paths
 };
 
-} // namespace platform_media
+} // namespace native_video

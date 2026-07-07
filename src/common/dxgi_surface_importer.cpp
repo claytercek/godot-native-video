@@ -87,7 +87,7 @@
 using namespace godot;
 using mf::ComPtr;
 
-namespace platform_media {
+namespace native_video {
 
 namespace {
 
@@ -536,6 +536,6 @@ PlaneTextures DxgiSurfaceImporter::import(void *d3d11_texture, uint32_t plane_sl
 // make_surface_importer() lives in surface_importer_factory_windows.cpp, which
 // selects among the three Windows importers (and currently hard-disables this one).
 
-} // namespace platform_media
+} // namespace native_video
 
 #endif // _WIN32

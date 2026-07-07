@@ -1,7 +1,7 @@
 #pragma once
 
 // -----------------------------------------------------------------------
-// platform_video_stream_playback.h — the Binding's VideoStreamPlayback.
+// native_video_stream_playback.h — the Binding's VideoStreamPlayback.
 //
 // Adapts the Godot-independent Engine Core to Godot's VideoStreamPlayback so a
 // stock VideoStreamPlayer can play a native clip. It drives a per-platform
@@ -55,8 +55,8 @@
 
 namespace godot {
 
-class PlatformVideoStreamPlayback : public VideoStreamPlayback {
-	GDCLASS(PlatformVideoStreamPlayback, VideoStreamPlayback)
+class NativeVideoStreamPlayback : public VideoStreamPlayback {
+	GDCLASS(NativeVideoStreamPlayback, VideoStreamPlayback)
 
 public:
 	// -------------------------------------------------------------------
@@ -69,10 +69,10 @@ public:
 		OUTPUT_MODE_HDR = 1,
 	};
 
-	PlatformVideoStreamPlayback();
-	~PlatformVideoStreamPlayback() override;
+	NativeVideoStreamPlayback();
+	~NativeVideoStreamPlayback() override;
 
-	// Open the media file. Returns true on success. Called by PlatformVideoStream.
+	// Open the media file. Returns true on success. Called by NativeVideoStream.
 	bool load(const String &path);
 
 	// --- Output mode ---
@@ -165,7 +165,7 @@ private:
 	std::unique_ptr<core::AudioRing> audio_ring_;
 	godot::PackedFloat32Array mix_buffer_; // reused mix scratch (no per-frame alloc)
 
-	platform_media::PresentPipeline present_;
+	native_video::PresentPipeline present_;
 
 	bool loaded_ = false;
 	bool playing_ = false;

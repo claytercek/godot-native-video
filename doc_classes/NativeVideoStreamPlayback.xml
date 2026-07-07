@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8" ?>
-<class name="PlatformVideoStreamPlayback" inherits="VideoStreamPlayback" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://raw.githubusercontent.com/godotengine/godot/master/doc/class.xsd">
+<class name="NativeVideoStreamPlayback" inherits="VideoStreamPlayback" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://raw.githubusercontent.com/godotengine/godot/master/doc/class.xsd">
 	<brief_description>
-		The [VideoStreamPlayback] driving hardware-decoded, zero-copy native video playback for [PlatformVideoStream].
+		The [VideoStreamPlayback] driving hardware-decoded, zero-copy native video playback for [NativeVideoStream].
 	</brief_description>
 	<description>
-		Instantiated by [PlatformVideoStream] to drive the platform's hardware decoder (AVFoundation on macOS, Windows Media Foundation on Windows) and present decoded frames to the GPU with no CPU copy. Not created directly — a stock [VideoStreamPlayer] obtains it by instantiating [PlatformVideoStream].
+		Instantiated by [NativeVideoStream] to drive the platform's hardware decoder (AVFoundation on macOS, Windows Media Foundation on Windows) and present decoded frames to the GPU with no CPU copy. Not created directly — a stock [VideoStreamPlayer] obtains it by instantiating [NativeVideoStream].
 	</description>
 	<tutorials>
 	</tutorials>
@@ -26,7 +26,7 @@
 	</methods>
 	<members>
 		<member name="output_mode" type="int" setter="set_output_mode" getter="get_output_mode" default="0">
-			Selects the pipeline's output mode: [code]0[/code] for SDR (RGBA8) or [code]1[/code] for HDR (RGBA16F, scene-linear, 1.0 = 203-nit Reference White). Toggling at runtime forces a pipeline rebuild. Prefer driving this through [member PlatformVideoStream.output_mode] instead of setting it here directly — this property does not mirror back to the stream resource.
+			Selects the pipeline's output mode: [code]0[/code] for SDR (RGBA8) or [code]1[/code] for HDR (RGBA16F, scene-linear, 1.0 = 203-nit Reference White). Toggling at runtime forces a pipeline rebuild. Prefer driving this through [member NativeVideoStream.output_mode] instead of setting it here directly — this property does not mirror back to the stream resource.
 		</member>
 	</members>
 </class>

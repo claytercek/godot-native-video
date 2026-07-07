@@ -24,7 +24,7 @@
 
 using namespace godot;
 
-namespace platform_media {
+namespace native_video {
 
 // kNv12ToRgbCompute and kNv12ToRgbHdrCompute are both auto-generated from the
 // same src/common/nv12_to_rgb.glsl by tools/embed_shader.py, embedded twice
@@ -81,7 +81,7 @@ bool PresentPipeline::build_resources(int width, int height) {
 		// frame.
 		state_ = State::Disabled;
 		UtilityFunctions::print(
-				"[NATIVE MEDIA STREAMS] No RenderingDevice — "
+				"[NATIVE VIDEO] No RenderingDevice — "
 				"presentation disabled (headless mode). Decode and audio "
 				"continue normally.");
 		return false;
@@ -371,4 +371,4 @@ void PresentPipeline::shutdown() {
 	rd_ = nullptr;
 }
 
-} // namespace platform_media
+} // namespace native_video

@@ -80,11 +80,11 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: platform-media-streams-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}
+          name: native-video-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}
           path: |
             ${{ github.workspace }}/bin/**
 
-  # Merges all the build artifacts together into a single platform-media-streams artifact.
+  # Merges all the build artifacts together into a single native-video artifact.
   # If you comment out this step, all the builds will be uploaded individually.
   merge:
     runs-on: ubuntu-22.04
@@ -96,28 +96,28 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: platform-media-streams-*
+          pattern: native-video-*
           path: artifacts
           
       - name: Create final artifact structure
         run: |
           mkdir -p final-artifact/bin
           # Copy contents of each artifact into final-artifact
-          for dir in artifacts/platform-media-streams-*; do
+          for dir in artifacts/native-video-*; do
             cp -r "$dir"/* final-artifact/
           done
           # Copy LICENSE and README.md to root of final artifact
           cp LICENSE README.md final-artifact/
           # Copy .gdextension
-          cp demo/bin/platform-media-streams.gdextension final-artifact/
+          cp demo/bin/native-video.gdextension final-artifact/
           
       - name: Upload final artifact
         uses: actions/upload-artifact@v4
         with:
-          name: platform-media-streams
+          name: native-video
           path: final-artifact/**
           
       - name: Delete individual artifacts
         uses: geekyeggo/delete-artifact@v5
         with:
-          name: platform-media-streams-*
+          name: native-video-*

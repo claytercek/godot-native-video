@@ -57,7 +57,7 @@
 #include <godot_cpp/classes/rendering_device.hpp>
 #include <godot_cpp/variant/rid.hpp>
 
-namespace platform_media {
+namespace native_video {
 
 // The two imported plane textures for one frame, plus a release closure
 // that tears down everything created during the import (RD RIDs + the native
@@ -165,4 +165,4 @@ public:
 // pipeline never sees a platform #ifdef.
 std::unique_ptr<SurfaceImporter> make_surface_importer();
 
-} // namespace platform_media
+} // namespace native_video

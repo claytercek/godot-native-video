@@ -1,8 +1,8 @@
 // -----------------------------------------------------------------------
-// platform_video_stream_playback.cpp — see header.
+// native_video_stream_playback.cpp — see header.
 // -----------------------------------------------------------------------
 
-#include "platform_video_stream_playback.h"
+#include "native_video_stream_playback.h"
 
 #include <godot_cpp/classes/audio_server.hpp>
 #include <godot_cpp/classes/project_settings.hpp>
@@ -18,9 +18,9 @@
 
 using namespace godot;
 
-PlatformVideoStreamPlayback::PlatformVideoStreamPlayback() = default;
+NativeVideoStreamPlayback::NativeVideoStreamPlayback() = default;
 
-PlatformVideoStreamPlayback::~PlatformVideoStreamPlayback() {
+NativeVideoStreamPlayback::~NativeVideoStreamPlayback() {
 	// Unregister from the shared pool first: this blocks until any in-flight
 	// decode slice for our stream completes and releases every buffered surface,
 	// so no worker can touch our Backend after this returns (no use-after-free).
@@ -31,17 +31,17 @@ PlatformVideoStreamPlayback::~PlatformVideoStreamPlayback() {
 	present_.shutdown();
 }
 
-void PlatformVideoStreamPlayback::_bind_methods() {
-	ClassDB::bind_method(D_METHOD("get_color_info"), &PlatformVideoStreamPlayback::get_color_info);
+void NativeVideoStreamPlayback::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("get_color_info"), &NativeVideoStreamPlayback::get_color_info);
 
-	ClassDB::bind_method(D_METHOD("set_output_mode", "mode"), &PlatformVideoStreamPlayback::set_output_mode);
-	ClassDB::bind_method(D_METHOD("get_output_mode"), &PlatformVideoStreamPlayback::get_output_mode);
+	ClassDB::bind_method(D_METHOD("set_output_mode", "mode"), &NativeVideoStreamPlayback::set_output_mode);
+	ClassDB::bind_method(D_METHOD("get_output_mode"), &NativeVideoStreamPlayback::get_output_mode);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "output_mode", PROPERTY_HINT_ENUM, "SDR,HDR"),
 			"set_output_mode", "get_output_mode");
 }
 
-bool PlatformVideoStreamPlayback::load(const String &path) {
-	std::unique_ptr<core::Backend> backend = platform_media::make_backend();
+bool NativeVideoStreamPlayback::load(const String &path) {
+	std::unique_ptr<core::Backend> backend = native_video::make_backend();
 
 	// Resolve a Godot res:// / user:// path to an absolute OS path the backend's
 	// AVURLAsset can open. globalize_path leaves absolute OS paths untouched.
@@ -157,17 +157,17 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 	return true;
 }
 
-core::Clock *PlatformVideoStreamPlayback::master() const {
+core::Clock *NativeVideoStreamPlayback::master() const {
 	return clock_.get();
 }
 
-bool PlatformVideoStreamPlayback::audio_exhausted() const {
+bool NativeVideoStreamPlayback::audio_exhausted() const {
 	// True when no real audio samples will ever advance the clock again:
 	// silent clips, and a shorter audio track once it has fully drained.
 	return !has_audio_ || (audio_eos_ && audio_ring_ && audio_ring_->empty());
 }
 
-void PlatformVideoStreamPlayback::fill_audio() {
+void NativeVideoStreamPlayback::fill_audio() {
 	if (!stream_ || !audio_ring_ || audio_eos_) {
 		return;
 	}
@@ -215,7 +215,7 @@ void PlatformVideoStreamPlayback::fill_audio() {
 	});
 }
 
-bool PlatformVideoStreamPlayback::drive_audio() {
+bool NativeVideoStreamPlayback::drive_audio() {
 	if (!audio_ring_ || !clock_ || canonical_channels_ <= 0) {
 		return false;
 	}
@@ -262,7 +262,7 @@ bool PlatformVideoStreamPlayback::drive_audio() {
 	return advance > 0;
 }
 
-void PlatformVideoStreamPlayback::_play() {
+void NativeVideoStreamPlayback::_play() {
 	if (!loaded_) {
 		return;
 	}
@@ -280,7 +280,7 @@ void PlatformVideoStreamPlayback::_play() {
 	}
 }
 
-void PlatformVideoStreamPlayback::_stop() {
+void NativeVideoStreamPlayback::_stop() {
 	playing_ = false;
 	paused_ = false;
 	audio_eos_ = false;
@@ -308,37 +308,37 @@ void PlatformVideoStreamPlayback::_stop() {
 	}
 }
 
-bool PlatformVideoStreamPlayback::_is_playing() const {
+bool NativeVideoStreamPlayback::_is_playing() const {
 	return playing_;
 }
 
-void PlatformVideoStreamPlayback::_set_paused(bool paused) {
+void NativeVideoStreamPlayback::_set_paused(bool paused) {
 	paused_ = paused;
 	if (core::Clock *c = master()) {
 		c->set_paused(paused);
 	}
 }
 
-bool PlatformVideoStreamPlayback::_is_paused() const {
+bool NativeVideoStreamPlayback::_is_paused() const {
 	return paused_;
 }
 
-double PlatformVideoStreamPlayback::_get_length() const {
+double NativeVideoStreamPlayback::_get_length() const {
 	return length_;
 }
 
-double PlatformVideoStreamPlayback::_get_playback_position() const {
+double NativeVideoStreamPlayback::_get_playback_position() const {
 	return position_;
 }
 
-double PlatformVideoStreamPlayback::now_ms() {
+double NativeVideoStreamPlayback::now_ms() {
 	// Monotonic wall clock for scrub velocity/debounce. steady_clock never jumps.
 	using clock = std::chrono::steady_clock;
 	const auto t = clock::now().time_since_epoch();
 	return std::chrono::duration<double, std::milli>(t).count();
 }
 
-void PlatformVideoStreamPlayback::apply_scrub_resolve(const core::ScrubResolve &resolve) {
+void NativeVideoStreamPlayback::apply_scrub_resolve(const core::ScrubResolve &resolve) {
 	core::Clock *c = master();
 	if (!stream_ || !c) {
 		return;
@@ -399,7 +399,7 @@ void PlatformVideoStreamPlayback::apply_scrub_resolve(const core::ScrubResolve &
 	reconcile_audio_track();
 }
 
-void PlatformVideoStreamPlayback::reconcile_audio_track() {
+void NativeVideoStreamPlayback::reconcile_audio_track() {
 	if (desired_track_ == live_track_ || !stream_) {
 		return;
 	}
@@ -462,7 +462,7 @@ void PlatformVideoStreamPlayback::reconcile_audio_track() {
 	audio_eos_ = false;
 }
 
-void PlatformVideoStreamPlayback::_seek(double time) {
+void NativeVideoStreamPlayback::_seek(double time) {
 	if (!stream_ || !master()) {
 		return;
 	}
@@ -477,7 +477,7 @@ void PlatformVideoStreamPlayback::_seek(double time) {
 	apply_scrub_resolve(resolve);
 }
 
-void PlatformVideoStreamPlayback::_set_audio_track(int idx) {
+void NativeVideoStreamPlayback::_set_audio_track(int idx) {
 	// Validate out-of-range: the stock VideoStreamPlayer calls this before
 	// play() to pre-select a track, and while playing for mid-stream switch.
 	if (audio_track_count_ > 0 && (idx < 0 || idx >= audio_track_count_)) {
@@ -518,13 +518,13 @@ void PlatformVideoStreamPlayback::_set_audio_track(int idx) {
 	}
 }
 
-Ref<Texture2D> PlatformVideoStreamPlayback::_get_texture() const {
+Ref<Texture2D> NativeVideoStreamPlayback::_get_texture() const {
 	// The engine-owned RGBA Texture2DRD. Godot samples ONLY this — never the
 	// decoder surface.
 	return present_.get_texture();
 }
 
-void PlatformVideoStreamPlayback::_update(double delta) {
+void NativeVideoStreamPlayback::_update(double delta) {
 	core::Clock *clock = master();
 	if (!loaded_ || !clock || !stream_) {
 		return;
@@ -627,7 +627,7 @@ void PlatformVideoStreamPlayback::_update(double delta) {
 	}
 }
 
-int PlatformVideoStreamPlayback::_get_channels() const {
+int NativeVideoStreamPlayback::_get_channels() const {
 	// Canonical Mix Format channel count (maximum across all audio tracks,
 	// computed at load). Godot sizes its mix buffer from this and queries it
 	// exactly once at play start, so it is stable for the playback's lifetime.
@@ -636,7 +636,7 @@ int PlatformVideoStreamPlayback::_get_channels() const {
 	return canonical_channels_;
 }
 
-int PlatformVideoStreamPlayback::_get_mix_rate() const {
+int NativeVideoStreamPlayback::_get_mix_rate() const {
 	// Canonical Mix Format sample rate: the FIRST audio-bearing track's rate
 	// (mixed-sample-rate clips are a documented limitation — see load()). The
 	// AudioServer resamples from this to the device rate; the master clock
@@ -644,7 +644,7 @@ int PlatformVideoStreamPlayback::_get_mix_rate() const {
 	return canonical_sample_rate_;
 }
 
-Dictionary PlatformVideoStreamPlayback::get_color_info() const {
+Dictionary NativeVideoStreamPlayback::get_color_info() const {
 	Dictionary info;
 	info["matrix"] = static_cast<int>(color_.matrix);
 	info["primaries"] = static_cast<int>(color_.primaries);
@@ -657,15 +657,15 @@ Dictionary PlatformVideoStreamPlayback::get_color_info() const {
 	return info;
 }
 
-void PlatformVideoStreamPlayback::set_output_mode(int mode) {
+void NativeVideoStreamPlayback::set_output_mode(int mode) {
 	if (mode < 0 || mode > 1) {
 		return;
 	}
-	auto om = (mode == 1) ? platform_media::OutputMode::HDR
-						  : platform_media::OutputMode::SDR;
+	auto om = (mode == 1) ? native_video::OutputMode::HDR
+						  : native_video::OutputMode::SDR;
 	present_.set_output_mode(om);
 }
 
-int PlatformVideoStreamPlayback::get_output_mode() const {
+int NativeVideoStreamPlayback::get_output_mode() const {
 	return static_cast<int>(present_.output_mode());
 }

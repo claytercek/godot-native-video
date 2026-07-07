@@ -283,7 +283,7 @@ TEST_CASE("request_seek flushes and resumes decode-ahead at the target") {
 	CHECK(live.load() == 0);
 }
 
-#if PLATFORM_MEDIA_FORCE_SYNC_AVAILABLE
+#if NATIVE_VIDEO_FORCE_SYNC_AVAILABLE
 // -----------------------------------------------------------------------
 // Force-synchronous mode (debug only): no worker threads; decode runs on the
 // caller's thread so lifetime bugs reproduce deterministically. Same external

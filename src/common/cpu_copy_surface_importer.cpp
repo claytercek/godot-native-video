@@ -66,7 +66,7 @@
 using namespace godot;
 using mf::ComPtr;
 
-namespace platform_media {
+namespace native_video {
 
 // PImpl holding the D3D11 readback state. Raw owning pointer so the header
 // stays plain C++; freed in CpuCopySurfaceImporter::~CpuCopySurfaceImporter.
@@ -307,6 +307,6 @@ PlaneTextures CpuCopySurfaceImporter::import(void *d3d11_texture, uint32_t plane
 	return out;
 }
 
-} // namespace platform_media
+} // namespace native_video
 
 #endif // _WIN32

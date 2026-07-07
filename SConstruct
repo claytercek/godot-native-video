@@ -3,7 +3,7 @@ import os
 import sys
 
 
-libname = "platform-media-streams"
+libname = "native-video"
 projectdir = "demo"
 
 localEnv = Environment(tools=["default"], PLATFORM="")
@@ -84,9 +84,9 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "src/core/decode_scheduler.cpp",
         "src/core/backend.cpp",
     ]
-    # The force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG.
+    # The force-synchronous lifetime-debug mode is gated behind NATIVE_VIDEO_DEBUG.
     # Define it for the headless core tests so the force-sync test compiles/runs.
-    core_env.Append(CPPDEFINES=["PLATFORM_MEDIA_DEBUG"])
+    core_env.Append(CPPDEFINES=["NATIVE_VIDEO_DEBUG"])
     # The scheduler spins up worker threads. MSVC's std::thread needs no extra
     # library; everywhere else link pthread.
     if sys.platform != "win32":
@@ -232,11 +232,11 @@ sources = ["build/src/register_types.cpp"]
 env.VariantDir("build/src/core", "src/core", duplicate=0)
 sources.extend(Glob("build/src/core/*.cpp"))
 
-# Force-synchronous lifetime-debug mode is gated behind PLATFORM_MEDIA_DEBUG; it
+# Force-synchronous lifetime-debug mode is gated behind NATIVE_VIDEO_DEBUG; it
 # is compiled in for debug builds only and stays out of template_release so the
 # synchronous decode path can never run in a shipped binary.
 if env["target"] == "template_debug" or env["target"] == "editor":
-    env.Append(CPPDEFINES=["PLATFORM_MEDIA_DEBUG"])
+    env.Append(CPPDEFINES=["NATIVE_VIDEO_DEBUG"])
 
 # Add Binding source files (src/common — the Godot adapter layer). Both plain
 # C++ (.cpp) and Objective-C++ (.mm, e.g. the Metal surface importer) live here.
