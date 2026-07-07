@@ -1,0 +1,15 @@
+; Headless smoke test project for platform-media-streams GDExtension.
+; Dedicated test project — the demo is kept as a human playground.
+; Runs headless with the Dummy audio driver (automatic with --headless).
+
+config_version=5
+
+[application]
+
+config/name="Native Media Streams — Headless Smoke Suite"
+run/main_scene="res://scenes/smoke.tscn"
+config/features=PackedStringArray("4.4")
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"

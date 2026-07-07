@@ -2,8 +2,9 @@
 *.gen.*
 .godot/
 
-# Ignore library files
+# Ignore library files but not the gdextension file
 demo/bin/*
+!demo/bin/*.gdextension
 .sconsign*.dblite
 
 # Ignore custom.py
@@ -63,3 +64,11 @@ tests/fixtures/
 # The demo's copy of the synthetic clip (see demo/README.md) is generated too.
 demo/synthetic.mp4
 demo/synthetic.mp4.uid
+
+# Headless smoke test project generated artifacts
+tests/headless-smoke/synthetic.mp4
+tests/headless-smoke/synthetic.mov
+tests/headless-smoke/synthetic.m4v
+tests/headless-smoke/**/*.uid
+tests/headless-smoke/*.uid
+tests/headless-smoke/bin/
