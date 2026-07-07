@@ -80,7 +80,9 @@ HEIGHT=240
 #   h264_30_m4v : H.264 / 30 fps / m4v container
 #
 #   h264_30_bt601_mp4 : H.264 / 30 fps / mp4, tagged BT.601 NTSC colorimetry
-#     (ffmpeg -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m)
+#     (ffmpeg -colorspace smpte170m -color_primaries smpte170m -color_trc smpte170m,
+#      plus -movflags +write_colr so the container carries the tags on every
+#      ffmpeg version — see the movflags note in gen_clip)
 #
 #   hevc_pq_bt2020_30_mp4 : HEVC Main10 PQ (ST 2084) / BT.2020 / 30 fps / mp4
 #     HDR10 test: PQ transfer, BT.2020 colour primaries, BT.2020 non-constant
@@ -176,9 +178,22 @@ gen_clip() {
     done
     audio_filter+="${concat}concat=n=${frames}:v=0:a=1[amono];[amono]pan=stereo|c0=c0|c1=c0[audio_out]"
 
+    # Colorimetry-tagged rows tag the frames themselves via setparams. The
+    # generic -colorspace/-color_primaries/-color_trc output options are NOT
+    # version-stable: ffmpeg 7.x only propagates the matrix (via lavfi YUV
+    # negotiation) into the encoder VUI / muxer colr box and silently drops
+    # primaries and transfer, while 6.x propagates all three. Frame-level
+    # properties survive on every version.
+    local color_tag=""
+    case "${codec}" in
+        h264_bt601) color_tag=",setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m" ;;
+        hevc10_pq)  color_tag=",setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084" ;;
+        hevc10_hlg) color_tag=",setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=arib-std-b67" ;;
+    esac
+
     local video_filter="color=black:size=${WIDTH}x${HEIGHT}:rate=${fps}:duration=${duration}[base];"
     video_filter+="[base]drawbox=x=0:y=0:w=80:h=80:color=white:t=fill,"
-    video_filter+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:${DRAWTEXT_FONT}[video_out]"
+    video_filter+="drawtext=text='%{eif\:n\:d}':x=5:y=5:fontsize=40:fontcolor=black:${DRAWTEXT_FONT}${color_tag}[video_out]"
 
     local vcodec
     case "${codec}" in
@@ -210,6 +225,17 @@ gen_clip() {
         *) echo "ERROR: unknown container ${container}" >&2; return 1 ;;
     esac
 
+    # Colorimetry-tagged rows force the ISOBMFF 'colr' box so the container-
+    # level tags are deterministic across ffmpeg versions: ffmpeg >= 6.0 writes
+    # the box by default when color metadata is set, older versions only with
+    # +write_colr. Media Foundation's mp4 source reads colorimetry exclusively
+    # from this box (it never parses SPS VUI), so without it the same clip
+    # decodes as untagged on Windows but tagged on macOS.
+    local movflags="+faststart"
+    case "${codec}" in
+        h264_bt601|hevc10_pq|hevc10_hlg) movflags+="+write_colr" ;;
+    esac
+
     echo "Generating ${name}: ${codec} ${fps}fps ${container} (${frames} frames) -> ${out}"
     ffmpeg -y \
         -filter_complex "${video_filter};${audio_filter}" \
@@ -217,7 +243,7 @@ gen_clip() {
         "${vcodec[@]}" \
         -c:a aac -b:a 128k -ac 2 -ar "${SAMPLE_RATE}" \
         -t "${duration}" \
-        -movflags +faststart \
+        -movflags "${movflags}" \
         -f "${muxer}" \
         "${out}" </dev/null
 }

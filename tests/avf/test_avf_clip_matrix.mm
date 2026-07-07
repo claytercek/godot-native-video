@@ -43,16 +43,14 @@ struct ColorimetryExpect {
 };
 
 static bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) {
-	// BT.601 NTSC-tagged clip. The YCbCr matrix is reliably present in the
-	// format description extensions; color primaries and transfer function
-	// are often absent (Unspecified) when only the H.264 VUI matrix coefficient
-	// is set without the corresponding primaries/transfer VUI fields. The
-	// per-frame CV attachments may be more complete.
+	// BT.601 NTSC-tagged clip. The generator forces the ISOBMFF 'colr' box
+	// (-movflags +write_colr), so the format description extensions carry the
+	// full SD tags: BT.601 matrix and SMPTE-C primaries. The SMPTE 170M
+	// transfer function is curve-identical to BT.709 and CoreMedia
+	// canonicalizes it as such.
 	if (file == "h264_30_bt601_mp4.mp4") {
 		out.matrix = core::ColorMatrix::BT601;
-		// Primaries and transfer are not tagged in this clip's format description
-		// extensions, so they fall back to the BT.709 defaults.
-		out.primaries = core::ColorPrimaries::BT709;
+		out.primaries = core::ColorPrimaries::BT601_525;
 		out.transfer = core::TransferFunction::BT709;
 		out.range = core::ColorRange::Video;
 		out.bit_depth = 8;
