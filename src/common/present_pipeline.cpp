@@ -232,11 +232,11 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 		uint8_t *w = pc.ptrw();
 		const uint32_t ow = static_cast<uint32_t>(width_);
 		const uint32_t oh = static_cast<uint32_t>(height_);
-		const uint32_t matrix = static_cast<uint32_t>(frame.ycbcr_matrix);
-		const uint32_t range = static_cast<uint32_t>(frame.range);
-		const uint32_t depth = static_cast<uint32_t>(frame.bit_depth);
-		const uint32_t transfer = static_cast<uint32_t>(frame.transfer);
-		const uint32_t primaries = static_cast<uint32_t>(frame.primaries);
+		const uint32_t matrix = static_cast<uint32_t>(frame.color.matrix);
+		const uint32_t range = static_cast<uint32_t>(frame.color.range);
+		const uint32_t depth = static_cast<uint32_t>(frame.color.bit_depth);
+		const uint32_t transfer = static_cast<uint32_t>(frame.color.transfer);
+		const uint32_t primaries = static_cast<uint32_t>(frame.color.primaries);
 		const float sample_scale = planes.sample_scale;
 		memcpy(w + 0, &ow, sizeof(uint32_t));
 		memcpy(w + 4, &oh, sizeof(uint32_t));

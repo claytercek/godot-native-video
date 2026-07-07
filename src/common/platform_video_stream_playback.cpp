@@ -56,11 +56,7 @@ bool PlatformVideoStreamPlayback::load(const String &path) {
 	// Cache colorimetry from the backend. These are populated at open time
 	// from the track's format descriptions; per-frame CV attachments may
 	// provide more accurate metadata at decode time.
-	color_matrix_ = static_cast<int>(backend->ycbcr_matrix());
-	color_primaries_ = static_cast<int>(backend->color_primaries());
-	color_transfer_ = static_cast<int>(backend->transfer_function());
-	color_range_ = static_cast<int>(backend->color_range());
-	color_bit_depth_ = backend->bit_depth();
+	color_ = backend->colorimetry();
 
 	length_ = backend->duration_seconds();
 	width_ = backend->video_width();
@@ -436,11 +432,11 @@ int PlatformVideoStreamPlayback::_get_mix_rate() const {
 
 Dictionary PlatformVideoStreamPlayback::get_color_info() const {
 	Dictionary info;
-	info["matrix"] = color_matrix_;
-	info["primaries"] = color_primaries_;
-	info["transfer"] = color_transfer_;
-	info["range"] = color_range_;
-	info["bit_depth"] = color_bit_depth_;
+	info["matrix"] = static_cast<int>(color_.matrix);
+	info["primaries"] = static_cast<int>(color_.primaries);
+	info["transfer"] = static_cast<int>(color_.transfer);
+	info["range"] = static_cast<int>(color_.range);
+	info["bit_depth"] = color_.bit_depth;
 	// Report the effective output mode so callers can distinguish between
 	// an SDR clip in HDR viewport vs a native HDR clip.
 	info["output_mode"] = static_cast<int>(present_.output_mode());

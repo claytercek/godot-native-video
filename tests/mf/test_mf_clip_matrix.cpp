@@ -114,22 +114,22 @@ void check_colorimetry(core::ColorMatrix matrix, core::ColorPrimaries primaries,
 
 // Assert that the backend's open-time colorimetry matches expectations.
 void check_backend_colorimetry(mf::MfBackend &backend, const std::string &file) {
-	check_colorimetry(backend.ycbcr_matrix(), backend.color_primaries(),
-			backend.transfer_function(), backend.color_range(), file);
+	const core::Colorimetry color = backend.colorimetry();
+	check_colorimetry(color.matrix, color.primaries, color.transfer, color.range, file);
 
 	ColorimetryExpect exp;
 	if (!expect_colorimetry(file, exp)) {
-		CHECK(backend.bit_depth() == 8);
+		CHECK(color.bit_depth == 8);
 		return;
 	}
-	CHECK(backend.bit_depth() == exp.bit_depth);
+	CHECK(color.bit_depth == exp.bit_depth);
 }
 
 // Assert that the first decoded frame's per-frame colorimetry matches the
 // same expectations (the MF backend tags every frame from the stream-level
 // negotiated values; see mf_backend.cpp's read_colorimetry).
 void check_frame_colorimetry(const core::VideoFrame &frame, const std::string &file) {
-	check_colorimetry(frame.ycbcr_matrix, frame.primaries, frame.transfer, frame.range, file);
+	check_colorimetry(frame.color.matrix, frame.color.primaries, frame.color.transfer, frame.color.range, file);
 }
 
 // GitHub-hosted Windows runners (and many headless Windows Server images) do
@@ -220,10 +220,10 @@ TEST_CASE("MF backend decodes the real-clip format matrix") {
 			const bool is_10bit = expect_colorimetry(clip.file, exp) && exp.bit_depth >= 10;
 			if (is_10bit) {
 				CHECK(frame->pixel_format == core::PixelFormat::x420);
-				CHECK(frame->bit_depth == 10);
+				CHECK(frame->color.bit_depth == 10);
 			} else {
 				CHECK(frame->pixel_format == core::PixelFormat::NV12);
-				CHECK(frame->bit_depth == 8);
+				CHECK(frame->color.bit_depth == 8);
 			}
 			CHECK(frame->native_handle != nullptr);
 			CHECK(frame->width == clip.width);

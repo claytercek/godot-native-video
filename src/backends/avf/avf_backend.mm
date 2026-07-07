@@ -54,11 +54,7 @@ public:
 	// shader constants). Per-frame values from CV attachments may differ from
 	// these per-sample metadata (e.g. a tagged clip that has attachments on the
 	// actual pixel buffers but empty format-description extensions).
-	core::ColorMatrix ycbcr_matrix_ = core::ColorMatrix::BT709;
-	core::ColorPrimaries primaries_ = core::ColorPrimaries::BT709;
-	core::TransferFunction transfer_ = core::TransferFunction::BT709;
-	core::ColorRange range_ = core::ColorRange::Video;
-	int bit_depth_ = 8;
+	core::Colorimetry color_ = core::Colorimetry::bt709_defaults();
 
 	bool error = false;
 
@@ -87,14 +83,14 @@ public:
 // buffer so the decode stays on the GPU path; the zero-copy present slice
 // imports the surface directly without a CPU copy.
 static AVAssetReaderTrackOutput *make_video_output(AVAssetTrack *track,
-		int bit_depth, core::ColorRange range) {
+		const core::Colorimetry &color) {
 	OSType pixel_format;
-	if (bit_depth >= 10) {
-		pixel_format = (range == core::ColorRange::Full)
+	if (color.bit_depth >= 10) {
+		pixel_format = (color.range == core::ColorRange::Full)
 				? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange   // 'x42F'
 				: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange; // 'x420'
 	} else {
-		pixel_format = (range == core::ColorRange::Full)
+		pixel_format = (color.range == core::ColorRange::Full)
 				? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange     // 'a420'
 				: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;   // '420v'
 	}
@@ -167,17 +163,17 @@ static void populate_colorimetry(CVPixelBufferRef pb, core::VideoFrame &frame) {
 
 	val = CVBufferCopyAttachment(pb, kCVImageBufferYCbCrMatrixKey, nullptr);
 	if (val) {
-		frame.ycbcr_matrix = parse_ycbcr_matrix(static_cast<CFStringRef>(val));
+		frame.color.matrix = parse_ycbcr_matrix(static_cast<CFStringRef>(val));
 		CFRelease(val);
 	}
 	val = CVBufferCopyAttachment(pb, kCVImageBufferColorPrimariesKey, nullptr);
 	if (val) {
-		frame.primaries = parse_color_primaries(static_cast<CFStringRef>(val));
+		frame.color.primaries = parse_color_primaries(static_cast<CFStringRef>(val));
 		CFRelease(val);
 	}
 	val = CVBufferCopyAttachment(pb, kCVImageBufferTransferFunctionKey, nullptr);
 	if (val) {
-		frame.transfer = parse_transfer_function(static_cast<CFStringRef>(val));
+		frame.color.transfer = parse_transfer_function(static_cast<CFStringRef>(val));
 		CFRelease(val);
 	}
 	// Range: determine from the pixel format type (handles both 8-bit and 10-bit
@@ -185,17 +181,17 @@ static void populate_colorimetry(CVPixelBufferRef pb, core::VideoFrame &frame) {
 	OSType fmt = CVPixelBufferGetPixelFormatType(pb);
 	if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
 			fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
-		frame.range = core::ColorRange::Full;
+		frame.color.range = core::ColorRange::Full;
 	} else {
 		// Video-range variants and all other formats are treated as video range.
-		frame.range = core::ColorRange::Video;
+		frame.color.range = core::ColorRange::Video;
 	}
 	// Bit depth from the pixel format.
 	if (fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
 			fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange) {
-		frame.bit_depth = 10;
+		frame.color.bit_depth = 10;
 	} else {
-		frame.bit_depth = 8;
+		frame.color.bit_depth = 8;
 	}
 }
 
@@ -219,8 +215,7 @@ bool AvfBackend::Impl::build_reader(double start_time) {
 	}
 
 	if (video_track) {
-		AVAssetReaderTrackOutput *vo = make_video_output(video_track,
-				bit_depth_, range_);
+		AVAssetReaderTrackOutput *vo = make_video_output(video_track, color_);
 		vo.alwaysCopiesSampleData = NO; // hand out the decoder's own surface
 		if ([r canAddOutput:vo]) {
 			[r addOutput:vo];
@@ -318,31 +313,31 @@ bool AvfBackend::open(const std::string &url_or_path) {
 				val = (CFStringRef)CMFormatDescriptionGetExtension(vfd,
 						kCMFormatDescriptionExtension_YCbCrMatrix);
 				if (val) {
-					impl_->ycbcr_matrix_ = parse_ycbcr_matrix(val);
+					impl_->color_.matrix = parse_ycbcr_matrix(val);
 				}
 
 				val = (CFStringRef)CMFormatDescriptionGetExtension(vfd,
 						kCMFormatDescriptionExtension_ColorPrimaries);
 				if (val) {
-					impl_->primaries_ = parse_color_primaries(val);
+					impl_->color_.primaries = parse_color_primaries(val);
 				}
 
 				val = (CFStringRef)CMFormatDescriptionGetExtension(vfd,
 						kCMFormatDescriptionExtension_TransferFunction);
 				if (val) {
-					impl_->transfer_ = parse_transfer_function(val);
+					impl_->color_.transfer = parse_transfer_function(val);
 				}
 
 				// Bit depth: detect from the format description's BitsPerComponent
 				// extension. 8-bit sources return 8, 10-bit sources (HEVC Main10)
 				// return 10. Default to 8 if absent (legacy behaviour).
-				impl_->bit_depth_ = 8;
+				impl_->color_.bit_depth = 8;
 				CFNumberRef bpc_ref = (CFNumberRef)CMFormatDescriptionGetExtension(vfd,
 						kCMFormatDescriptionExtension_BitsPerComponent);
 				if (bpc_ref) {
 					int32_t bpc;
 					if (CFNumberGetValue(bpc_ref, kCFNumberSInt32Type, &bpc)) {
-						impl_->bit_depth_ = (bpc >= 10) ? 10 : 8;
+						impl_->color_.bit_depth = (bpc >= 10) ? 10 : 8;
 					}
 				}
 				// Source range: read from the format description extension. Default to
@@ -350,9 +345,9 @@ bool AvfBackend::open(const std::string &url_or_path) {
 				CFBooleanRef full_range = (CFBooleanRef)CMFormatDescriptionGetExtension(vfd,
 						kCMFormatDescriptionExtension_FullRangeVideo);
 				if (full_range && CFBooleanGetValue(full_range)) {
-					impl_->range_ = core::ColorRange::Full;
+					impl_->color_.range = core::ColorRange::Full;
 				} else {
-					impl_->range_ = core::ColorRange::Video;
+					impl_->color_.range = core::ColorRange::Video;
 				}
 			}
 		}
@@ -409,24 +404,8 @@ bool AvfBackend::had_error() const {
 	return impl_ && impl_->error;
 }
 
-core::ColorMatrix AvfBackend::ycbcr_matrix() const {
-	return impl_ ? impl_->ycbcr_matrix_ : core::ColorMatrix::BT709;
-}
-
-core::ColorPrimaries AvfBackend::color_primaries() const {
-	return impl_ ? impl_->primaries_ : core::ColorPrimaries::BT709;
-}
-
-core::TransferFunction AvfBackend::transfer_function() const {
-	return impl_ ? impl_->transfer_ : core::TransferFunction::BT709;
-}
-
-core::ColorRange AvfBackend::color_range() const {
-	return impl_ ? impl_->range_ : core::ColorRange::Video;
-}
-
-int AvfBackend::bit_depth() const {
-	return impl_ ? impl_->bit_depth_ : 8;
+core::Colorimetry AvfBackend::colorimetry() const {
+	return impl_ ? impl_->color_ : core::Colorimetry::bt709_defaults();
 }
 
 bool AvfBackend::seek(double pts_seconds) {

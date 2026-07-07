@@ -166,18 +166,13 @@ public:
 
 	// Negotiated colorimetry (read from the video stream's current media type
 	// at open time, and re-read on a native-type change mid-stream). Defaults:
-	// BT.709, video range — same as today's hard-coded shader constants and
-	// the AVF backend's untagged-clip default.
-	core::ColorMatrix ycbcr_matrix_ = core::ColorMatrix::BT709;
-	core::ColorPrimaries primaries_ = core::ColorPrimaries::BT709;
-	core::TransferFunction transfer_ = core::TransferFunction::BT709;
-	core::ColorRange range_ = core::ColorRange::Video;
-
-	// Negotiated bit depth: 10 when the video stream output type is P010
-	// (10-bit source, matched), 8 for NV12 (8-bit source, or a 10-bit source
-	// whose P010 request failed and fell back to NV12). Set by
-	// configure_video_stream() before open() returns.
-	int bit_depth_ = 8;
+	// BT.709, video range, 8-bit — same as today's hard-coded shader constants
+	// and the AVF backend's untagged-clip default. bit_depth is set by
+	// configure_video_stream() before open() returns: 10 when the video
+	// stream output type is P010 (10-bit source, matched), 8 for NV12 (8-bit
+	// source, or a 10-bit source whose P010 request failed and fell back to
+	// NV12).
+	core::Colorimetry color_ = core::Colorimetry::bt709_defaults();
 
 	bool error = false;
 	bool com_initialized = false;
@@ -304,7 +299,7 @@ bool MfBackend::Impl::configure_video_stream() {
 			// onto its negotiated output type, so reading them post-conversion
 			// would always see the unspecified defaults.
 			read_colorimetry(native.get());
-			bit_depth_ = detect_bit_depth(native.get());
+			color_.bit_depth = detect_bit_depth(native.get());
 		} else if (major == MFMediaType_Audio && audio_stream_index < 0) {
 			audio_stream_index = static_cast<int>(i);
 		}
@@ -319,8 +314,8 @@ bool MfBackend::Impl::configure_video_stream() {
 	// Request the output subtype matching the detected bit depth. The reader
 	// inserts a video processor MFT if the decoder doesn't natively output
 	// that subtype. If the 10-bit (P010) request fails — e.g. no MFT in the
-	// chain can produce it — fall back to NV12 and correct bit_depth_ so the
-	// frames we hand out accurately report what was actually negotiated.
+	// chain can produce it — fall back to NV12 and correct color_.bit_depth so
+	// the frames we hand out accurately report what was actually negotiated.
 	auto request_subtype = [&](const GUID &subtype) -> HRESULT {
 		ComPtr<IMFMediaType> out_type;
 		HRESULT hr2 = MFCreateMediaType(out_type.put());
@@ -332,9 +327,9 @@ bool MfBackend::Impl::configure_video_stream() {
 		return reader->SetCurrentMediaType(vidx, nullptr, out_type.get());
 	};
 
-	HRESULT hr = request_subtype(bit_depth_ >= 10 ? MFVideoFormat_P010 : MFVideoFormat_NV12);
-	if (FAILED(hr) && bit_depth_ >= 10) {
-		bit_depth_ = 8;
+	HRESULT hr = request_subtype(color_.bit_depth >= 10 ? MFVideoFormat_P010 : MFVideoFormat_NV12);
+	if (FAILED(hr) && color_.bit_depth >= 10) {
+		color_.bit_depth = 8;
 		hr = request_subtype(MFVideoFormat_NV12);
 	}
 	if (FAILED(hr)) {
@@ -363,16 +358,16 @@ bool MfBackend::Impl::configure_video_stream() {
 void MfBackend::Impl::read_colorimetry(IMFMediaType *type) {
 	UINT32 val = 0;
 	if (SUCCEEDED(type->GetUINT32(MF_MT_YUV_MATRIX, &val))) {
-		ycbcr_matrix_ = parse_ycbcr_matrix(val);
+		color_.matrix = parse_ycbcr_matrix(val);
 	}
 	if (SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_PRIMARIES, &val))) {
-		primaries_ = parse_color_primaries(val);
+		color_.primaries = parse_color_primaries(val);
 	}
 	if (SUCCEEDED(type->GetUINT32(MF_MT_TRANSFER_FUNCTION, &val))) {
-		transfer_ = parse_transfer_function(val);
+		color_.transfer = parse_transfer_function(val);
 	}
 	if (SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &val))) {
-		range_ = parse_color_range(val);
+		color_.range = parse_color_range(val);
 	}
 }
 
@@ -524,24 +519,8 @@ bool MfBackend::had_error() const {
 	return impl_ && impl_->error;
 }
 
-core::ColorMatrix MfBackend::ycbcr_matrix() const {
-	return impl_ ? impl_->ycbcr_matrix_ : core::ColorMatrix::BT709;
-}
-
-core::ColorPrimaries MfBackend::color_primaries() const {
-	return impl_ ? impl_->primaries_ : core::ColorPrimaries::BT709;
-}
-
-core::TransferFunction MfBackend::transfer_function() const {
-	return impl_ ? impl_->transfer_ : core::TransferFunction::BT709;
-}
-
-core::ColorRange MfBackend::color_range() const {
-	return impl_ ? impl_->range_ : core::ColorRange::Video;
-}
-
-int MfBackend::bit_depth() const {
-	return impl_ ? impl_->bit_depth_ : 8;
+core::Colorimetry MfBackend::colorimetry() const {
+	return impl_ ? impl_->color_ : core::Colorimetry::bt709_defaults();
 }
 
 bool MfBackend::seek(double pts_seconds) {
@@ -642,8 +621,7 @@ std::optional<core::VideoFrame> MfBackend::next_video_frame() {
 		// 8-bit sources negotiated NV12; 10-bit HEVC Main10 sources negotiated
 		// P010, tagged as PixelFormat::x420 — the same logical tag the AVF
 		// backend uses for its 10-bit biplanar surfaces.
-		frame.pixel_format = impl_->bit_depth_ >= 10 ? core::PixelFormat::x420 : core::PixelFormat::NV12;
-		frame.bit_depth = impl_->bit_depth_;
+		frame.pixel_format = impl_->color_.bit_depth >= 10 ? core::PixelFormat::x420 : core::PixelFormat::NV12;
 		// Record the array-slice index so the importer can address the right
 		// subresource of the shared decoder texture array.
 		frame.plane_slice = static_cast<uint32_t>(subresource);
@@ -652,10 +630,7 @@ std::optional<core::VideoFrame> MfBackend::next_video_frame() {
 		// native-type change). MF does not expose per-IMFSample colorimetry
 		// overrides the way CoreVideo attaches per-buffer keys, so the current
 		// media type is the most granular source available.
-		frame.ycbcr_matrix = impl_->ycbcr_matrix_;
-		frame.primaries = impl_->primaries_;
-		frame.transfer = impl_->transfer_;
-		frame.range = impl_->range_;
+		frame.color = impl_->color_;
 
 		// Move the texture owner into the release closure so the D3D11 texture is
 		// Released exactly once when the consumer is done — the COM analog of the

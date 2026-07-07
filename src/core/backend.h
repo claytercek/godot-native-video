@@ -45,6 +45,40 @@ enum class ColorRange : uint8_t {
 };
 
 // -----------------------------------------------------------------------
+// Colorimetry — the five colorimetry fields bundled into one value type.
+//
+// There are two default conventions in play, both preserved here:
+//  - Per-frame (VideoFrame::color): defaults to all-Unspecified, matching
+//    the enums' own defaults. Unspecified is treated as BT.709 video range
+//    by the shader (the v1 assumption, matching today's hard-coded shader
+//    constants).
+//  - Negotiated (Backend::colorimetry() and backend impls): defaults to
+//    BT709/BT709/BT709/Video/8, i.e. the concrete negotiated values rather
+//    than "unknown". Use bt709_defaults() for that convention instead of
+//    hand-writing the five fields.
+// -----------------------------------------------------------------------
+struct Colorimetry {
+	ColorMatrix matrix = ColorMatrix::Unspecified;
+	ColorPrimaries primaries = ColorPrimaries::Unspecified;
+	TransferFunction transfer = TransferFunction::Unspecified;
+	ColorRange range = ColorRange::Unspecified;
+	int bit_depth = 8;
+
+	// The negotiated-default convention: concrete BT.709 video-range values
+	// rather than Unspecified. Backends start here and overwrite fields as
+	// they learn the stream's actual colorimetry from the container/codec.
+	static Colorimetry bt709_defaults() {
+		Colorimetry c;
+		c.matrix = ColorMatrix::BT709;
+		c.primaries = ColorPrimaries::BT709;
+		c.transfer = TransferFunction::BT709;
+		c.range = ColorRange::Video;
+		c.bit_depth = 8;
+		return c;
+	}
+};
+
+// -----------------------------------------------------------------------
 // Pixel format tag — surface types produced by a hardware decoder.
 // Only 8-bit SDR formats are in scope for v1.
 // -----------------------------------------------------------------------
@@ -85,11 +119,7 @@ struct VideoFrame {
 	// Populated from the decoder surface's color attachments by the Backend.
 	// Unspecified fields are treated as BT.709, video range (the v1 default
 	// that matches today's hard-coded shader constants).
-	ColorMatrix ycbcr_matrix = ColorMatrix::Unspecified;
-	ColorPrimaries primaries = ColorPrimaries::Unspecified;
-	TransferFunction transfer = TransferFunction::Unspecified;
-	ColorRange range = ColorRange::Unspecified;
-	int bit_depth = 8;
+	Colorimetry color;
 
 	// Call when the consumer is done with this frame so the decode pool can
 	// recycle the surface.
@@ -146,13 +176,9 @@ public:
 	virtual int audio_sample_rate() const = 0;
 
 	// --- Colorimetry (populated after open) ---
-	// These return the negotiated colorimetry for the stream as a whole.
-	// The per-frame VideoFrame fields carry the per-sample metadata.
-	virtual ColorMatrix ycbcr_matrix() const { return ColorMatrix::BT709; }
-	virtual ColorPrimaries color_primaries() const { return ColorPrimaries::BT709; }
-	virtual TransferFunction transfer_function() const { return TransferFunction::BT709; }
-	virtual ColorRange color_range() const { return ColorRange::Video; }
-	virtual int bit_depth() const { return 8; }
+	// Returns the negotiated colorimetry for the stream as a whole.
+	// The per-frame VideoFrame::color field carries the per-sample metadata.
+	virtual Colorimetry colorimetry() const { return Colorimetry::bt709_defaults(); }
 
 	// --- Decode pump ---
 

@@ -53,11 +53,7 @@ public:
 	bool had_error() const;
 
 	// --- Colorimetry (populated at open from format descriptions) ---
-	core::ColorMatrix ycbcr_matrix() const override;
-	core::ColorPrimaries color_primaries() const override;
-	core::TransferFunction transfer_function() const override;
-	core::ColorRange color_range() const override;
-	int bit_depth() const override;
+	core::Colorimetry colorimetry() const override;
 
 private:
 	class Impl;
