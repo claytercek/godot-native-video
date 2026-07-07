@@ -16,6 +16,11 @@
 // core::VideoFrame::release callback. This is the structural mirror of
 // avf_backend.mm.
 //
+// Audio-track enumeration and selection (select_audio_track(),
+// reselect_audio_track(), and the machinery behind them) live in
+// mf_audio.cpp, sharing the MfBackend::Impl definition declared in
+// mf_backend_impl.h.
+//
 // No Godot / RenderingDevice symbols appear here.
 //
 // STATUS: VERIFIED on Windows 11 (AMD hardware decode). tests/mf passes the
@@ -26,8 +31,7 @@
 // the slice index is reported in VideoFrame::plane_slice (see below).
 // -----------------------------------------------------------------------
 
-#include "mf_backend.h"
-#include "com_raii.h"
+#include "mf_backend_impl.h"
 
 // This entire backend is Windows-only. On any other platform it compiles to an
 // empty translation unit so the macOS build (which never globs it) is safe even
@@ -35,35 +39,19 @@
 #if defined(_WIN32)
 
 // Media Foundation + D3D11 + DXGI.
-#include <mfapi.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
 #include <mferror.h>
 #include <mftransform.h>
-#include <d3d11.h>
-#include <dxgi.h>
 #include <Mfobjects.h>
 #include <propvarutil.h>
 #include <codecapi.h> // eAVEncH265VProfile_*
 
-#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
-// MFTIME / LONGLONG sample times are in 100-nanosecond units (10^7 per second),
-// the Media Foundation time base. PTS in seconds = mf_time / 1e7.
 namespace {
-constexpr double kMfTicksPerSecond = 10'000'000.0;
-
-inline double mf_ticks_to_seconds(LONGLONG ticks) {
-	return static_cast<double>(ticks) / kMfTicksPerSecond;
-}
-inline LONGLONG seconds_to_mf_ticks(double seconds) {
-	return static_cast<LONGLONG>(seconds * kMfTicksPerSecond + 0.5);
-}
 
 // -----------------------------------------------------------------------
 // Colorimetry helpers — map MF_MT_YUV_MATRIX / MF_MT_VIDEO_PRIMARIES /
@@ -136,129 +124,6 @@ int detect_bit_depth(IMFMediaType *native) {
 } // namespace
 
 namespace mf {
-
-// -----------------------------------------------------------------------
-// MfBackend::Impl — holds the MF/D3D11 objects (COM-managed via ComPtr) and the
-// scratch buffer whose lifetime backs the audio pointer we return. This mirrors
-// AvfBackend::Impl one-for-one.
-// -----------------------------------------------------------------------
-class MfBackend::Impl {
-public:
-	// D3D11 device + the DXGI device manager that the source reader uses to
-	// hardware-decode straight into D3D11 NV12 textures. Created once in open()
-	// and reused across seek() (unlike the source reader, which is single-pass
-	// in the same sense AVAssetReader is, so we recreate it on seek via a fresh
-	// SetCurrentPosition — MF supports rewinding a reader, so we keep one reader
-	// and just seek it).
-	ComPtr<ID3D11Device> d3d_device;
-	ComPtr<ID3D11DeviceContext> d3d_context;
-	ComPtr<IMFDXGIDeviceManager> dxgi_manager;
-	ComPtr<IMFSourceReader> reader;
-
-	// Non-null only after reselect_audio_track(); reset by open()/seek().
-	// Dedicated audio-only source reader so a mid-decode track switch can
-	// prime the new track at the requested position without repositioning
-	// (and thus disturbing) the shared reader's video stream. Toggling
-	// per-stream selection on the shared reader alone cannot implement
-	// reselect: a stream that was deselected when the media source last
-	// started never delivers samples — ReadSample reports end-of-stream —
-	// until the source is restarted by a position change.
-	// next_audio_chunk() reads from audio_reader when it is non-null.
-	ComPtr<IMFSourceReader> audio_reader;
-
-	std::wstring path;
-
-	double duration = 0.0;
-	int width = 0;
-	int height = 0;
-	int audio_channels = 0;
-	int audio_rate = 0;
-
-	int video_stream_index = -1;
-	int audio_stream_index = -1;
-
-	// Negotiated colorimetry (read from the video stream's current media type
-	// at open time, and re-read on a native-type change mid-stream). Defaults:
-	// BT.709, video range, 8-bit — same as today's hard-coded shader constants
-	// and the AVF backend's untagged-clip default. bit_depth is set by
-	// configure_video_stream() before open() returns: 10 when the video
-	// stream output type is P010 (10-bit source, matched), 8 for NV12 (8-bit
-	// source, or a 10-bit source whose P010 request failed and fell back to
-	// NV12).
-	core::Colorimetry color_ = core::Colorimetry::bt709_defaults();
-
-	bool error = false;
-	bool com_initialized = false;
-	bool mf_started = false;
-
-	// Per-track audio metadata. Populated by configure_video_stream()
-	// during the initial stream scan.
-	struct TrackMeta {
-		std::string language;
-		std::string name;
-		int channels = 0;
-		int sample_rate = 0;
-		bool is_default = false;
-	};
-	std::vector<TrackMeta> audio_tracks;
-
-	// Maps audio track index (position in audio_tracks) to the MF source
-	// reader stream index used by SetStreamSelection / SetCurrentMediaType.
-	std::vector<int> audio_stream_indices;
-
-	// The currently selected audio track index.
-	int selected_audio_track = 0;
-
-	// Backing store for the most recent decoded audio chunk. core::AudioChunk
-	// returns a borrowed const float*, so the buffer must outlive the returned
-	// chunk; it stays valid until the next next_audio_chunk() call.
-	std::vector<float> audio_scratch;
-
-	bool create_device();
-	bool create_reader();
-	bool configure_video_stream();
-	bool configure_audio_stream();
-	// Switch audio output to the track at `track_index` (position in
-	// audio_tracks). Deselects the old audio stream, selects the new one,
-	// and reconfigures PCM output. Returns true on success; on failure
-	// the old stream selection is left deselected and audio_stream_index
-	// is set to -1 (no audio).
-	bool switch_audio_track(int track_index);
-	// Select stream `aidx` on `target_reader` and negotiate interleaved
-	// float32 PCM output, updating audio_channels / audio_rate from the
-	// negotiated type. Shared by the combined reader and the dedicated
-	// audio-only reader.
-	bool configure_pcm_output(IMFSourceReader *target_reader, DWORD aidx);
-	// Build a dedicated audio-only source reader for `track_index`,
-	// positioned at `start_time`. Used by reselect_audio_track().
-	bool build_audio_reader(int track_index, double start_time);
-	void read_duration();
-	void read_colorimetry(IMFMediaType *type);
-	// Read a wide-string stream-descriptor attribute (e.g. MF_SD_LANGUAGE)
-	// for stream `stream_index` and return it as UTF-8; empty if absent.
-	std::string read_stream_string_attribute(DWORD stream_index, REFGUID guid);
-	// Sort audio_tracks/audio_stream_indices into container track order.
-	// MF's MP4 source enumerates streams in an order unrelated to the file's
-	// trak order (observed: reversed), but the cross-platform contract is that
-	// audio track index N names the same physical track on every backend.
-	void reorder_audio_tracks_by_container_order();
-
-	void teardown() {
-		audio_reader.reset();
-		reader.reset();
-		dxgi_manager.reset();
-		d3d_context.reset();
-		d3d_device.reset();
-		if (mf_started) {
-			MFShutdown();
-			mf_started = false;
-		}
-		if (com_initialized) {
-			CoUninitialize();
-			com_initialized = false;
-		}
-	}
-};
 
 // Create a hardware D3D11 device with BGRA + video support and wrap it in an
 // IMFDXGIDeviceManager so the source reader can decode into D3D11 textures.
@@ -336,62 +201,9 @@ bool MfBackend::Impl::create_reader() {
 // During the initial stream scan we also enumerate all audio stream indices
 // and collect per-track metadata (channel count, sample rate, language).
 // MF reports MF_SD_LANGUAGE as an RFC 1766 tag ("en", "es"); AVF reports the
-// container's ISO 639-2 code ("eng", "spa"). Convert to ISO 639-2/T so track
-// metadata is identical across platforms; unknown tags pass through unchanged.
-std::string normalize_language_tag(const std::string &tag) {
-	if (tag.empty()) {
-		return tag;
-	}
-	wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
-	if (MultiByteToWideChar(CP_UTF8, 0, tag.c_str(), -1, wide, LOCALE_NAME_MAX_LENGTH) <= 0) {
-		return tag;
-	}
-	wchar_t iso[9] = {};
-	if (GetLocaleInfoEx(wide, LOCALE_SISO639LANGNAME2, iso, 9) <= 0) {
-		return tag;
-	}
-	char narrow[9] = {};
-	WideCharToMultiByte(CP_UTF8, 0, iso, -1, narrow, sizeof(narrow), nullptr, nullptr);
-	return std::string(narrow);
-}
-
-std::string MfBackend::Impl::read_stream_string_attribute(DWORD stream_index, REFGUID guid) {
-	PROPVARIANT var;
-	PropVariantInit(&var);
-	HRESULT hr = reader->GetPresentationAttribute(stream_index, guid, &var);
-	std::string result;
-	if (SUCCEEDED(hr) && var.vt == VT_LPWSTR && var.pwszVal) {
-		const int len = WideCharToMultiByte(CP_UTF8, 0, var.pwszVal, -1, nullptr, 0, nullptr, nullptr);
-		if (len > 1) {
-			result.resize(static_cast<size_t>(len) - 1); // len counts the NUL
-			WideCharToMultiByte(CP_UTF8, 0, var.pwszVal, -1, result.data(), len, nullptr, nullptr);
-		}
-	}
-	PropVariantClear(&var);
-	return result;
-}
-
-void MfBackend::Impl::reorder_audio_tracks_by_container_order() {
-	if (audio_tracks.size() < 2) {
-		return;
-	}
-	// The MF MP4/MOV source enumerates streams in the exact REVERSE of the
-	// container's trak order (verified against multi-track fixtures: file order
-	// video/eng/fra/deu surfaces as deu/fra/eng/video). The real trak IDs are
-	// not recoverable — IMFStreamDescriptor::GetStreamIdentifier just returns
-	// 1..N in the source's own (reversed) order — so reversing the scan order
-	// is the only way to line audio track index N up with AVF and the file.
-	// The language-checked multi-track tests pin this; if a future Windows
-	// changes the enumeration order, they fail loudly.
-	std::reverse(audio_tracks.begin(), audio_tracks.end());
-	std::reverse(audio_stream_indices.begin(), audio_stream_indices.end());
-	for (size_t k = 0; k < audio_tracks.size(); ++k) {
-		audio_tracks[k].is_default = (k == 0);
-	}
-	// The default (pre-selection) audio stream is the container's first track.
-	audio_stream_index = audio_stream_indices[0];
-}
-
+// container's ISO 639-2 code ("eng", "spa"). normalize_language_tag()
+// (mf_audio.cpp) converts to ISO 639-2/T so track metadata is identical
+// across platforms; unknown tags pass through unchanged.
 bool MfBackend::Impl::configure_video_stream() {
 	// Find the first video stream by walking native media types.
 	audio_tracks.clear();
@@ -418,7 +230,7 @@ bool MfBackend::Impl::configure_video_stream() {
 			color_.bit_depth = detect_bit_depth(native.get());
 		} else if (major == MFMediaType_Audio) {
 			// Collect per-track metadata from the native audio media type.
-			TrackMeta meta;
+			core::AudioTrackInfo meta;
 			UINT32 ch = 0, rate = 0;
 			native->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch);
 			native->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
@@ -544,98 +356,6 @@ bool MfBackend::Impl::configure_audio_stream() {
 	return true;
 }
 
-bool MfBackend::Impl::switch_audio_track(int track_index) {
-	if (audio_stream_indices.empty()) {
-		return false;
-	}
-	if (track_index < 0 ||
-			static_cast<size_t>(track_index) >= audio_stream_indices.size()) {
-		return false;
-	}
-
-	// Deselect the old audio stream (if any) so the reader stops producing
-	// samples from it. This is safe even if no old stream is selected.
-	if (audio_stream_index >= 0) {
-		reader->SetStreamSelection(
-				static_cast<DWORD>(audio_stream_index), FALSE);
-	}
-
-	// Select the new audio stream index and apply PCM output type.
-	const int new_mf_index = audio_stream_indices[static_cast<size_t>(track_index)];
-	audio_stream_index = new_mf_index;
-	selected_audio_track = track_index;
-
-	const DWORD aidx = static_cast<DWORD>(new_mf_index);
-	if (!configure_pcm_output(reader.get(), aidx)) {
-		// PCM negotiation failed; deselect this stream too.
-		reader->SetStreamSelection(aidx, FALSE);
-		audio_stream_index = -1;
-		return false;
-	}
-	return true;
-}
-
-bool MfBackend::Impl::configure_pcm_output(
-		IMFSourceReader *target_reader, DWORD aidx) {
-	target_reader->SetStreamSelection(aidx, TRUE);
-
-	ComPtr<IMFMediaType> pcm;
-	HRESULT hr = MFCreateMediaType(pcm.put());
-	if (SUCCEEDED(hr)) {
-		pcm->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-		pcm->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float);
-		hr = target_reader->SetCurrentMediaType(aidx, nullptr, pcm.get());
-	}
-	if (FAILED(hr)) {
-		return false;
-	}
-
-	// Read back the negotiated type to get actual channels and rate.
-	ComPtr<IMFMediaType> current;
-	hr = target_reader->GetCurrentMediaType(aidx, current.put());
-	if (SUCCEEDED(hr) && current) {
-		UINT32 ch = 0, rate = 0;
-		current->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &ch);
-		current->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
-		audio_channels = static_cast<int>(ch);
-		audio_rate = static_cast<int>(rate);
-	}
-	return true;
-}
-
-bool MfBackend::Impl::build_audio_reader(int track_index, double start_time) {
-	audio_reader.reset();
-
-	// Plain source reader from the same URL — audio decode needs no DXGI
-	// device manager or hardware transforms.
-	ComPtr<IMFSourceReader> ar;
-	HRESULT hr = MFCreateSourceReaderFromURL(path.c_str(), nullptr, ar.put());
-	if (FAILED(hr) || !ar) {
-		return false;
-	}
-	ar->SetStreamSelection(
-			static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-
-	const DWORD aidx = static_cast<DWORD>(
-			audio_stream_indices[static_cast<size_t>(track_index)]);
-	if (!configure_pcm_output(ar.get(), aidx)) {
-		return false;
-	}
-
-	// Prime at the requested position (nearest sample at or before it —
-	// compressed audio frames are all sync points, so this is ~exact).
-	PROPVARIANT pos;
-	InitPropVariantFromInt64(seconds_to_mf_ticks(start_time), &pos);
-	hr = ar->SetCurrentPosition(GUID_NULL, pos);
-	PropVariantClear(&pos);
-	if (FAILED(hr)) {
-		return false;
-	}
-
-	audio_reader = std::move(ar);
-	return true;
-}
-
 // Read total duration from the presentation descriptor (100ns units -> seconds).
 void MfBackend::Impl::read_duration() {
 	PROPVARIANT var;
@@ -744,67 +464,6 @@ int MfBackend::audio_channel_count() const {
 int MfBackend::audio_sample_rate() const {
 	return impl_ ? impl_->audio_rate : 0;
 }
-int MfBackend::audio_track_count() const {
-	return impl_ ? static_cast<int>(impl_->audio_tracks.size()) : 0;
-}
-core::AudioTrackInfo MfBackend::audio_track_info(int index) const {
-	if (!impl_ || index < 0 ||
-			static_cast<size_t>(index) >= impl_->audio_tracks.size()) {
-		return {};
-	}
-	const auto &t = impl_->audio_tracks[static_cast<size_t>(index)];
-	core::AudioTrackInfo info;
-	info.language = t.language;
-	info.name = t.name;
-	info.channels = t.channels;
-	info.sample_rate = t.sample_rate;
-	info.is_default = t.is_default;
-	return info;
-}
-void MfBackend::select_audio_track(int index) {
-	if (!impl_ || impl_->audio_stream_indices.empty()) {
-		return;
-	}
-	const int count = static_cast<int>(impl_->audio_tracks.size());
-	if (count == 0) {
-		return;
-	}
-	// Clamp out-of-range to the nearest valid index.
-	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
-	impl_->switch_audio_track(clamped);
-}
-
-bool MfBackend::reselect_audio_track(int index, double pts_seconds) {
-	if (!impl_ || impl_->audio_stream_indices.empty()) {
-		return false;
-	}
-	const int count = static_cast<int>(impl_->audio_tracks.size());
-	if (count == 0) {
-		return false;
-	}
-	const int clamped = (index < 0) ? 0 : (index >= count ? count - 1 : index);
-	const double target = pts_seconds < 0.0 ? 0.0 : pts_seconds;
-
-	// Mirror the AVF design: a dedicated audio-only reader for the new track,
-	// primed at `target`, while the shared reader keeps decoding video from
-	// its current position. Toggling per-stream selection on the shared
-	// reader alone does not work — an MF stream that was deselected when the
-	// source last started reports end-of-stream instead of delivering, and
-	// restarting the source to fix that would also reposition video.
-	if (!impl_->build_audio_reader(clamped, target)) {
-		return false;
-	}
-
-	// Stop the shared reader from queueing the old track's audio.
-	if (impl_->audio_stream_index >= 0) {
-		impl_->reader->SetStreamSelection(
-				static_cast<DWORD>(impl_->audio_stream_index), FALSE);
-	}
-	impl_->audio_stream_index =
-			impl_->audio_stream_indices[static_cast<size_t>(clamped)];
-	impl_->selected_audio_track = clamped;
-	return true;
-}
 
 bool MfBackend::had_error() const {
 	return impl_ && impl_->error;
@@ -823,11 +482,19 @@ bool MfBackend::seek(double pts_seconds) {
 	}
 	// Tear down any dedicated audio-only reader and re-home audio on the
 	// shared reader (mirrors AVF rebuilding its combined reader on seek).
-	// Re-selecting the stream is safe here because SetCurrentPosition below
-	// restarts the media source, which is what makes a newly selected stream
-	// actually deliver samples.
+	bool audio_reader_torn_down = false;
 	if (impl_->audio_reader) {
 		impl_->audio_reader.reset();
+		audio_reader_torn_down = true;
+	}
+	// Catch the shared reader up to a pending select_audio_track() (the
+	// Backend contract defers selection to the next seek()/open()), and/or
+	// re-home audio after a dedicated reselect reader. Re-selecting the
+	// stream is safe here because SetCurrentPosition below restarts the
+	// media source, which is what makes a newly (re)selected stream actually
+	// deliver samples — a stream selected after the source started does not
+	// deliver until a reposition.
+	if (audio_reader_torn_down || impl_->applied_audio_track != impl_->selected_audio_track) {
 		impl_->switch_audio_track(impl_->selected_audio_track);
 	}
 	// Unlike AVAssetReader (single-pass, recreated on seek), IMFSourceReader can

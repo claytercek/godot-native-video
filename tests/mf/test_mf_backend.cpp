@@ -180,6 +180,60 @@ double mean_block_luma(ID3D11Texture2D *tex, UINT subresource) {
 	return result;
 }
 
+// -----------------------------------------------------------------------
+// Sync Ladder track identification for the multi-track fixture.
+//
+// tools/multitrack_lib.sh encodes each track k's frame i as a sine tone at
+// (k * kTrackStrideHz + kTrackBaseHz) + 200 * i Hz — disjoint, widely-spaced
+// bands per track (track 0: ~200-1200 Hz, track 1: ~3200-4200 Hz, track 2:
+// ~6200-7200 Hz for this fixture's kMultiFrames). The gaps between bands are
+// thousands of Hz, so a coarse zero-crossing frequency estimate is enough to
+// identify which track produced a stretch of decoded PCM — no FFT needed.
+// -----------------------------------------------------------------------
+constexpr int kTrackStrideHz = 3000;
+constexpr int kTrackBaseHz = 200;
+
+double estimate_dominant_frequency_hz(const std::vector<float> &mono_samples, int sample_rate) {
+	if (mono_samples.size() < 2 || sample_rate <= 0) {
+		return 0.0;
+	}
+	int crossings = 0;
+	for (size_t i = 1; i < mono_samples.size(); ++i) {
+		if ((mono_samples[i - 1] < 0.0f) != (mono_samples[i] < 0.0f)) {
+			++crossings;
+		}
+	}
+	const double duration = static_cast<double>(mono_samples.size()) / sample_rate;
+	return duration > 0.0 ? (crossings / 2.0) / duration : 0.0;
+}
+
+// True if `freq_hz` falls within track `track`'s Sync Ladder band, with a
+// margin generous enough to absorb the zero-crossing estimate's error.
+bool frequency_in_track_band(double freq_hz, int track) {
+	const double lo = track * kTrackStrideHz + kTrackBaseHz - 300.0;
+	const double hi = track * kTrackStrideHz + kTrackBaseHz + 200.0 * (kMultiFrames - 1) + 300.0;
+	return freq_hz >= lo && freq_hz <= hi;
+}
+
+// Accumulate at least `min_seconds` of channel-0 samples from `backend`'s
+// audio stream (fewer at end-of-stream). Deinterleaves channel 0 out of each
+// chunk's frame-major PCM.
+std::vector<float> accumulate_mono_audio(mf::MfBackend &backend, int sample_rate, double min_seconds) {
+	std::vector<float> mono;
+	const size_t target = static_cast<size_t>(static_cast<double>(sample_rate) * min_seconds);
+	while (mono.size() < target) {
+		auto chunk = backend.next_audio_chunk();
+		if (!chunk) {
+			break;
+		}
+		const int channels = chunk->channel_count > 0 ? chunk->channel_count : 1;
+		for (int i = 0; i < chunk->frame_count; ++i) {
+			mono.push_back(chunk->samples[static_cast<size_t>(i) * channels]);
+		}
+	}
+	return mono;
+}
+
 } // namespace
 
 TEST_CASE("MF backend decodes synthetic clip to NV12 + PCM with monotonic PTS") {
@@ -340,7 +394,6 @@ TEST_CASE("MF backend selects audio track pre-play for multi-track clip") {
 	CHECK(t0.sample_rate == 48000);
 
 	// ---- Select track 1 and verify audio decoding ----
-	// Re-open so the track selection applies to a fresh reader.
 	REQUIRE(backend.open(fixture));
 	backend.select_audio_track(1);
 
@@ -350,6 +403,10 @@ TEST_CASE("MF backend selects audio track pre-play for multi-track clip") {
 	CHECK(t1_check.is_default == false);
 	CHECK(t1_check.channels >= 1);
 	CHECK(t1_check.sample_rate == 48000);
+
+	// select_audio_track() takes effect on the next seek()/open() (Backend
+	// contract) rather than immediately, so seek before decoding.
+	REQUIRE(backend.seek(0.0));
 
 	// Decode audio from the selected track and verify valid PCM output.
 	int audio_chunks = 0;
@@ -377,6 +434,7 @@ TEST_CASE("MF backend selects audio track pre-play for multi-track clip") {
 	backend.select_audio_track(99); // out of range
 	CHECK(backend.audio_channel_count() >= 1);
 	CHECK(backend.audio_sample_rate() == 48000);
+	REQUIRE(backend.seek(0.0));
 
 	// Decode should still produce valid PCM from the fallback.
 	audio_chunks = 0;
@@ -605,6 +663,78 @@ TEST_CASE("MF backend reselect clamps out-of-range index") {
 		++audio_count;
 	}
 	CHECK(audio_count >= 1);
+	CHECK_FALSE(backend.had_error());
+}
+
+TEST_CASE("MF backend defers select_audio_track() until the next seek") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping deferred selection regression");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	backend.select_audio_track(1);
+
+	// The metadata effect of select_audio_track() (channel count / sample
+	// rate for the newly selected track) is immediate even though the shared
+	// reader isn't reconfigured until the next seek()/open() -- the Backend
+	// contract defers the selection itself.
+	const auto t1 = backend.audio_track_info(1);
+	CHECK(backend.audio_channel_count() == t1.channels);
+	CHECK(backend.audio_sample_rate() == t1.sample_rate);
+
+	// The selection itself only takes effect on the next seek().
+	REQUIRE(backend.seek(0.0));
+
+	const std::vector<float> mono = accumulate_mono_audio(backend, backend.audio_sample_rate(), 0.15);
+	REQUIRE(mono.size() > 1);
+	const double freq = estimate_dominant_frequency_hz(mono, backend.audio_sample_rate());
+	CAPTURE(freq);
+	CHECK(frequency_in_track_band(freq, 1));
+	CHECK_FALSE(frequency_in_track_band(freq, 0));
+	CHECK_FALSE(frequency_in_track_band(freq, 2));
+	CHECK_FALSE(backend.had_error());
+}
+
+TEST_CASE("MF backend keeps a reselected audio track across a later seek") {
+	const std::string fixture = ensure_multi_track_fixture();
+	if (fixture.empty()) {
+		WARN_MESSAGE(false, "ffmpeg unavailable or fixture generation failed -- skipping reselect+seek regression");
+		return;
+	}
+
+	mf::MfBackend backend;
+	REQUIRE(backend.open(fixture));
+
+	// Decode a bit of video + track-0 audio, same setup as the mid-decode
+	// reselect tests above.
+	double last_video_pts = -1.0;
+	for (int i = 0; i < 2; ++i) {
+		auto frame = backend.next_video_frame();
+		REQUIRE(frame.has_value());
+		last_video_pts = frame->pts_seconds;
+		frame->release();
+	}
+	auto pre_chunk = backend.next_audio_chunk();
+	REQUIRE(pre_chunk.has_value());
+
+	REQUIRE(backend.reselect_audio_track(1, last_video_pts));
+
+	// seek() tears down the dedicated reselect reader and re-homes audio onto
+	// the shared reader; selected/applied bookkeeping must keep the
+	// reselected track (1) rather than silently falling back to track 0.
+	REQUIRE(backend.seek(0.5));
+
+	const std::vector<float> mono = accumulate_mono_audio(backend, backend.audio_sample_rate(), 0.15);
+	REQUIRE(mono.size() > 1);
+	const double freq = estimate_dominant_frequency_hz(mono, backend.audio_sample_rate());
+	CAPTURE(freq);
+	CHECK(frequency_in_track_band(freq, 1));
+	CHECK_FALSE(frequency_in_track_band(freq, 0));
+	CHECK_FALSE(frequency_in_track_band(freq, 2));
 	CHECK_FALSE(backend.had_error());
 }
 

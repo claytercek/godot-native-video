@@ -169,6 +169,7 @@ if ARGUMENTS.get("target", "") == "mf_tests":
         "tests/mf/test_mf_backend.cpp",
         "tests/mf/test_mf_clip_matrix.cpp",
         "src/backends/mf/mf_backend.cpp",
+        "src/backends/mf/mf_audio.cpp",
         "src/core/backend.cpp",
     ]
     mf_tests = mf_env.Program("bin/mf_tests", mf_sources)
