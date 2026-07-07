@@ -68,16 +68,15 @@ bool PresentPipeline::build_resources(int width, int height) {
 		// No RenderingDevice (e.g. headless mode). Degrade gracefully: the
 		// pipeline cannot produce texture output, but decode, audio mixing,
 		// the master clock, and the playback state machine keep running
-		// normally. Print one informational notice, then ensure_ready()
-		// short-circuits for the rest of this pipeline's lifetime.
+		// normally. Print the one-shot informational notice inline here (the
+		// first and only time we set no_rd_), then ensure_ready()
+		// short-circuits for the rest of this pipeline's lifetime — no
+		// separate "notice shown" bool is needed.
 		no_rd_ = true;
-		if (!headless_notice_shown_) {
-			headless_notice_shown_ = true;
-			UtilityFunctions::print(
-					"[NATIVE MEDIA STREAMS] No RenderingDevice — "
-					"presentation disabled (headless mode). Decode and audio "
-					"continue normally.");
-		}
+		UtilityFunctions::print(
+				"[NATIVE MEDIA STREAMS] No RenderingDevice — "
+				"presentation disabled (headless mode). Decode and audio "
+				"continue normally.");
 		return false;
 	}
 
