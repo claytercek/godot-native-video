@@ -56,6 +56,9 @@ CMakeUserPresets.json
 *.db
 .beads-credential-key
 
+# CI cached tools
+.godot/
+
 # Generated test fixtures — none are committed. The synthetic marker clip
 # (tools/gen_test_media.sh) and the real-clip matrix (tools/gen_clip_matrix.sh:
 # clips + the matrix.list / matrix.json manifests) are all regenerated on demand
