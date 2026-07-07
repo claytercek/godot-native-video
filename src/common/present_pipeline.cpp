@@ -39,17 +39,18 @@ bool PresentPipeline::ensure_ready(int width, int height) {
 	if (width <= 0 || height <= 0) {
 		return false;
 	}
-	// No RenderingDevice (e.g. headless) — permanently disabled. Don't retry
-	// build_resources() every frame; it will find the same absent RD each time.
-	if (no_rd_) {
+	// Disabled (e.g. headless) is terminal — don't retry build_resources()
+	// every frame; it will find the same absent RenderingServer/RenderingDevice
+	// each time.
+	if (state_ == State::Disabled) {
 		return false;
 	}
-	if (ready_ && width == width_ && height == height_) {
+	if (state_ == State::Ready && width == width_ && height == height_) {
 		return true;
 	}
 	// Dimensions or output mode changed (or first use): rebuild.
 	// Drain held surfaces first so we don't leak the old ring's transient textures.
-	if (ready_) {
+	if (state_ == State::Ready) {
 		retire_ring_.drain();
 		free_resources();
 	}
@@ -61,6 +62,12 @@ bool PresentPipeline::build_resources(int width, int height) {
 	// device Godot samples from when compositing the VideoStreamPlayer.
 	RenderingServer *rs = RenderingServer::get_singleton();
 	if (!rs) {
+		// No RenderingServer singleton is abnormal (unlike the expected
+		// headless RD-null case below). Latch Disabled and print once so
+		// ensure_ready() short-circuits for the rest of this pipeline's
+		// lifetime instead of re-querying and re-logging every frame.
+		state_ = State::Disabled;
+		ERR_PRINT("No RenderingServer singleton — presentation disabled.");
 		return false;
 	}
 	rd_ = rs->get_rendering_device();
@@ -68,11 +75,11 @@ bool PresentPipeline::build_resources(int width, int height) {
 		// No RenderingDevice (e.g. headless mode). Degrade gracefully: the
 		// pipeline cannot produce texture output, but decode, audio mixing,
 		// the master clock, and the playback state machine keep running
-		// normally. Print the one-shot informational notice inline here (the
-		// first and only time we set no_rd_), then ensure_ready()
-		// short-circuits for the rest of this pipeline's lifetime — no
-		// separate "notice shown" bool is needed.
-		no_rd_ = true;
+		// normally. Latch Disabled and print the one-shot informational
+		// notice so ensure_ready() short-circuits for the rest of this
+		// pipeline's lifetime instead of re-querying the absent RD every
+		// frame.
+		state_ = State::Disabled;
 		UtilityFunctions::print(
 				"[NATIVE MEDIA STREAMS] No RenderingDevice — "
 				"presentation disabled (headless mode). Decode and audio "
@@ -91,8 +98,8 @@ bool PresentPipeline::build_resources(int width, int height) {
 	}
 
 	// --- Compile the shader variant for the active output mode. ---
-	// set_output_mode() invalidates ready_ on a mode change, so the next
-	// ensure_ready() runs build_resources() again anyway — and the ring
+	// set_output_mode() downgrades state_ to Unbuilt on a mode change, so the
+	// next ensure_ready() runs build_resources() again anyway — and the ring
 	// texture format changes too (rgba8 vs rgba16f), so that rebuild isn't
 	// avoidable regardless. There's no benefit to keeping both variants
 	// compiled, so only the one matching output_mode_ is built here.
@@ -166,7 +173,7 @@ bool PresentPipeline::build_resources(int width, int height) {
 	// not asked for it yet). This fires `changed`, so the cached texture in
 	// VideoStreamPlayer picks up the real dimensions.
 	get_texture()->set_texture_rd_rid(ring_[0].rgba_rid);
-	ready_ = true;
+	state_ = State::Ready;
 	return true;
 }
 
@@ -242,12 +249,13 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	}
 
 	// Push constant: output dimensions + colorimetry + bit depth + the
-	// importer's 10-bit sample scale. std430 — seven uint32 + one float = 32
-	// bytes, a 16-byte multiple: pre-4.7 Godot rounds the required
-	// push-constant size up to 32, 4.7+ validates the exact declared size, and
-	// 32 satisfies both. The SDR and HDR shader variants share this layout.
+	// importer's 10-bit sample scale. std430 — seven uint32 + one float =
+	// kPushConstantSize bytes, a 16-byte multiple: pre-4.7 Godot rounds the
+	// required push-constant size up to 32, 4.7+ validates the exact declared
+	// size, and 32 satisfies both. The SDR and HDR shader variants share this
+	// layout.
 	PackedByteArray pc;
-	pc.resize(32);
+	pc.resize(kPushConstantSize);
 	pack_push_constants(
 		pc.ptrw(),
 		static_cast<uint32_t>(width_),
@@ -346,7 +354,11 @@ void PresentPipeline::free_resources() {
 		rd_->free_rid(shader_);
 		shader_ = RID();
 	}
-	ready_ = false;
+	// Disabled is terminal — only downgrade Ready to Unbuilt so a previously
+	// Disabled pipeline (no RenderingServer/RenderingDevice) never resumes.
+	if (state_ == State::Ready) {
+		state_ = State::Unbuilt;
+	}
 	width_ = 0;
 	height_ = 0;
 }
