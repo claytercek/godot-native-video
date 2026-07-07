@@ -374,6 +374,10 @@ TEST_CASE("MF backend selects pre-play audio track from multi-track matrix clip"
 	CHECK(t1_check.channels == clip->audio_channels);
 	CHECK(t1_check.sample_rate == clip->audio_rate);
 
+	// select_audio_track() takes effect on the next seek()/open() (Backend
+	// contract) rather than immediately, so seek before decoding.
+	REQUIRE(backend.seek(0.0));
+
 	int audio_chunks = 0;
 	long audio_frames_total = 0;
 	double last_audio_pts = -1.0;
@@ -397,6 +401,7 @@ TEST_CASE("MF backend selects pre-play audio track from multi-track matrix clip"
 	backend.select_audio_track(99);
 	CHECK(backend.audio_channel_count() >= 1);
 	CHECK(backend.audio_sample_rate() == clip->audio_rate);
+	REQUIRE(backend.seek(0.0));
 
 	audio_chunks = 0;
 	audio_frames_total = 0;
