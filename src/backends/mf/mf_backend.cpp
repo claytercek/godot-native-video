@@ -46,6 +46,7 @@
 #include <propvarutil.h>
 #include <codecapi.h> // eAVEncH265VProfile_*
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -233,6 +234,14 @@ public:
 	bool build_audio_reader(int track_index, double start_time);
 	void read_duration();
 	void read_colorimetry(IMFMediaType *type);
+	// Read a wide-string stream-descriptor attribute (e.g. MF_SD_LANGUAGE)
+	// for stream `stream_index` and return it as UTF-8; empty if absent.
+	std::string read_stream_string_attribute(DWORD stream_index, REFGUID guid);
+	// Sort audio_tracks/audio_stream_indices into container track order.
+	// MF's MP4 source enumerates streams in an order unrelated to the file's
+	// trak order (observed: reversed), but the cross-platform contract is that
+	// audio track index N names the same physical track on every backend.
+	void reorder_audio_tracks_by_container_order();
 
 	void teardown() {
 		audio_reader.reset();
@@ -326,6 +335,63 @@ bool MfBackend::Impl::create_reader() {
 //
 // During the initial stream scan we also enumerate all audio stream indices
 // and collect per-track metadata (channel count, sample rate, language).
+// MF reports MF_SD_LANGUAGE as an RFC 1766 tag ("en", "es"); AVF reports the
+// container's ISO 639-2 code ("eng", "spa"). Convert to ISO 639-2/T so track
+// metadata is identical across platforms; unknown tags pass through unchanged.
+std::string normalize_language_tag(const std::string &tag) {
+	if (tag.empty()) {
+		return tag;
+	}
+	wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
+	if (MultiByteToWideChar(CP_UTF8, 0, tag.c_str(), -1, wide, LOCALE_NAME_MAX_LENGTH) <= 0) {
+		return tag;
+	}
+	wchar_t iso[9] = {};
+	if (GetLocaleInfoEx(wide, LOCALE_SISO639LANGNAME2, iso, 9) <= 0) {
+		return tag;
+	}
+	char narrow[9] = {};
+	WideCharToMultiByte(CP_UTF8, 0, iso, -1, narrow, sizeof(narrow), nullptr, nullptr);
+	return std::string(narrow);
+}
+
+std::string MfBackend::Impl::read_stream_string_attribute(DWORD stream_index, REFGUID guid) {
+	PROPVARIANT var;
+	PropVariantInit(&var);
+	HRESULT hr = reader->GetPresentationAttribute(stream_index, guid, &var);
+	std::string result;
+	if (SUCCEEDED(hr) && var.vt == VT_LPWSTR && var.pwszVal) {
+		const int len = WideCharToMultiByte(CP_UTF8, 0, var.pwszVal, -1, nullptr, 0, nullptr, nullptr);
+		if (len > 1) {
+			result.resize(static_cast<size_t>(len) - 1); // len counts the NUL
+			WideCharToMultiByte(CP_UTF8, 0, var.pwszVal, -1, result.data(), len, nullptr, nullptr);
+		}
+	}
+	PropVariantClear(&var);
+	return result;
+}
+
+void MfBackend::Impl::reorder_audio_tracks_by_container_order() {
+	if (audio_tracks.size() < 2) {
+		return;
+	}
+	// The MF MP4/MOV source enumerates streams in the exact REVERSE of the
+	// container's trak order (verified against multi-track fixtures: file order
+	// video/eng/fra/deu surfaces as deu/fra/eng/video). The real trak IDs are
+	// not recoverable — IMFStreamDescriptor::GetStreamIdentifier just returns
+	// 1..N in the source's own (reversed) order — so reversing the scan order
+	// is the only way to line audio track index N up with AVF and the file.
+	// The language-checked multi-track tests pin this; if a future Windows
+	// changes the enumeration order, they fail loudly.
+	std::reverse(audio_tracks.begin(), audio_tracks.end());
+	std::reverse(audio_stream_indices.begin(), audio_stream_indices.end());
+	for (size_t k = 0; k < audio_tracks.size(); ++k) {
+		audio_tracks[k].is_default = (k == 0);
+	}
+	// The default (pre-selection) audio stream is the container's first track.
+	audio_stream_index = audio_stream_indices[0];
+}
+
 bool MfBackend::Impl::configure_video_stream() {
 	// Find the first video stream by walking native media types.
 	audio_tracks.clear();
@@ -359,11 +425,13 @@ bool MfBackend::Impl::configure_video_stream() {
 			meta.channels = static_cast<int>(ch);
 			meta.sample_rate = static_cast<int>(rate);
 			meta.is_default = audio_tracks.empty(); // first track is default
-			// MF stream language (MF_SD_LANGUAGE) is available from the
-			// stream descriptor (presentation descriptor), but that requires
-			// extra IMFMediaSource queries beyond the source reader. We skip
-			// language/name for MF in v1; this is consistent with the
-			// single-track legacy fields below.
+			// Stream-descriptor attributes are reachable through the source
+			// reader: GetPresentationAttribute with a stream index queries the
+			// stream descriptor. The MP4/MOV source surfaces the mdhd language
+			// (ISO 639-2, e.g. "eng") as MF_SD_LANGUAGE — same raw tag AVF
+			// reports, so the two backends stay comparable.
+			meta.language = normalize_language_tag(read_stream_string_attribute(i, MF_SD_LANGUAGE));
+			meta.name = read_stream_string_attribute(i, MF_SD_STREAM_NAME);
 			audio_tracks.push_back(meta);
 			audio_stream_indices.push_back(static_cast<int>(i));
 			if (audio_stream_index < 0) {
@@ -375,6 +443,8 @@ bool MfBackend::Impl::configure_video_stream() {
 	if (video_stream_index < 0) {
 		return false; // no video track — caller decides if that's fatal
 	}
+
+	reorder_audio_tracks_by_container_order();
 
 	const DWORD vidx = static_cast<DWORD>(video_stream_index);
 
