@@ -323,6 +323,7 @@ library = env.SharedLibrary(
 )
 
 copy = env.Install("{}/bin/{}/".format(projectdir, env["platform"]), library)
+smoke_copy = env.Install("tests/headless-smoke/bin/{}/".format(env["platform"]), library)
 
-default_args = [library, copy]
+default_args = [library, copy, smoke_copy]
 Default(*default_args)

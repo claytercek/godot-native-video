@@ -1,0 +1,8 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://scenes/smoke.gd" id="1_smoke"]
+
+[node name="Smoke" type="Node"]
+script = ExtResource("1_smoke")
+
+[node name="VideoStreamPlayer" type="VideoStreamPlayer" parent="."]
