@@ -163,8 +163,9 @@ private:
 	// Set once when we detect no RenderingDevice is available (e.g. headless
 	// mode). Once true, ensure_ready() short-circuits without calling
 	// build_resources(), which would re-query the same absent RD every frame.
+	// build_resources() prints the one-shot headless notice at the moment it
+	// flips this flag, so no separate "notice shown" bool is needed.
 	bool no_rd_ = false;
-	bool headless_notice_shown_ = false;
 
 	OutputMode output_mode_ = OutputMode::SDR;
 
