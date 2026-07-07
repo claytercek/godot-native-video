@@ -6,6 +6,7 @@
 
 #include "common/nv12_to_rgb_shader.h"
 #include "common/nv12_to_rgb_hdr_shader.h"
+#include "push_constants.h"
 
 #include <cstring>
 
@@ -248,26 +249,12 @@ bool PresentPipeline::present(core::VideoFrame &&frame) {
 	// 32 satisfies both. The SDR and HDR shader variants share this layout.
 	PackedByteArray pc;
 	pc.resize(32);
-	pc.fill(0);
-	{
-		uint8_t *w = pc.ptrw();
-		const uint32_t ow = static_cast<uint32_t>(width_);
-		const uint32_t oh = static_cast<uint32_t>(height_);
-		const uint32_t matrix = static_cast<uint32_t>(frame.color.matrix);
-		const uint32_t range = static_cast<uint32_t>(frame.color.range);
-		const uint32_t depth = static_cast<uint32_t>(frame.color.bit_depth);
-		const uint32_t transfer = static_cast<uint32_t>(frame.color.transfer);
-		const uint32_t primaries = static_cast<uint32_t>(frame.color.primaries);
-		const float sample_scale = planes.sample_scale;
-		memcpy(w + 0, &ow, sizeof(uint32_t));
-		memcpy(w + 4, &oh, sizeof(uint32_t));
-		memcpy(w + 8, &matrix, sizeof(uint32_t));
-		memcpy(w + 12, &range, sizeof(uint32_t));
-		memcpy(w + 16, &depth, sizeof(uint32_t));
-		memcpy(w + 20, &transfer, sizeof(uint32_t));
-		memcpy(w + 24, &primaries, sizeof(uint32_t));
-		memcpy(w + 28, &sample_scale, sizeof(float));
-	}
+	pack_push_constants(
+		pc.ptrw(),
+		static_cast<uint32_t>(width_),
+		static_cast<uint32_t>(height_),
+		frame.color,
+		planes.sample_scale);
 
 	// On platforms that share the decoder surface across two GPU APIs, wait for
 	// the exporting side's work to be visible before we sample it: a CPU-blocking
