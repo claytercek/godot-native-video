@@ -8,8 +8,8 @@
 // +/-1, AAC stereo @ 48 kHz, monotonic PTS, PTS drift within half a frame) plus
 // colorimetry: per-clip matrix/primaries/transfer/range assertions, keyed by
 // clip filename. Untagged clips default to BT.709 video-range (pixel-identical
-// to the old hard-coded constants). PQ/HLG BT.2020 clips report their real
-// tags; see the BT.601 row note below for a platform gap.
+// to the old hard-coded constants). BT.601 and PQ/HLG BT.2020 clips report
+// their real tags from the container-level 'colr' box.
 //
 // WINDOWS-ONLY: the body is under #if _WIN32 and is compiled only by
 // `scons target=mf_tests platform=windows`. Clips missing because
@@ -47,6 +47,19 @@ struct ColorimetryExpect {
 };
 
 bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) {
+	// BT.601 NTSC-tagged clip. The generator forces the ISOBMFF 'colr' box
+	// (-movflags +write_colr), which is the only place Media Foundation's mp4
+	// source reads colorimetry from (it never parses SPS VUI). Matrix and
+	// primaries surface as the real SD tags; the SMPTE 170M transfer function
+	// is curve-identical to BT.709 and MF canonicalizes it as such.
+	if (file == "h264_30_bt601_mp4.mp4") {
+		out.matrix = core::ColorMatrix::BT601;
+		out.primaries = core::ColorPrimaries::BT601_525;
+		out.transfer = core::TransferFunction::BT709;
+		out.range = core::ColorRange::Video;
+		out.bit_depth = 8;
+		return true;
+	}
 	// HEVC Main10 SDR clip. Negotiates as 10-bit (P010); the bit depth is
 	// detected from the native type's MF_MT_MPEG2_PROFILE. The 'colr' box is
 	// absent for this encode, so open-time colorimetry stays at the BT.709
@@ -82,13 +95,6 @@ bool expect_colorimetry(const std::string &file, ColorimetryExpect &out) {
 	}
 
 	// Untagged — defaults (8-bit NV12).
-	// h264_30_bt601_mp4.mp4 falls here too: its H.264 SPS VUI carries
-	// matrix_coefficients = smpte170m, but ffmpeg's mp4 muxer does not emit
-	// the ISOBMFF 'colr' box for this encode, and Media Foundation's mp4
-	// source surfaces colorimetry only from that container-level box (it
-	// does not parse SPS VUI itself the way AVFoundation's demuxer does). So
-	// on the MF backend this clip is indistinguishable from an untagged
-	// clip — a real platform gap, not a bug in this backend.
 	return false;
 }
 
