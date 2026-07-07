@@ -9,9 +9,10 @@
 //
 // This header defines a pure function select_importer() that makes that
 // decision from extracted scalar parameters (no Godot API calls, no
-// platform header dependencies), plus a wrapper that reads the actual
-// Godot singletons. The pure function can be doctested from the core test
-// target on any host without linking godot-cpp.
+// platform header dependencies). The singleton-reading factory shell that
+// calls it lives in src/common/surface_importer_factory_windows.cpp. The
+// pure function can be doctested from the core test target on any host
+// without linking godot-cpp.
 // -----------------------------------------------------------------------
 
 #pragma once
