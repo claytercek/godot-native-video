@@ -13,6 +13,20 @@ extends Node
 # pipeline delay the exact frequency lags the reported position, but
 # the frequency trend (Δfreq/Δt ≈ 6000 Hz/s for either track) and the
 # 3000 Hz stride between tracks are both measurable externally.
+#
+# ACCURACY CAVEAT — read before trusting any frequency number here:
+# The C++ tests in tests/common/multi_track_cases.h measure raw decoded
+# PCM straight from the backend, so their zero-crossing frequencies land
+# cleanly on the Sync Ladder. This smoke test measures AFTER the full
+# AudioServer mix pipeline, from AAC-encoded audio. AAC's lossy encoding
+# distorts the sine, so the zero-crossing estimate is NOT reliable in
+# absolute terms — measured frequencies often come in 2-8x below the
+# theoretical Sync Ladder values and vary run-to-run, and the Phase 2
+# pre/post samples sit at different points in the audio pipeline's delay
+# buffer (no shared delay). Only the SIGN of the frequency trend
+# (frequency rises with position; a track switch drops the base) is a
+# meaningful signal here. The slope thresholds below are noise-rejection
+# bands, NOT matches against the theoretical 6000 Hz/s.
 # -----------------------------------------------------------------------
 
 const TIMEOUT := 20.0
@@ -40,11 +54,16 @@ var _stream: VideoStream
 var _capture: AudioEffectCapture
 var _capture_bus_idx := -1
 
-# Phase 1 frequency samples
+# Phase 1 frequency samples. The _p1_capturedN flags are one-shot gates
+# that stay true even when _capture_and_measure_freq() returns -1.0 (silence
+# / timeout), so a failed capture fails Group 5 once instead of busy-looping
+# re-capturing the drained buffer until TIMEOUT fires.
 var _p1_freq0 := -1.0
 var _p1_freq1 := -1.0
 var _p1_pos0 := -1.0
 var _p1_pos1 := -1.0
+var _p1_captured0 := false
+var _p1_captured1 := false
 
 # Phase 2 frequency samples
 var _p2_pre_freq := -1.0
@@ -186,6 +205,8 @@ func _start_phase1() -> bool:
 	_p1_freq1 = -1.0
 	_p1_pos0 = -1.0
 	_p1_pos1 = -1.0
+	_p1_captured0 = false
+	_p1_captured1 = false
 	_player.play()
 	return true
 
@@ -201,18 +222,20 @@ func _phase1_process():
 		_prev_pos = pos
 
 		# --- Group 5: frequency tracking ---
-		# Capture frequency at two positions during playback.
-		# Due to ~0.67s audio pipeline delay, the absolute frequency will
-		# lag behind the reported position, but the rate of change
-		# (Δfreq/Δt ≈ 6000 Hz/s) is the Sync Ladder signal.
-		# Sample later to avoid startup transients.
-		if _p1_freq0 < 0 and pos >= 0.8:
-			_p1_freq0 = 0.0  # mark in-progress (prevents re-entry while awaiting)
+		# Capture frequency at two positions during playback. The Sync Ladder
+		# encodes position: frequency rises ~6000 Hz/s (theoretical) as playback
+		# advances. We measure through the full AudioServer mix pipeline from
+		# AAC-encoded audio, so the zero-crossing estimate is NOT reliable in
+		# absolute terms (see the header CAVEAT). We therefore gate the captures
+		# on one-shot bools (not on freq < 0) and assert only the SIGN of the
+		# trend later. Sample late to avoid startup transients.
+		if not _p1_captured0 and pos >= 0.8:
+			_p1_captured0 = true  # one-shot: stays true even if capture fails
 			_p1_freq0 = await _capture_and_measure_freq()
 			_p1_pos0 = pos
 			print("[PHASE 1] freq sample at pos=%.3f: %.0f Hz" % [pos, _p1_freq0])
-		elif _p1_freq1 < 0 and _p1_freq0 > 0 and pos >= 1.3:
-			_p1_freq1 = 0.0  # mark in-progress
+		elif not _p1_captured1 and _p1_captured0 and _p1_freq0 > 0 and pos >= 1.3:
+			_p1_captured1 = true
 			_p1_freq1 = await _capture_and_measure_freq()
 			_p1_pos1 = pos
 			print("[PHASE 1] freq sample at pos=%.3f: %.0f Hz" % [pos, _p1_freq1])
@@ -229,21 +252,30 @@ func _phase1_process():
 			return
 
 		# --- Group 5 frequency assertion ---
+		# See the capture block above and the header CAVEAT for why the exact
+		# 6000 Hz/s slope is NOT asserted: AAC + AudioServer make the
+		# zero-crossing estimate unreliable in absolute terms. We assert a
+		# clearly-positive trend (above the noise floor, below a
+		# double-crossing-artifact ceiling), not a match against 6000.
 		if _p1_freq0 > 0 and _p1_freq1 > 0:
 			var ok := true
-			# The Sync Ladder slope for track 0 is 200 Hz/frame * 30 fps = 6000 Hz/s
+			# The Sync Ladder frequency must rise with playback position.
 			if _p1_freq1 <= _p1_freq0:
 				_fail("Phase 1 freq did not increase: %.0f -> %.0f Hz" % [_p1_freq0, _p1_freq1])
 				ok = false
 			else:
-				# Check that the slope is close to 6000 Hz/s (allow ±3000 Hz/s)
+				# Lower bound rejects a near-flat signal (noise/silence);
+				# upper bound rejects double-crossing artifacts from AAC
+				# harmonic distortion. Theoretical slope is 6000 Hz/s; the
+				# measured slope is often ~half and varies run-to-run, so the
+				# band is a noise-rejection window, not a 6000 match.
 				var dt := _p1_pos1 - _p1_pos0
 				var slope := (_p1_freq1 - _p1_freq0) / dt if dt > 0 else 0.0
-				if slope < 1200.0 or slope > 9000.0:
-					_fail("Phase 1 freq slope %.0f Hz/s outside expected range 3000-9000 Hz/s" % slope)
+				if slope < 1500.0 or slope > 9000.0:
+					_fail("Phase 1 freq slope %.0f Hz/s outside expected range 1500-9000 Hz/s" % slope)
 					ok = false
 				if ok:
-					print("[PHASE 1] freq slope %.0f Hz/s (expect ~6000) — Sync Ladder tracks position" % slope)
+					print("[PHASE 1] freq slope %.0f Hz/s (theoretical ~6000; measured varies via AAC) — Sync Ladder tracks position" % slope)
 			if ok:
 				print("[PASS] Group 5 — Sync Ladder frequency tracks playback position")
 		else:
@@ -296,8 +328,9 @@ func test_audio_track_enumeration():
 
 
 # ===================================================
-# Group 5 — mid-play track switch (phase 2)
-# Group 6 — post-switch frequency band assertion
+# Group 6 — mid-play track switch + post-switch frequency band
+# (The mid-play switch is setup for Group 6's band assertion, not a
+# separate group. Group 5 is the Phase 1 frequency-tracking check.)
 # ===================================================
 
 func _start_phase2():
@@ -332,7 +365,7 @@ func _phase2_process():
 			var pos := _player.stream_position
 			if pos > 0.0 and _switch_done:
 				print("[PHASE 2] EOS at pos=%.3fs after track switch" % pos)
-				print("[PASS] Group 5 — mid-play track switch")
+				print("[PASS] mid-play track switch — playback continued after switching audio track")
 
 				# --- Group 6 frequency band assertion ---
 				_assert_post_switch_freq()
@@ -385,28 +418,24 @@ func _assert_post_switch_freq():
 
 	var ok := true
 
-	# The Sync Ladder stride between tracks at the same position is 3000 Hz.
-	# After the switch, the captured audio is from track 0 at a position
-	# ~0.67s behind the reported player position. We don't know the exact
-	# delay, so we check the RELATIVE difference:
+	# What this assertion can and cannot prove, stated honestly:
 	#
-	# If the switch took effect, post-switch freq should reflect track 0's
-	# Sync Ladder (lower base). If the switch failed (still on track 1),
-	# the post-switch freq would be ~3000 Hz higher for the same position.
+	# Both captures go through the full AudioServer mix pipeline from
+	# AAC-encoded audio, so zero-crossing frequencies are NOT reliable in
+	# absolute terms (see the header CAVEAT). Worse, the pre- and post-switch
+	# samples sit at DIFFERENT points in the audio pipeline's delay buffer,
+	# so they do NOT share a common pipeline delay — the slope's premise of a
+	# shared delay is false, and the slope is not a clean theoretical value.
 	#
-	# Pre-switch freq captures track 1 at an earlier position.
-	# Post-switch freq captures (we hope) track 0 at a later position.
+	# What we CAN distinguish: if the switch FAILED and we stayed on track 1,
+	# both samples come from track 1's Sync Ladder and the slope is ~6000 Hz/s
+	# (position advance only). A successful switch to track 0 drops the base
+	# by 3000 Hz, so the net slope falls well below 6000. The > 5000 Hz/s
+	# threshold catches the "still on track 1" case.
 	#
-	# Key observation: post_pre_diff = post_freq - pre_freq
-	# The frequency increases due to position advance (6000 Hz/s) but drops
-	# by 3000 Hz due to the track switch. The NET increase over ~0.9s
-	# between captures should be ~0.9 * 6000 - 3000 = 2400 Hz.
-	#
-	# If the switch FAILED (still track 1), the net increase would be
-	# ~0.9 * 6000 = 5400 Hz.
-	#
-	# So: diff_worked ≈ 2400 Hz, diff_failed ≈ 5400 Hz.
-	# Threshold: if diff < 4000 Hz, the switch took effect.
+	# What we CANNOT distinguish: a successful switch from a signal too weak
+	# to measure (both give a low slope). So this proves we did NOT stay on
+	# track 1, NOT that clean track-0 audio reached the output.
 
 	var dt := _p2_post_pos - _p2_pre_pos
 	var diff := _p2_post_freq - _p2_pre_freq
@@ -416,25 +445,21 @@ func _assert_post_switch_freq():
 	print("[PHASE 2] Post-switch: %.0f Hz at pos %.3f (track 0)" % [_p2_post_freq, _p2_post_pos])
 	print("[PHASE 2] Δfreq=%.0f Hz over Δt=%.3fs (slope=%.0f Hz/s)" % [diff, dt, slope])
 
-	# Without a track switch, both samples on track 1 would show a slope
-	# of ~6000 Hz/s. With a successful switch to track 0, the slope drops
-	# by the track stride per unit time (the effective rate is lower
-	# because the track base dropped by 3000 Hz).
-	#
-	# The threshold: if slope < 4000 Hz/s, the switch definitively changed
-	# the audio track (track 0 has a lower base).
+	# Still on track 1 => slope ~6000 Hz/s. Switch to track 0 => slope well
+	# below 6000 (the 3000 Hz track-base drop subtracts from the position
+	# advance). > 5000 Hz/s means the switch did not take effect. A strongly
+	# negative slope is not expected even for a successful switch and smells
+	# like an audio pipeline problem.
 	if slope > 5000.0:
-		_fail("Post-switch slope %.0f Hz/s is too high — track switch may not have taken effect" % slope)
-		_fail("  (expected < 4500 Hz/s if track 0 is active, > 4500 Hz/s suggests still on track 1)")
+		_fail("Post-switch slope %.0f Hz/s > 5000 — track switch did not take effect (still on track 1 would be ~6000 Hz/s)" % slope)
 		ok = false
 	elif slope < -3000.0:
-		# Slope near zero would mean no frequency increase at all — also suspect
 		_fail("Post-switch slope %.0f Hz/s is too low — possible audio pipeline issue" % slope)
 		ok = false
 
 	if ok:
-		print("[PHASE 2] Post-switch slope %.0f Hz/s confirms audio from track 0 (not track 1)" % slope)
-		print("[PASS] Group 6 — post-switch frequency band proves new Audio Track is live")
+		print("[PHASE 2] Post-switch slope %.0f Hz/s (< 5000) confirms we did not stay on track 1" % slope)
+		print("[PASS] Group 6 — post-switch slope confirms audio track changed (not still track 1)")
 
 	return
 
@@ -473,7 +498,12 @@ func _capture_and_measure_freq() -> float:
 		return -1.0  # All zero/silence
 
 	# Zero-crossing frequency estimate (matches the C++ implementation in
-	# tests/common/multi_track_cases.h)
+	# tests/common/multi_track_cases.h). CAVEAT: the C++ tests measure raw
+	# decoded PCM straight from the backend; this smoke test measures AFTER
+	# the AudioServer mix pipeline, from AAC-encoded audio. AAC's lossy
+	# encoding distorts the sine, so the estimate is unreliable in absolute
+	# terms (see the header CAVEAT and Group 5). Only the trend sign is
+	# meaningful here.
 	var crossings := 0
 	var prev := mono[start]
 	var window := mini(mono.size() - start, 14400)  # max 300 ms
@@ -501,12 +531,10 @@ func _fail(msg: String):
 func _finish():
 	_phase = 3
 
-	# Clean up AudioEffectCapture
+	# Remove the AudioEffectCapture we added at effect index 0 on Master.
 	if _capture_bus_idx >= 0 and _capture:
-		for i in AudioServer.get_bus_effect_count(_capture_bus_idx):
-			pass  # No easy way to remove by reference; just let it go on exit.
-
-	_errors = _errors  # Not counting capture availability failures.
+		AudioServer.remove_bus_effect(_capture_bus_idx, 0)
+		_capture = null
 
 	if _errors == 0:
 		print("=== ALL PASS ===")
