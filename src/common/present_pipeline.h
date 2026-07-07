@@ -160,6 +160,11 @@ private:
 	int width_ = 0;
 	int height_ = 0;
 	bool ready_ = false;
+	// Set once when we detect no RenderingDevice is available (e.g. headless
+	// mode). Once true, ensure_ready() short-circuits without calling
+	// build_resources(), which would re-query the same absent RD every frame.
+	bool no_rd_ = false;
+	bool headless_notice_shown_ = false;
 
 	OutputMode output_mode_ = OutputMode::SDR;
 

@@ -30,6 +30,29 @@ A stock Godot `VideoStreamPlayer` plays a clip through this extension:
   (Media Foundation).
 - The built library installed into `demo/bin/<platform>/` by SCons.
 
+## Headless mode
+
+`godot --headless` is supported: the Binding degrades gracefully when no
+RenderingDevice is available. Decode, audio mixing, the master clock, and the
+playback state machine keep running, and end-of-stream is reached normally. One
+informational notice is printed at startup:
+
+```
+[NATIVE MEDIA STREAMS] No RenderingDevice — presentation disabled (headless mode).
+Decode and audio continue normally.
+```
+
+**Known limitation**: no Texture2D output is available in headless mode — the
+`_get_texture()` call returns a Texture2DRD with an invalid RID. This is
+expected: without a GPU, there is no rendering path. The headless run is
+suitable for smoke-testing decode and audio pipeline integrity, not for
+verifying visual output or colorimetry.
+
+Before the first headless run, the project must be opened once in the Godot
+editor so that `.godot/extension_list.cfg` is generated. This file tells Godot
+where to find the GDExtension. Without it, the extension's resource format
+loader is not registered and `.mp4`/`.mov`/`.m4v` files cannot be loaded.
+
 ## Run it
 
 1. Build the extension for your platform:

@@ -2,9 +2,8 @@
 *.gen.*
 .godot/
 
-# Ignore library files but not the gdextension file
+# Ignore library files
 demo/bin/*
-!demo/bin/*.gdextension
 .sconsign*.dblite
 
 # Ignore custom.py

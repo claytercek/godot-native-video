@@ -38,6 +38,11 @@ bool PresentPipeline::ensure_ready(int width, int height) {
 	if (width <= 0 || height <= 0) {
 		return false;
 	}
+	// No RenderingDevice (e.g. headless) — permanently disabled. Don't retry
+	// build_resources() every frame; it will find the same absent RD each time.
+	if (no_rd_) {
+		return false;
+	}
 	if (ready_ && width == width_ && height == height_) {
 		return true;
 	}
@@ -54,10 +59,26 @@ bool PresentPipeline::build_resources(int width, int height) {
 	// Use the global RenderingDevice — the present output must live on the same
 	// device Godot samples from when compositing the VideoStreamPlayer.
 	RenderingServer *rs = RenderingServer::get_singleton();
-	ERR_FAIL_NULL_V_MSG(rs, false, "RenderingServer unavailable");
+	if (!rs) {
+		return false;
+	}
 	rd_ = rs->get_rendering_device();
-	ERR_FAIL_NULL_V_MSG(rd_, false,
-			"No RenderingDevice — requires a Forward+/Mobile renderer.");
+	if (!rd_) {
+		// No RenderingDevice (e.g. headless mode). Degrade gracefully: the
+		// pipeline cannot produce texture output, but decode, audio mixing,
+		// the master clock, and the playback state machine keep running
+		// normally. Print one informational notice, then ensure_ready()
+		// short-circuits for the rest of this pipeline's lifetime.
+		no_rd_ = true;
+		if (!headless_notice_shown_) {
+			headless_notice_shown_ = true;
+			UtilityFunctions::print(
+					"[NATIVE MEDIA STREAMS] No RenderingDevice — "
+					"presentation disabled (headless mode). Decode and audio "
+					"continue normally.");
+		}
+		return false;
+	}
 
 	// Build the per-platform surface importer (Metal on macOS, DXGI->Vulkan on
 	// Windows) lazily, then bind it to Godot's RD.

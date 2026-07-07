@@ -39,6 +39,15 @@ Highlights:
   **Compatibility / OpenGL** renderer is **not supported** — there is no CPU
   present path.
 
+## Known limitations
+
+- **Headless mode (`--headless`)**: presentation is disabled because there is no
+  RenderingDevice. Decode, audio mixing, the master clock, and playback state
+  machines keep running normally, and end-of-stream is reached. No texture
+  output is available. A single informational notice is printed at startup; no
+  per-frame error spam occurs.
+- **Compatibility / OpenGL renderer**: not supported — no CPU present path.
+
 ## Scope
 
 v1 targets the **8-bit SDR core matrix**, tested identically on macOS and
