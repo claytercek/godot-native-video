@@ -4,6 +4,7 @@
 
 #include "playback_controller.h"
 
+#include "canonical_mix_format.h"
 #include "channel_mixer.h"
 #include "present_selector.h"
 
@@ -48,47 +49,16 @@ void PlaybackController::load(std::unique_ptr<Backend> backend, double audio_out
 	audio_track_count_ = backend->audio_track_count();
 
 	// --- Canonical Mix Format ---
-	// canonical_channels_ is the maximum channel count across all audio
-	// tracks. canonical_sample_rate_ is the FIRST audio-bearing track's rate
-	// — NOT a shared rate across tracks. Mixed-sample-rate clips are a
-	// documented limitation: the default track's rate wins, and a later
-	// track with a differing rate only gets one warning here (a mid-stream
-	// switch to it is refused in request_audio_track()). Godot queries
-	// channels/mix-rate exactly once at play start, so these must be stable
-	// for the playback's entire lifetime. The channel mixer converts each
-	// backend chunk's native channel layout to the canonical format before
-	// writing to the audio ring.
-	canonical_channels_ = 0;
-	canonical_sample_rate_ = 0;
-	has_audio_ = false;
-	track_infos_.clear();
-	bool warned_mixed_sample_rates = false;
-	for (int i = 0; i < audio_track_count_; ++i) {
-		const AudioTrackInfo info = backend->audio_track_info(i);
-		track_infos_.push_back(info);
-		if (info.channels > canonical_channels_) {
-			canonical_channels_ = info.channels;
-		}
-		if (info.channels > 0 && info.sample_rate > 0) {
-			if (!has_audio_) {
-				canonical_sample_rate_ = info.sample_rate;
-				has_audio_ = true;
-			} else if (!warned_mixed_sample_rates && info.sample_rate != canonical_sample_rate_) {
-				std::ostringstream oss;
-				oss << "Audio track " << i << " sample rate " << info.sample_rate
-					<< " Hz differs from the canonical rate " << canonical_sample_rate_
-					<< " Hz. Mixed-sample-rate clips are not supported; this track "
-					   "will play at the canonical rate and mid-stream switches to "
-					   "it are refused.";
-				warn(oss.str());
-				warned_mixed_sample_rates = true;
-			}
-		}
-	}
-	// Clamp to the max we know how to mix; larger channel counts are passed
-	// through unmixed (the ring still fills and plays).
-	if (canonical_channels_ > kMaxMixSourceChannels) {
-		canonical_channels_ = kMaxMixSourceChannels;
+	// Derived pure from the backend's audio tracks (no scheduler, no clock);
+	// see canonical_mix_format.h for the mixed-sample-rate limitation. Done
+	// before the backend moves into the scheduler, which takes ownership.
+	CanonicalMixFormat fmt = derive_canonical_mix_format(*backend);
+	canonical_channels_ = fmt.channels;
+	canonical_sample_rate_ = fmt.sample_rate;
+	has_audio_ = fmt.has_audio;
+	track_infos_ = std::move(fmt.track_infos);
+	for (std::string &w : fmt.warnings) {
+		warn(std::move(w));
 	}
 
 	// Hand the Backend to the process-wide shared decode pool. From here a
