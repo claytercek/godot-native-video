@@ -81,8 +81,10 @@ if ARGUMENTS.get("target", "") == "core_tests":
         "tests/core/test_colorimetry.cpp",
         "tests/core/test_push_constant.cpp",
         "tests/core/test_surface_importer_factory.cpp",
+        "tests/core/test_playback_controller.cpp",
         "src/core/decode_scheduler.cpp",
         "src/core/backend.cpp",
+        "src/core/playback_controller.cpp",
     ]
     # The force-synchronous lifetime-debug mode is gated behind NATIVE_VIDEO_DEBUG.
     # Define it for the headless core tests so the force-sync test compiles/runs.
