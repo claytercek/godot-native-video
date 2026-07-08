@@ -844,12 +844,17 @@ TEST_CASE("seek(): a fast burst resolves Keyframe with no forward-decode drops; 
 		controller.seek(1.0, WallClockMs(0.0)); // prime (Exact, trivial forward decode)
 		kf_drops.store(0); // isolate the SECOND (Keyframe) resolve only
 		controller.seek(target, WallClockMs(20.0)); // 20ms later, huge jump -> fast drag -> Keyframe
+		// Check BEFORE shutdown: request_seek() flushes the queue and releases
+		// every frame that was buffered, so the count at this point is purely
+		// the flush. shutdown()'s unregister_stream also drains the queue, but
+		// by then the worker may have pushed new frames after the seek — those
+		// are from the new position, not the pre-seek buffer the test targets.
+		CHECK(kf_drops.load() <= static_cast<int>(core::kDecodeAheadCapacity));
 		controller.shutdown();
 	}
 	// Keyframe skips the forward-decode spin entirely; only request_seek's own
-	// bounded queue flush (whatever was already decode-ahead-buffered) can
-	// contribute here, so this is capped by the decode-ahead queue's capacity.
-	CHECK(kf_drops.load() <= static_cast<int>(core::kDecodeAheadCapacity));
+	// bounded queue flush (whatever was already decode-ahead-buffered, checked
+	// above before shutdown adds worker-pushed frames) can contribute here.
 }
 
 TEST_CASE("the exact-resolve spin treats a frame within epsilon of the target as arrived") {
@@ -903,6 +908,20 @@ TEST_CASE("seek() past end-of-stream terminates the exact-resolve spin instead o
 	CHECK(elapsed < std::chrono::seconds(5)); // bounded, not hung
 
 	controller.shutdown();
+}
+
+TEST_CASE("the exact-resolve spin backoff is bounded far below the old kMaxSpins=100000") {
+	// Regression guard for the busy-wait replacement: the spin's total
+	// iteration ceiling (yield + sleep phases) must be far smaller than the
+	// old 100000-yield hot-loop, so a stalled worker can no longer pin a
+	// core. The behavioral termination guarantee is the "bounded spin" test
+	// above; this pins the constant. In synchronous test mode the sleep path
+	// is effectively unreachable (pump_stream fills the queue inline), so the
+	// constant is the guard for async (release) mode.
+	CHECK(core::kScrubMaxYieldSpins + core::kScrubMaxSleepSpins < 10000);
+	CHECK(core::kScrubMaxYieldSpins > 0);
+	CHECK(core::kScrubMaxSleepSpins > 0);
+	CHECK(core::kScrubSpinSleepMs > 0.0);
 }
 
 TEST_CASE("after a drag burst settles, the next tick presents the exact settled target frame") {
