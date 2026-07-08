@@ -1,6 +1,4 @@
-// -----------------------------------------------------------------------
 // playback_controller.cpp — see header.
-// -----------------------------------------------------------------------
 
 #include "playback_controller.h"
 
@@ -40,9 +38,8 @@ void PlaybackController::shutdown() {
 }
 
 void PlaybackController::load(std::unique_ptr<Backend> backend, double audio_output_latency_seconds) {
-	// Cache colorimetry/dimensions from the backend. These are populated at
-	// open time from the track's format descriptions; per-frame CV
-	// attachments may provide more accurate metadata at decode time.
+	// Cached at open time from the track's format descriptions; per-frame CV
+	// attachments may carry more accurate metadata at decode time.
 	color_ = backend->colorimetry();
 	length_ = backend->duration_seconds();
 	width_ = backend->video_width();
@@ -69,22 +66,17 @@ void PlaybackController::load(std::unique_ptr<Backend> backend, double audio_out
 	stream_ = DecodeScheduler::instance().register_stream(std::move(backend));
 
 	if (has_audio_) {
-		// Audio-master: derive media time from the samples Godot's
-		// AudioServer actually consumes (latency-compensated). The latency
-		// offset shifts reported time back so media_time() reflects what
-		// the speaker is emitting now, not what was just pushed into the
-		// audio buffer.
+		// Audio-master: latency-compensated so media_time() reflects what the
+		// speaker is emitting, not what was just queued.
 		auto audio = std::make_unique<AudioMasterClock>(canonical_sample_rate_, audio_output_latency_seconds);
 		auto mono = std::make_unique<MonotonicClock>(0.0);
 		clock_ = std::make_unique<ClockBridge>(std::move(audio), std::move(mono), /*audio_master=*/true);
-		// ~0.5 s of head-room so brief decode jitter never underruns the mixer.
-		const size_t ring_frames = static_cast<size_t>(canonical_sample_rate_) / 2;
+		const size_t ring_frames = static_cast<size_t>(canonical_sample_rate_) / 2; // ~0.5 s head-room
 		audio_ring_ = std::make_unique<AudioRing>(canonical_channels_, ring_frames);
 	} else {
-		// No audio track: fall back to a monotonic clock advanced by the
-		// render delta so silent clips still play at the correct rate. A
-		// null audio clock makes the bridge permanently monotonic-master —
-		// every audio-facing ClockBridge method becomes a safe no-op.
+		// Silent clip: a null audio clock makes the bridge permanently
+		// monotonic-master, so every audio-facing ClockBridge method is a
+		// safe no-op.
 		auto mono = std::make_unique<MonotonicClock>(0.0);
 		clock_ = std::make_unique<ClockBridge>(nullptr, std::move(mono), /*audio_master=*/false);
 	}
@@ -94,9 +86,8 @@ void PlaybackController::load(std::unique_ptr<Backend> backend, double audio_out
 	audio_eos_ = false;
 	switch_in_progress_ = false;
 
-	// desired_track_ may already carry a pre-load selection made via
-	// request_audio_track() before load() ran; it must survive, not be
-	// clobbered. Validate it now that audio_track_count_ is known.
+	// A pre-load request_audio_track() selection must survive, not be
+	// clobbered; validate it now that audio_track_count_ is known.
 	if (audio_track_count_ > 0 && (desired_track_ < 0 || desired_track_ >= audio_track_count_)) {
 		std::ostringstream oss;
 		oss << "Audio track index " << desired_track_ << " is out of range. Clip has "
@@ -130,14 +121,10 @@ void PlaybackController::fill_audio() {
 	if (!stream_ || !audio_ring_ || audio_eos_) {
 		return;
 	}
-	// Pump audio from the Backend under the scheduler's per-stream exclusion
-	// so we never race the worker that is decoding video ahead on the same
-	// Backend. The callback runs on the caller's thread with sole access to
-	// the Backend.
+	// Pump under the scheduler's per-stream exclusion so we never race the
+	// worker decoding video ahead on the same Backend.
 	DecodeScheduler::instance().with_backend(stream_, [this](Backend &backend) {
-		// Top the ring up to roughly half full so there is always a cushion
-		// against decode jitter without buffering an unbounded amount of
-		// audio ahead.
+		// Half-fill: cushion against decode jitter without buffering unbounded audio.
 		while (audio_ring_->free_frames() > audio_ring_->available_frames()) {
 			std::optional<AudioChunk> chunk = backend.next_audio_chunk();
 			if (!chunk.has_value()) {
@@ -162,9 +149,7 @@ void PlaybackController::fill_audio() {
 				clock_->reanchor_to_audio();
 				switch_in_progress_ = false;
 			}
-			// Mix from the backend's native channel layout to the canonical
-			// format. The channel mixer is a no-op (memcpy) when channel
-			// counts already match.
+			// Mix native layout -> canonical (no-op memcpy when counts match).
 			const int nf = chunk->frame_count;
 			const int sc = chunk->channel_count;
 			const int dc = canonical_channels_;
@@ -183,17 +168,13 @@ bool PlaybackController::drive_audio(MixSink &sink) {
 		return false;
 	}
 
-	// Offer up to a render-tick worth of audio per call. We request exactly
-	// the frames currently buffered (capped) so the normal path supplies
-	// real PCM with no silence padding; only a genuine underrun pads with
-	// zeros.
-	constexpr int kMaxMixFramesPerTick = 4096; // ~85 ms @ 48k — generous head-room
+	constexpr int kMaxMixFramesPerTick = 4096; // ~85 ms @ 48k
 
 	const int ch = canonical_channels_;
 	const size_t available = audio_ring_->available_frames();
-	// On underrun (available == 0) still offer a small block of silence so
-	// the sink keeps its buffer fed and playback doesn't glitch; the clock
-	// is NOT advanced for silence (read_frames reports 0 real frames).
+	// On underrun, offer a small block of silence so the sink keeps its
+	// buffer fed; the clock is NOT advanced for silence (read_frames reports
+	// 0 real frames).
 	int request = static_cast<int>(std::min<size_t>(
 			available > 0 ? available : 256, kMaxMixFramesPerTick));
 
@@ -206,20 +187,11 @@ bool PlaybackController::drive_audio(MixSink &sink) {
 	const size_t real_frames =
 			audio_ring_->read_frames(drive_scratch_.data(), static_cast<size_t>(request));
 
-	// Hand the PCM to the sink. It returns the frames it accepted. We
-	// advance the master clock ONLY by frames that were both real
-	// (non-silence) AND consumed by the sink — so neither underrun silence
-	// nor a full downstream buffer inflates media time. The clock therefore
-	// tracks genuine audio consumption, latency-compensated in
-	// AudioMasterClock.
-	//
-	// NOTE: read_frames() already drained `real_frames` from the ring. If
-	// the sink accepts fewer than that (a near-full downstream buffer), the
-	// surplus real frames are dropped — the clock stays honest (we count
-	// only `accepted`), but a tiny amount of audio is lost. In practice the
-	// sink accepts the full request, and `request` is capped to what is
-	// buffered, so this only bites under sustained downstream back-pressure.
-	// Tolerable for linear playback.
+	// Advance the clock ONLY by frames both real (non-silence) AND consumed —
+	// neither underrun silence nor a full downstream buffer inflates media
+	// time. If the sink accepts fewer than `real_frames` (near-full
+	// downstream buffer), the surplus is dropped: the clock stays honest at
+	// the cost of a little lost audio. Tolerable for linear playback.
 	const int accepted = sink.mix(drive_scratch_.data(), request, ch);
 	const int advance = std::min<int>(accepted, static_cast<int>(real_frames));
 	if (advance > 0) {
@@ -238,10 +210,8 @@ void PlaybackController::play(WallClockMs now) {
 	if (Clock *c = master()) {
 		c->set_paused(false);
 	}
-	// Resuming playback after a scrub: force an exact resolve at the last
-	// scrub target so play starts from the precise frame, not an
-	// approximate keyframe one. Only when transitioning from stopped/paused
-	// into play (not a redundant call).
+	// Resuming after a scrub: force an exact resolve at the last scrub target
+	// so play starts from the precise frame, not an approximate keyframe one.
 	if (!was_playing && stream_) {
 		apply_scrub_resolve(scrubber_.on_resume(now.ms));
 	}
@@ -258,18 +228,15 @@ void PlaybackController::stop() {
 	if (audio_ring_) {
 		audio_ring_->clear();
 	}
-	// Flush the decode-ahead queue and reseek to the start via the
-	// scheduler (serialized against the worker; releases buffered surfaces).
+	// Flush + reseek to start (serialized against the worker).
 	if (stream_) {
 		DecodeScheduler::instance().request_seek(stream_, 0.0);
 	}
-	// Reset scrub state so the next seek starts fresh (no stale velocity/settle).
-	scrubber_ = Scrubber(scrubber_.config());
+	scrubber_ = Scrubber(scrubber_.config()); // no stale velocity/settle
 	switch_in_progress_ = false;
-	// The backend's track selection persists across stop (desired_/live_track_
-	// are NOT reset here), so audio is still live if the clip has any. If the
-	// caller stopped mid-switch, the bridge would otherwise stay
-	// monotonic-master forever with no more fill_audio() calls to re-anchor it.
+	// Track selection persists across stop (desired_/live_track_ are NOT reset
+	// here). If the caller stopped mid-switch, re-anchor so the bridge does
+	// not stay monotonic-master forever with no fill_audio() to re-anchor it.
 	if (has_audio_ && clock_) {
 		clock_->reanchor_to_audio();
 	}
@@ -289,10 +256,6 @@ void PlaybackController::seek(double time_seconds, WallClockMs now) {
 	if (time_seconds < 0.0) {
 		time_seconds = 0.0;
 	}
-	// Feed the seek to the adaptive scrubber: a fast drag burst resolves to
-	// the nearest keyframe for instant feedback; a slow/lone seek resolves
-	// exactly. A debounced settle (or playback resume) later upgrades a
-	// keyframe scrub to an exact resolve via poll()/on_resume() in tick()/play().
 	const ScrubResolve resolve = scrubber_.on_seek(time_seconds, now.ms);
 	apply_scrub_resolve(resolve);
 }
@@ -315,19 +278,12 @@ void PlaybackController::apply_scrub_resolve(const ScrubResolve &resolve) {
 	sched.request_seek(stream_, target);
 
 	if (resolve.mode == ResolveMode::Exact) {
-		// Precise resolve: decode FORWARD past the keyframe to the exact
-		// target, dropping (releasing) every earlier frame so the precise
-		// frame is what the present step shows. Bounded by the clip — stops at
-		// EOS. We drop frames strictly before the target; the present step
-		// then shows the target frame.
-		//
-		// This runs on the caller's thread only on a settle/resume (not the
-		// hot per-frame path), so a brief wait for the worker to top the queue
-		// up is acceptable. The wait uses bounded backoff (see kScrubMaxYield
-		// Spins / kScrubMaxSleepSpins in the header): yield a bounded number of
-		// times, then sleep in small increments, then give up and let the
-		// present step converge on the next ticks. A pure yield loop could
-		// hot-loop on a loaded machine.
+		// Decode forward past the keyframe to the exact target, dropping
+		// earlier frames; bounded by the clip (stops at EOS). Runs on the
+		// caller's thread only on settle/resume (not the hot per-frame path),
+		// so a brief wait for the worker is acceptable. The wait uses bounded
+		// backoff (kScrubMaxYieldSpins / kScrubMaxSleepSpins in the header): a
+		// pure yield loop could hot-loop on a loaded machine.
 		const double eps = 1.0 / 120.0; // ~half a frame at 60fps tolerance
 		int yield_spins = 0;
 		int sleep_spins = 0;
@@ -378,9 +334,8 @@ void PlaybackController::reconcile_audio_track() {
 	}
 
 	if (!playing_) {
-		// Stopped / pre-play: apply cheaply. Selection is deferred in the
-		// backend until its next seek — which play()'s scrub-resume resolve
-		// always issues before resuming.
+		// Stopped / pre-play: cheap apply. Deferred in the backend until its
+		// next seek — which play()'s scrub-resume resolve always issues first.
 		const int target = desired_track_;
 		DecodeScheduler::instance().with_backend(
 				stream_, [target](Backend &backend) {
@@ -390,7 +345,7 @@ void PlaybackController::reconcile_audio_track() {
 		return;
 	}
 
-	// Playing (including paused — reselecting now primes the new reader at
+	// Playing (or paused — reselecting now primes the new reader at
 	// position_ so resume is instant).
 	if (!clock_ || !audio_ring_) {
 		return;
@@ -402,11 +357,10 @@ void PlaybackController::reconcile_audio_track() {
 	const int target = desired_track_;
 	const double prime_seconds = position_;
 
-	// Call reselect_audio_track on the backend under the scheduler's
-	// per-stream exclusion. This tears down and rebuilds ONLY the audio
-	// decode path (plus the video reader in AVF's case, but the FrameQueue
-	// still has buffered frames so the caller keeps presenting without
-	// interruption).
+	// Reselect under the scheduler's per-stream exclusion. Tears down and
+	// rebuilds ONLY the audio decode path (plus the video reader in AVF's
+	// case, but the FrameQueue still has buffered frames so presenting is
+	// uninterrupted).
 	bool ok = false;
 	DecodeScheduler::instance().with_backend(
 			stream_, [&](Backend &backend) {
@@ -414,11 +368,10 @@ void PlaybackController::reconcile_audio_track() {
 			});
 
 	if (!ok) {
-		// Reselect failed: the Backend contract leaves the audio decode path
-		// undefined on failure (on AVF this can even leave no readers at
-		// all), so we cannot assume the old track is still playable. Roll
-		// the desired selection back to what is still live and force a seek
-		// to recover, per the Backend contract.
+		// The Backend contract leaves the audio decode path undefined on
+		// failure (on AVF this can even leave no readers at all), so the old
+		// track is not safely playable. Roll desired back to what is still
+		// live and force a seek to recover.
 		desired_track_ = live_track_;
 		switch_in_progress_ = false;
 		clock_->reanchor_to_audio();
@@ -429,17 +382,13 @@ void PlaybackController::reconcile_audio_track() {
 		return;
 	}
 
-	// Clear the audio ring so stale samples from the old track don't play
-	// into the new track's first chunks. fill_audio() re-anchors the clock
-	// when the first chunk from the new track arrives.
+	// Clear stale samples; fill_audio() re-anchors when the new track flows.
 	live_track_ = desired_track_;
 	audio_ring_->clear();
 	audio_eos_ = false;
 }
 
 void PlaybackController::request_audio_track(int idx) {
-	// Validate out-of-range: the stock VideoStreamPlayer calls this before
-	// play() to pre-select a track, and while playing for mid-stream switch.
 	if (audio_track_count_ > 0 && (idx < 0 || idx >= audio_track_count_)) {
 		std::ostringstream oss;
 		oss << "Audio track index " << idx << " is out of range. Clip has "
@@ -452,12 +401,10 @@ void PlaybackController::request_audio_track(int idx) {
 		return;
 	}
 
-	// Mid-stream sample-rate refusal: the canonical mix format and
-	// AudioMasterClock are fixed to the clip's canonical rate and cannot
-	// change mid-stream, so a switch to a differing-rate track is refused
-	// outright (while stopped/pre-play there is no live audio path yet to
-	// disturb, so the switch is allowed and validated again at load-derived
-	// canonical-rate time).
+	// The canonical mix format and AudioMasterClock are fixed to the clip's
+	// canonical rate and cannot change mid-stream, so a mid-stream switch to
+	// a differing-rate track is refused outright (stopped/pre-play has no
+	// live audio path yet, so it is allowed).
 	if (playing_ && has_audio_ && static_cast<size_t>(idx) < track_infos_.size() &&
 			track_infos_[static_cast<size_t>(idx)].sample_rate != canonical_sample_rate_) {
 		std::ostringstream oss;
@@ -471,9 +418,8 @@ void PlaybackController::request_audio_track(int idx) {
 
 	desired_track_ = idx;
 
-	// Stopped / pre-play: apply immediately (cheap — deferred in the
-	// backend until its next seek). While playing or paused, tick()
-	// reconciles on its next call (it already runs while paused).
+	// Stopped/pre-play applies immediately; playing/paused defers to the
+	// next tick() (which runs while paused).
 	if (!playing_) {
 		reconcile_audio_track();
 	}
@@ -502,10 +448,8 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, WallClo
 	}
 	DecodeScheduler &sched = DecodeScheduler::instance();
 
-	// Always advance the clock bridge: when audio-master this is a no-op
-	// (AudioMasterClock ignores advance()), but in monotonic-master mode —
-	// a silent clip, or the handoff window during a track switch — it keeps
-	// video advancing through the silence.
+	// No-op when audio-master; keeps video advancing through monotonic-master
+	// silence (silent clip, or the handoff window during a track switch).
 	clock->advance(delta_seconds);
 
 	// One clock rule: advance from real audio samples when any exist; once
@@ -521,16 +465,11 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, WallClo
 	advance_master_clock(delta_seconds, advanced_from_audio);
 	const double media_now = clock->media_time();
 
-	// Video decode-ahead is driven by the shared pool's worker(s); the
-	// queue is topped up off the pool's threads. We only consume here.
-
-	// --- Present step: drop-late / hold-early, via the Godot-free selector ---
-	//
-	// We peek the head/next PTS (consumer-side, non-destructive) so frame
-	// order is never disturbed, then act on the selector's decision:
-	//   * Drop  — head is stale (a newer due frame exists): pop+release it, loop.
-	//   * Show  — head is the correct frame for `media_now`: pop and present it.
-	//   * Hold  — head is in the future: present nothing new, keep current frame.
+	// --- Present step: drop-late / hold-early, via the Godot-free selector. ---
+	// Peek head/next PTS non-destructively (frame order is never disturbed):
+	//   * Drop  — head stale: pop+release, loop.
+	//   * Show  — head is the due frame for `media_now`: pop and present it.
+	//   * Hold  — head in the future: present nothing new.
 	const double frame_interval = 1.0 / 30.0; // nominal; refined when fps is known
 	std::optional<VideoFrame> chosen;
 
@@ -545,7 +484,6 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, WallClo
 				select_present_action(head_pts, next_pts, media_now, frame_interval);
 
 		if (action == PresentAction::Drop) {
-			// Head is stale: pop and retire it, then re-evaluate the new head.
 			std::optional<VideoFrame> stale = sched.next_frame(stream_);
 			if (stale.has_value() && stale->release) {
 				stale->release();
@@ -554,8 +492,6 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, WallClo
 		}
 
 		if (action == PresentAction::Show) {
-			// Newest due frame: pop and present it. (Drop already collapsed
-			// any backlog, so this is the only due frame.)
 			chosen = sched.next_frame(stream_);
 		}
 
@@ -567,9 +503,7 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, WallClo
 		position_ = chosen->pts_seconds;
 	}
 
-	// End-of-playback: video stream drained (Backend EOS + empty queue) and
-	// audio fully consumed. at_end() reflects the worker-reported EOS for
-	// our stream.
+	// End-of-playback: video EOS (at_end() is worker-reported) and audio drained.
 	if (sched.at_end(stream_) && audio_exhausted()) {
 		playing_ = false;
 	}
