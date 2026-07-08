@@ -246,7 +246,7 @@ bool PlaybackController::drive_audio(MixSink &sink) {
 	return advance > 0;
 }
 
-void PlaybackController::play(double now_ms) {
+void PlaybackController::play(WallClockMs now) {
 	if (!loaded_) {
 		return;
 	}
@@ -261,7 +261,7 @@ void PlaybackController::play(double now_ms) {
 	// approximate keyframe one. Only when transitioning from stopped/paused
 	// into play (not a redundant call).
 	if (!was_playing && stream_) {
-		apply_scrub_resolve(scrubber_.on_resume(now_ms));
+		apply_scrub_resolve(scrubber_.on_resume(now.ms));
 	}
 }
 
@@ -300,7 +300,7 @@ void PlaybackController::set_paused(bool paused) {
 	}
 }
 
-void PlaybackController::seek(double time_seconds, double now_ms) {
+void PlaybackController::seek(double time_seconds, WallClockMs now) {
 	if (!stream_ || !master()) {
 		return;
 	}
@@ -311,7 +311,7 @@ void PlaybackController::seek(double time_seconds, double now_ms) {
 	// the nearest keyframe for instant feedback; a slow/lone seek resolves
 	// exactly. A debounced settle (or playback resume) later upgrades a
 	// keyframe scrub to an exact resolve via poll()/on_resume() in tick()/play().
-	const ScrubResolve resolve = scrubber_.on_seek(time_seconds, now_ms);
+	const ScrubResolve resolve = scrubber_.on_seek(time_seconds, now.ms);
 	apply_scrub_resolve(resolve);
 }
 
@@ -485,7 +485,7 @@ void PlaybackController::request_audio_track(int idx) {
 	}
 }
 
-std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, double now_ms, MixSink &sink) {
+std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, WallClockMs now, MixSink &sink) {
 	Clock *clock = master();
 	if (!loaded_ || !clock || !stream_) {
 		return std::nullopt;
@@ -495,7 +495,7 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, double 
 	// while paused (dragging a timeline). Once a fast drag has gone quiet
 	// for the debounce window, upgrade the approximate keyframe frame to the
 	// exact target frame.
-	if (std::optional<ScrubResolve> settle = scrubber_.poll(now_ms)) {
+	if (std::optional<ScrubResolve> settle = scrubber_.poll(now.ms)) {
 		apply_scrub_resolve(*settle);
 	}
 
@@ -532,7 +532,7 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, double 
 	if (clock_->is_audio_master() && !advanced_from_audio && audio_exhausted()) {
 		clock->set_time(clock->media_time() + delta_seconds);
 	}
-	const double now = clock->media_time();
+	const double media_now = clock->media_time();
 
 	// Video decode-ahead is driven by the shared pool's worker(s); the
 	// queue is topped up off the pool's threads. We only consume here.
@@ -542,7 +542,7 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, double 
 	// We peek the head/next PTS (consumer-side, non-destructive) so frame
 	// order is never disturbed, then act on the selector's decision:
 	//   * Drop  — head is stale (a newer due frame exists): pop+release it, loop.
-	//   * Show  — head is the correct frame for `now`: pop and present it.
+	//   * Show  — head is the correct frame for `media_now`: pop and present it.
 	//   * Hold  — head is in the future: present nothing new, keep current frame.
 	const double frame_interval = 1.0 / 30.0; // nominal; refined when fps is known
 	std::optional<VideoFrame> chosen;
@@ -555,7 +555,7 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, double 
 		std::optional<double> next_pts = sched.peek_next_pts(stream_);
 
 		PresentAction action =
-				select_present_action(head_pts, next_pts, now, frame_interval);
+				select_present_action(head_pts, next_pts, media_now, frame_interval);
 
 		if (action == PresentAction::Drop) {
 			// Head is stale: pop and retire it, then re-evaluate the new head.

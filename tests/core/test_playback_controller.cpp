@@ -1,6 +1,7 @@
 #include "vendor/doctest.h"
 
 #include "../../src/core/playback_controller.h"
+#include "../../src/core/wall_clock.h"
 
 #include "../../src/core/channel_mixer.h"
 
@@ -11,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using core::AudioChunk;
@@ -19,6 +21,24 @@ using core::Backend;
 using core::MixSink;
 using core::PlaybackController;
 using core::VideoFrame;
+using core::WallClockMs;
+
+// WallClockMs must NOT implicitly convert from double — the whole point of
+// the type is forcing a caller to opt into treating a number as wall time.
+static_assert(!std::is_convertible_v<double, WallClockMs>,
+		"WallClockMs must not implicitly convert from double");
+static_assert(std::is_default_constructible_v<WallClockMs>,
+		"WallClockMs must be default constructible");
+
+TEST_CASE("WallClockMs holds its value and supports comparison/arithmetic via .ms") {
+	WallClockMs a(100.0);
+	WallClockMs b(30.0);
+	CHECK(a.ms == 100.0);
+	CHECK(b.ms == 30.0);
+	CHECK(a.ms - b.ms == doctest::Approx(70.0));
+	// Default-constructed is zero (the pre-load / pre-tick sentinel).
+	CHECK(WallClockMs().ms == 0.0);
+}
 
 // -----------------------------------------------------------------------
 // A lean sanity suite for the newly-extracted PlaybackController — no Godot,
@@ -406,13 +426,13 @@ TEST_CASE("an out-of-range pre-load track selection is validated and reset once 
 TEST_CASE("drive_audio advances the clock by only the accepted-and-real frame count") {
 	PlaybackController controller;
 	controller.load(make_stereo_backend(), 0.0);
-	controller.play(/*now_ms=*/0.0);
+	controller.play(WallClockMs(0.0));
 
 	// The sink accepts far fewer frames than fill_audio() will have topped
 	// the ring up with, so the clock must advance by exactly the accepted
 	// count (mix back-pressure), never the full offered/available amount.
 	CappedMixSink sink(/*accept_cap=*/100);
-	std::optional<VideoFrame> frame = controller.tick(/*delta_seconds=*/1.0 / 60.0, /*now_ms=*/16.6, sink);
+	std::optional<VideoFrame> frame = controller.tick(/*delta_seconds=*/1.0 / 60.0, WallClockMs(16.6), sink);
 	(void)frame; // no video frames are queued in this test; present is a Hold
 
 	REQUIRE(sink.last_offered() > 100); // proves back-pressure was actually exercised
@@ -429,13 +449,13 @@ TEST_CASE("a mid-stream reselect the backend refuses rolls the desired track bac
 
 	PlaybackController controller;
 	controller.load(std::move(backend), 0.0);
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 
 	controller.request_audio_track(1); // deferred: applied on the next tick()
 	CHECK(controller.desired_audio_track() == 1);
 
 	CappedMixSink sink(4096);
-	controller.tick(1.0 / 60.0, 16.6, sink);
+	controller.tick(1.0 / 60.0, WallClockMs(16.6), sink);
 
 	CHECK(controller.desired_audio_track() == 0); // rolled back
 	CHECK(controller.live_audio_track() == 0);
@@ -449,10 +469,10 @@ TEST_CASE("a mid-stream reselect the backend refuses rolls the desired track bac
 TEST_CASE("stop() resets transport state and tick() is a no-op before load()") {
 	PlaybackController controller;
 	CappedMixSink sink(4096);
-	CHECK_FALSE(controller.tick(1.0 / 60.0, 0.0, sink).has_value());
+	CHECK_FALSE(controller.tick(1.0 / 60.0, WallClockMs(0.0), sink).has_value());
 
 	controller.load(make_stereo_backend(), 0.0);
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 	CHECK(controller.is_playing());
 
 	controller.stop();
@@ -495,14 +515,14 @@ TEST_CASE("a live reselect success converges desired/live, and a converged recon
 
 	PlaybackController controller;
 	controller.load(std::move(backend), 0.0);
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 
 	controller.request_audio_track(1); // deferred: applied on the next tick()
 	CHECK(controller.desired_audio_track() == 1);
 	CHECK(controller.live_audio_track() == 0); // not yet reconciled
 
 	CappedMixSink sink(4096);
-	controller.tick(1.0 / 60.0, 16.6, sink); // reconciles: reselect succeeds
+	controller.tick(1.0 / 60.0, WallClockMs(16.6), sink); // reconciles: reselect succeeds
 
 	CHECK(controller.desired_audio_track() == 1);
 	CHECK(controller.live_audio_track() == 1);
@@ -511,8 +531,8 @@ TEST_CASE("a live reselect success converges desired/live, and a converged recon
 
 	// Further ticks: desired == live now, so reconcile_audio_track's own no-op
 	// guard must stop it from reselecting again every tick.
-	controller.tick(1.0 / 60.0, 33.2, sink);
-	controller.tick(1.0 / 60.0, 49.8, sink);
+	controller.tick(1.0 / 60.0, WallClockMs(33.2), sink);
+	controller.tick(1.0 / 60.0, WallClockMs(49.8), sink);
 	CHECK(raw->reselect_calls() == 1); // unchanged
 
 	controller.shutdown();
@@ -544,13 +564,13 @@ TEST_CASE("requesting the already-desired track is a no-op and never touches the
 TEST_CASE("one-clock rule: audio-master tick() never adds the render delta on top of accepted audio frames") {
 	PlaybackController controller;
 	controller.load(make_stereo_backend(), 0.0);
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 
 	CappedMixSink sink(/*accept_cap=*/480); // 480 frames @ 48kHz = 10ms of real audio
 	// A deliberately huge render delta: if the clock ever added this on top of
 	// the accepted-frame accounting, media_time would be off by orders of
 	// magnitude (~1s instead of ~10ms).
-	controller.tick(/*delta_seconds=*/1.0, /*now_ms=*/16.6, sink);
+	controller.tick(/*delta_seconds=*/1.0, WallClockMs(16.6), sink);
 
 	CHECK(controller.media_time() == doctest::Approx(480.0 / 48000.0).epsilon(0.01));
 
@@ -561,13 +581,13 @@ TEST_CASE("one-clock rule: a silent clip advances the clock by exactly the rende
 	auto backend = std::make_unique<MultiTrackFakeBackend>(std::vector<MultiTrackFakeBackend::TrackSpec>{});
 	PlaybackController controller;
 	controller.load(std::move(backend), 0.0);
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 
 	CappedMixSink sink(4096); // never invoked: no audio track
 
-	controller.tick(0.1, 100.0, sink);
+	controller.tick(0.1, WallClockMs(100.0), sink);
 	CHECK(controller.media_time() == doctest::Approx(0.1));
-	controller.tick(0.1, 200.0, sink);
+	controller.tick(0.1, WallClockMs(200.0), sink);
 	CHECK(controller.media_time() == doctest::Approx(0.2)); // linear, not doubled
 
 	controller.shutdown();
@@ -576,20 +596,20 @@ TEST_CASE("one-clock rule: a silent clip advances the clock by exactly the rende
 TEST_CASE("one-clock rule: audio exhaustion falls back to the render delta exactly once per tick") {
 	PlaybackController controller;
 	controller.load(std::make_unique<ShortAudioBackend>(/*total_frames=*/100), 0.0);
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 	AcceptAllMixSink sink;
 
 	// Tick 1: the ring's one real chunk (100 frames) drains in full — the
 	// clock advances from real audio accounting only.
-	controller.tick(/*delta_seconds=*/1.0 / 60.0, 16.6, sink);
+	controller.tick(/*delta_seconds=*/1.0 / 60.0, WallClockMs(16.6), sink);
 	CHECK(controller.media_time() == doctest::Approx(100.0 / 48000.0).epsilon(0.01));
 
 	// Ticks 2-4: the ring is now empty and EOS'd (audio_exhausted()), so each
 	// tick must fall back to exactly one render-delta advance — not zero
 	// (stuck), and not doubled by also counting the now-silent audio path.
-	controller.tick(0.1, 33.2, sink);
-	controller.tick(0.1, 50.0, sink);
-	controller.tick(0.1, 66.6, sink);
+	controller.tick(0.1, WallClockMs(33.2), sink);
+	controller.tick(0.1, WallClockMs(50.0), sink);
+	controller.tick(0.1, WallClockMs(66.6), sink);
 
 	CHECK(controller.media_time() == doctest::Approx(100.0 / 48000.0 + 0.3).epsilon(0.01));
 
@@ -606,17 +626,17 @@ TEST_CASE("one-clock rule: audio exhaustion falls back to the render delta exact
 TEST_CASE("accepted-vs-real: silence offered during underrun is never counted as real audio") {
 	PlaybackController controller;
 	controller.load(std::make_unique<ShortAudioBackend>(/*total_frames=*/100), 0.0);
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 	AcceptAllMixSink sink; // accepts every frame offered, including underrun silence
 
-	controller.tick(1.0 / 60.0, 16.6, sink); // drains the one real 100-frame chunk
+	controller.tick(1.0 / 60.0, WallClockMs(16.6), sink); // drains the one real 100-frame chunk
 	const double after_real = controller.media_time();
 
 	// The ring is now empty and EOS'd: drive_audio() offers 256 silent frames
 	// and this sink accepts all 256 (accepted == 256), but real_frames == 0 —
 	// the clock must advance by the render-delta fallback only, NOT by an
 	// extra 256/48000s of "accepted" silence stacked on top of it.
-	controller.tick(/*delta_seconds=*/0.1, 33.2, sink);
+	controller.tick(/*delta_seconds=*/0.1, WallClockMs(33.2), sink);
 
 	CHECK(controller.media_time() == doctest::Approx(after_real + 0.1).epsilon(0.01));
 
@@ -649,7 +669,7 @@ TEST_CASE("a mid-stream switch to a differing sample-rate track is refused while
 	PlaybackController controller;
 	controller.load(std::move(backend), 0.0);
 	controller.take_warnings(); // drain load()'s own mixed-sample-rate warning
-	controller.play(0.0);
+	controller.play(WallClockMs(0.0));
 
 	controller.request_audio_track(1); // differing rate while playing -> refused
 
@@ -700,7 +720,7 @@ TEST_CASE("seek(): a fast burst resolves Keyframe with no forward-decode drops; 
 	{
 		PlaybackController controller;
 		controller.load(std::make_unique<ScrubGridBackend>(&exact_drops), 0.0);
-		controller.seek(target, /*now_ms=*/0.0);
+		controller.seek(target, WallClockMs(0.0));
 		controller.shutdown();
 	}
 	CHECK(exact_drops.load() >= kScrubGopFrames / 2); // decoded forward across most of a GOP
@@ -710,9 +730,9 @@ TEST_CASE("seek(): a fast burst resolves Keyframe with no forward-decode drops; 
 	{
 		PlaybackController controller;
 		controller.load(std::make_unique<ScrubGridBackend>(&kf_drops), 0.0);
-		controller.seek(1.0, /*now_ms=*/0.0); // prime (Exact, trivial forward decode)
+		controller.seek(1.0, WallClockMs(0.0)); // prime (Exact, trivial forward decode)
 		kf_drops.store(0); // isolate the SECOND (Keyframe) resolve only
-		controller.seek(target, /*now_ms=*/20.0); // 20ms later, huge jump -> fast drag -> Keyframe
+		controller.seek(target, WallClockMs(20.0)); // 20ms later, huge jump -> fast drag -> Keyframe
 		controller.shutdown();
 	}
 	// Keyframe skips the forward-decode spin entirely; only request_seek's own
@@ -733,7 +753,7 @@ TEST_CASE("the exact-resolve spin treats a frame within epsilon of the target as
 		controller.load(std::make_unique<ExactPtsBackend>(
 									std::vector<double>{ target - kSpinEps * 0.5 }, &drops_in_tolerance),
 				0.0);
-		controller.seek(target, /*now_ms=*/0.0);
+		controller.seek(target, WallClockMs(0.0));
 		// Check before shutdown(): unregister_stream() releases whatever frame
 		// the spin left buffered (the in-tolerance survivor), which would
 		// otherwise inflate this count by one after the fact.
@@ -750,7 +770,7 @@ TEST_CASE("the exact-resolve spin treats a frame within epsilon of the target as
 									std::vector<double>{ target - kSpinEps * 2.0, target - kSpinEps * 0.5 },
 									&drops_out_of_tolerance),
 				0.0);
-		controller.seek(target, /*now_ms=*/0.0);
+		controller.seek(target, WallClockMs(0.0));
 		CHECK(drops_out_of_tolerance.load() == 1);
 		controller.shutdown();
 	}
@@ -766,7 +786,7 @@ TEST_CASE("seek() past end-of-stream terminates the exact-resolve spin instead o
 	// spin must give up via at_end() rather than hang waiting for a frame that
 	// will never arrive.
 	const auto start = std::chrono::steady_clock::now();
-	controller.seek(kScrubTotalFrames / double(kScrubFps) + 1000.0, /*now_ms=*/0.0);
+	controller.seek(kScrubTotalFrames / double(kScrubFps) + 1000.0, WallClockMs(0.0));
 	const auto elapsed = std::chrono::steady_clock::now() - start;
 
 	CHECK(elapsed < std::chrono::seconds(5)); // bounded, not hung
@@ -778,14 +798,14 @@ TEST_CASE("after a drag burst settles, the next tick presents the exact settled 
 	std::atomic<int> drops{ 0 };
 	PlaybackController controller;
 	controller.load(std::make_unique<ScrubGridBackend>(&drops), 0.0);
-	controller.play(/*now_ms=*/0.0);
+	controller.play(WallClockMs(0.0));
 
 	// Frame-aligned targets sidestep the present-selector's own half-frame
 	// tolerance landing on a coin-flip between two adjacent frames.
 	const double last_target = 400.0 / kScrubFps;
-	controller.seek(100.0 / kScrubFps, /*now_ms=*/1000.0); // prime -> Exact
-	controller.seek(300.0 / kScrubFps, /*now_ms=*/1020.0); // fast -> Keyframe
-	controller.seek(last_target, /*now_ms=*/1040.0); // fast -> Keyframe (approximate frame on screen)
+	controller.seek(100.0 / kScrubFps, WallClockMs(1000.0)); // prime -> Exact
+	controller.seek(300.0 / kScrubFps, WallClockMs(1020.0)); // fast -> Keyframe
+	controller.seek(last_target, WallClockMs(1040.0)); // fast -> Keyframe (approximate frame on screen)
 
 	CappedMixSink sink(0); // never invoked: this backend carries no audio
 	// 150ms later (past the 100ms settle debounce): the pending settle fires
@@ -794,7 +814,7 @@ TEST_CASE("after a drag burst settles, the next tick presents the exact settled 
 	// the settle resolve, and a full 1/60s delta would push `now` to within the
 	// present selector's own half-frame tolerance of the NEXT frame too — a
 	// coincidental tie this fixture's frame-aligned target would otherwise hit.
-	std::optional<VideoFrame> frame = controller.tick(/*delta_seconds=*/0.001, /*now_ms=*/1190.0, sink);
+	std::optional<VideoFrame> frame = controller.tick(/*delta_seconds=*/0.001, WallClockMs(1190.0), sink);
 
 	REQUIRE(frame.has_value());
 	CHECK(frame->pts_seconds == doctest::Approx(last_target));
