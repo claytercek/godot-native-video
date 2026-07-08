@@ -168,6 +168,19 @@ private:
 	void apply_scrub_resolve(const ScrubResolve &resolve);
 	void fill_audio();
 	bool drive_audio(MixSink &sink);
+
+	// advance_master_clock — the one-clock rule: advance the master clock by
+	// exactly one source per tick, never two. When audio is present and drove
+	// the clock (`advanced_from_audio`), that is the one advance. When audio
+	// is master but exhausted (no more real samples will ever come — a
+	// shorter audio track fully drained, a legitimate real-world case), fall
+	// back to the render delta. The gates prevent double-advance: the
+	// `!advanced_from_audio` gate keeps the last partial ring drain from
+	// stacking real frames + delta; the `is_audio_master()` gate keeps this
+	// from stacking on top of the bridge advance() while in monotonic-master
+	// mode. Reordering these conditions would silently break A/V sync — the
+	// three "one-clock rule" tests pin the behavior.
+	void advance_master_clock(double delta_seconds, bool advanced_from_audio);
 	bool audio_exhausted() const;
 	Clock *master() const { return clock_.get(); }
 	void warn(std::string message);

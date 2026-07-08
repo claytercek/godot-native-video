@@ -114,6 +114,17 @@ bool PlaybackController::audio_exhausted() const {
 	return !has_audio_ || (audio_eos_ && audio_ring_ && audio_ring_->empty());
 }
 
+void PlaybackController::advance_master_clock(double delta_seconds, bool advanced_from_audio) {
+	// See the header: this is the one-clock rule as a single named decision.
+	if (!clock_ || !clock_->is_audio_master() || advanced_from_audio) {
+		return;
+	}
+	if (!audio_exhausted()) {
+		return;
+	}
+	clock_->set_time(clock_->media_time() + delta_seconds);
+}
+
 void PlaybackController::fill_audio() {
 	if (!stream_ || !audio_ring_ || audio_eos_) {
 		return;
@@ -485,23 +496,16 @@ std::optional<VideoFrame> PlaybackController::tick(double delta_seconds, WallClo
 	clock->advance(delta_seconds);
 
 	// One clock rule: advance from real audio samples when any exist; once
-	// no more can ever come (a shorter audio track fully drained —
-	// legitimate in real-world files), advance by the render delta instead.
-	// The gate on !advanced_from_audio keeps the last partial ring drain
-	// from double-advancing (real leftover frames + delta on the same
-	// tick). The is_audio_master() gate keeps this from stacking on top of
-	// the bridge advance() above while in monotonic-master mode.
+	// no more can ever come (a shorter audio track fully drained — legitimate
+	// in real-world files), advance by the render delta instead. Extracted
+	// into advance_master_clock() so the rule is a single named concept a
+	// future edit can't silently break by reordering the ifs.
 	bool advanced_from_audio = false;
 	if (has_audio_) {
-		// drive_audio() calls clock_->on_audio_mixed() from the samples
-		// actually consumed — the ClockBridge delegates to AudioMasterClock
-		// when audio-master and is a no-op during the monotonic handoff.
 		fill_audio();
 		advanced_from_audio = drive_audio(sink);
 	}
-	if (clock_->is_audio_master() && !advanced_from_audio && audio_exhausted()) {
-		clock->set_time(clock->media_time() + delta_seconds);
-	}
+	advance_master_clock(delta_seconds, advanced_from_audio);
 	const double media_now = clock->media_time();
 
 	// Video decode-ahead is driven by the shared pool's worker(s); the
