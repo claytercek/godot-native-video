@@ -21,3 +21,7 @@ ios.release.arm64 = "./ios/libnative-video.ios.template_release.arm64.dylib"
 ; prefix is empty, unlike the Darwin dylibs above.)
 windows.debug.x86_64 = "./windows/native-video.windows.template_debug.x86_64.dll"
 windows.release.x86_64 = "./windows/native-video.windows.template_release.x86_64.dll"
+windows.debug.x86_32 = "./windows/native-video.windows.template_debug.x86_32.dll"
+windows.release.x86_32 = "./windows/native-video.windows.template_release.x86_32.dll"
+windows.debug.arm64 = "./windows/native-video.windows.template_debug.arm64.dll"
+windows.release.arm64 = "./windows/native-video.windows.template_release.arm64.dll"
