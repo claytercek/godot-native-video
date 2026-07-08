@@ -1,55 +1,48 @@
 name: Build GDExtension
+
 on:
   workflow_dispatch:
+  # Called by release-please.yml when a release is created. The tag input
+  # makes the merge job attach the packaged zip to that GitHub Release.
+  workflow_call:
+    inputs:
+      release-tag:
+        description: "Release tag to attach the packaged artifact to (e.g. v0.1.0)"
+        type: string
+        required: false
+        default: ""
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
+        # Platforms match the entries declared in demo/bin/native-video.gdextension.
+        # Single precision only: the .gdextension ships no double-precision
+        # entries (known limitation).
         target:
           [
-            # { platform: linux, arch: x86_64, os: ubuntu-22.04 },
-            # { platform: linux, arch: x86_32, os: ubuntu-22.04 },
-            # { platform: linux, arch: arm64, os: ubuntu-22.04-arm },
-            # { platform: linux, arch: arm32, os: ubuntu-22.04-arm },
-            # { platform: windows, arch: x86_64, os: windows-latest },
-            # { platform: windows, arch: x86_32, os: windows-latest },
-            # { platform: windows, arch: arm64, os: windows-latest },
             { platform: macos, arch: universal, os: macos-latest },
-            # { platform: android, arch: x86_64, os: ubuntu-22.04 },
-            # { platform: android, arch: x86_32, os: ubuntu-22.04 },
-            # { platform: android, arch: arm64, os: ubuntu-22.04 },
-            # { platform: android, arch: arm32, os: ubuntu-22.04 },
             { platform: ios, arch: arm64, os: macos-latest },
-            # { platform: web, arch: wasm32, os: ubuntu-22.04 },
+            { platform: windows, arch: x86_64, os: windows-latest },
           ]
         target-type: [template_debug, template_release]
-        float-precision: [single, double]
 
-    name: Build ${{ matrix.target.platform }}-${{ matrix.target-type }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}
+    name: Build ${{ matrix.target.platform }}-${{ matrix.target-type }}-${{ matrix.target.arch }}
     runs-on: ${{ matrix.target.os }}
+    env:
+      APPLE_CERT_BASE64: ${{ secrets.APPLE_CERT_BASE64 }}
     steps:
-      # Clone this repository
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: true
 
-      # Add linux x86_32 toolchain
-      - name: Install multilib support
-        if: ${{ matrix.target.platform == 'linux' && matrix.target.arch == 'x86_32' }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
-
-      # Setup dependencies
       - name: Setup godot-cpp
         uses: ./godot-cpp/.github/actions/setup-godot-cpp
         with:
           platform: ${{ matrix.target.platform }}
           em-version: 3.1.62
-
-      # Build GDExtension (with caches)
 
       - name: Restore .scons-cache
         uses: actions/cache@v4
@@ -57,51 +50,107 @@ jobs:
           path: |
             ${{ github.workspace }}/.scons-cache/
             ${{ github.workspace }}/**/.sconsign.dblite
-          key: ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}-${{ github.ref }}
+          key: ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.target-type }}-${{ github.ref }}
           restore-keys: |
-            ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}
-            ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-
+            ${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.target-type }}
+            ${{ matrix.target.platform }}-${{ matrix.target.arch }}-
 
       - name: Build GDExtension
         shell: sh
         env:
           SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
         run: |
-          scons target=${{ matrix.target-type }} platform=${{ matrix.target.platform }} arch=${{ matrix.target.arch }} precision=${{ matrix.float-precision }}
+          scons target=${{ matrix.target-type }} platform=${{ matrix.target.platform }} arch=${{ matrix.target.arch }}
 
-      # Clean up compilation files
       - name: Windows - Delete compilation files
         if: ${{ matrix.target.platform == 'windows' }}
         shell: pwsh
         run: |
           Remove-Item bin/* -Include *.exp,*.lib,*.pdb -Force
 
-      # Upload the build
+      # --- macOS code signing + notarization -------------------------------
+      # Runs only when the Apple signing secrets are configured; skipped
+      # cleanly otherwise so forks and secret-less runs still build.
+      # iOS is intentionally NOT signed here: frameworks are re-signed by the
+      # consuming project's own certificate at export time.
+      #
+      # Required repository secrets:
+      #   APPLE_CERT_BASE64            base64-encoded Developer ID Application .p12
+      #   APPLE_CERT_PASSWORD          password for the .p12
+      #   APPLE_ID                     Apple ID email used for notarization
+      #   APPLE_TEAM_ID                10-character team identifier
+      #   APPLE_APP_SPECIFIC_PASSWORD  app-specific password for the Apple ID
+
+      - name: Import Developer ID certificate
+        if: matrix.target.platform == 'macos' && env.APPLE_CERT_BASE64 != ''
+        shell: bash
+        env:
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASS=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          echo "$APPLE_CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASS" "$KEYCHAIN" > /dev/null
+
+      - name: Sign and notarize dylib
+        if: matrix.target.platform == 'macos' && env.APPLE_CERT_BASE64 != ''
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          codesign --force --timestamp --options runtime \
+            --sign "Developer ID Application" bin/macos/*.dylib
+          codesign --verify --verbose bin/macos/*.dylib
+
+          # Notarization tickets cannot be stapled to bare dylibs; Gatekeeper
+          # verifies them via an online lookup instead, so submitting the
+          # signed dylibs is sufficient.
+          ditto -c -k --keepParent bin/macos "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+      # ----------------------------------------------------------------------
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: native-video-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}
+          name: native-video-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ matrix.target-type }}
           path: |
             ${{ github.workspace }}/bin/**
 
-  # Merges all the build artifacts together into a single native-video artifact.
-  # If you comment out this step, all the builds will be uploaded individually.
+  # Merges all the build artifacts together into a single native-video
+  # artifact and, when invoked for a release, attaches the packaged zip to
+  # the GitHub Release.
   merge:
     runs-on: ubuntu-22.04
     needs: build
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: native-video-*
           path: artifacts
-          
+
       - name: Create final artifact structure
         run: |
-          mkdir -p final-artifact/bin
+          mkdir -p final-artifact
           # Copy contents of each artifact into final-artifact
           for dir in artifacts/native-video-*; do
             cp -r "$dir"/* final-artifact/
@@ -110,14 +159,23 @@ jobs:
           cp LICENSE README.md final-artifact/
           # Copy .gdextension
           cp demo/bin/native-video.gdextension final-artifact/
-          
+
       - name: Upload final artifact
         uses: actions/upload-artifact@v4
         with:
           name: native-video
           path: final-artifact/**
-          
+
       - name: Delete individual artifacts
         uses: geekyeggo/delete-artifact@v5
         with:
           name: native-video-*
+
+      - name: Attach zip to GitHub Release
+        if: inputs.release-tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          (cd final-artifact && zip -r "../native-video-${RELEASE_TAG}.zip" .)
+          gh release upload "$RELEASE_TAG" "native-video-${RELEASE_TAG}.zip" --clobber
