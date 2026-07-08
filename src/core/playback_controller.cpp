@@ -9,6 +9,7 @@
 #include "present_selector.h"
 
 #include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <thread>
 
@@ -316,29 +317,41 @@ void PlaybackController::apply_scrub_resolve(const ScrubResolve &resolve) {
 	if (resolve.mode == ResolveMode::Exact) {
 		// Precise resolve: decode FORWARD past the keyframe to the exact
 		// target, dropping (releasing) every earlier frame so the precise
-		// frame is what the present step shows. Bounded by the clip —
-		// stops at EOS. We drop frames strictly before the target; the
-		// present step then shows the target frame.
+		// frame is what the present step shows. Bounded by the clip — stops at
+		// EOS. We drop frames strictly before the target; the present step
+		// then shows the target frame.
 		//
 		// This runs on the caller's thread only on a settle/resume (not the
-		// hot per-frame path), so a brief wait for the worker to top the
-		// queue up is acceptable. We bound the spin so a stall can never
-		// hang the caller: if the worker has not advanced after
-		// `kMaxSpins`, we give up and let the normal present step finish
-		// converging on the next ticks.
+		// hot per-frame path), so a brief wait for the worker to top the queue
+		// up is acceptable. The wait uses bounded backoff (see kScrubMaxYield
+		// Spins / kScrubMaxSleepSpins in the header): yield a bounded number of
+		// times, then sleep in small increments, then give up and let the
+		// present step converge on the next ticks. A pure yield loop could
+		// hot-loop on a loaded machine.
 		const double eps = 1.0 / 120.0; // ~half a frame at 60fps tolerance
-		constexpr int kMaxSpins = 100000;
-		int empty_spins = 0;
+		int yield_spins = 0;
+		int sleep_spins = 0;
+		const auto sleep_dur = std::chrono::microseconds(
+				static_cast<int64_t>(kScrubSpinSleepMs * 1000.0));
 		for (;;) {
 			std::optional<double> head = sched.peek_head_pts(stream_);
 			if (!head.has_value()) {
-				if (sched.at_end(stream_) || ++empty_spins > kMaxSpins) {
-					break; // EOS before the target, or worker stalled — clamp.
+				if (sched.at_end(stream_)) {
+					break; // EOS before the target — clamp.
 				}
-				std::this_thread::yield(); // queue momentarily empty; worker tops up
+				if (yield_spins < kScrubMaxYieldSpins) {
+					std::this_thread::yield();
+					++yield_spins;
+				} else if (sleep_spins < kScrubMaxSleepSpins) {
+					std::this_thread::sleep_for(sleep_dur);
+					++sleep_spins;
+				} else {
+					break; // worker stalled — give up, let present step converge.
+				}
 				continue;
 			}
-			empty_spins = 0;
+			yield_spins = 0;
+			sleep_spins = 0;
 			if (*head + eps >= target) {
 				break; // head is at/after the target — leave it for the present step
 			}
