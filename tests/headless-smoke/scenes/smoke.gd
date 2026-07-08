@@ -60,6 +60,7 @@ var _phase_start_ms := 0
 # AudioEffectCapture setup
 var _capture: AudioEffectCapture
 var _capture_bus_idx := -1
+var _audio_driver := ""
 
 
 # ===================================================
@@ -68,9 +69,10 @@ var _capture_bus_idx := -1
 
 func _ready():
 	print("=== Headless Smoke Suite ===")
+	_audio_driver = AudioServer.get_driver_name()
 	print("[SETUP] platform=%s audio_driver=%s" % [
 		OS.get_name(),
-		AudioServer.get_driver_name(),
+		_audio_driver,
 	])
 
 	# --- Set up AudioEffectCapture on Master bus ---
@@ -276,7 +278,13 @@ func _run_phase1():
 		if ok:
 			print("[PASS] Group 5 — Sync Ladder frequency tracks playback position")
 	else:
-		_fail("Could not capture frequency samples for Group 5")
+		# Under a Dummy audio driver AudioEffectCapture never produces frames
+		# because the mixer is never clocked — skip instead of failing.
+		# Under any real driver this is a genuine failure.
+		if _audio_driver.to_lower() == "dummy":
+			print("[SKIP] Group 5 — AudioEffectCapture empty under Dummy audio driver")
+		else:
+			_fail("Could not capture frequency samples for Group 5")
 
 
 # ===================================================
@@ -341,9 +349,10 @@ func _run_phase2():
 
 func _assert_post_switch_freq(pre: Dictionary, post: Dictionary):
 	if pre.freq < 0 or post.freq < 0:
-		# Frequency capture failed — not a hard failure if capture is
-		# impossible, but log it.
-		print("[INFO] Group 6 skipped — frequency samples not available")
+		if _audio_driver.to_lower() == "dummy":
+			print("[SKIP] Group 6 — frequency samples unavailable under Dummy audio driver")
+		else:
+			_fail("Could not capture frequency samples for Group 6")
 		return
 
 	var ok := true

@@ -259,7 +259,9 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile godot.zip
           New-Item -ItemType Directory -Force -Path .godot | Out-Null
           Expand-Archive -Path godot.zip -DestinationPath .godot
-          Get-ChildItem .godot/Godot*.exe | Rename-Item -NewName "Godot.exe" -Force
+          # Pick the main exe (not the console variant) and rename to Godot.exe.
+          $godotExe = Get-ChildItem .godot/Godot*.exe | Where-Object { $_.Name -notmatch 'console' } | Select-Object -First 1
+          if ($godotExe.Name -ne "Godot.exe") { Rename-Item -LiteralPath $godotExe.FullName -NewName "Godot.exe" }
           Remove-Item godot.zip
           Get-ChildItem .godot/Godot.exe
 
