@@ -1,5 +1,6 @@
 #include "vendor/doctest.h"
 
+#include "../../src/core/canonical_mix_format.h"
 #include "../../src/core/playback_controller.h"
 #include "../../src/core/wall_clock.h"
 
@@ -644,6 +645,77 @@ TEST_CASE("accepted-vs-real: silence offered during underrun is never counted as
 }
 
 // -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// derive_canonical_mix_format — the pure, scheduler-free half of load().
+// These exercise the derivation directly against a mock Backend WITHOUT
+// constructing a PlaybackController (and therefore without the
+// DecodeScheduler::instance() singleton the controller registers with). They
+// are the executable spec the load()-level tests above only approximate.
+// -----------------------------------------------------------------------
+
+TEST_CASE("derive_canonical_mix_format: max channel count across tracks; first audio-bearing rate wins") {
+	auto backend = std::make_unique<MultiTrackFakeBackend>(std::vector<MultiTrackFakeBackend::TrackSpec>{
+			{1, 44100}, // track 0: default -> canonical rate
+			{2, 48000}, // track 1: more channels, differing rate
+			{6, 44100}, // track 2: matches canonical rate
+	});
+
+	const core::CanonicalMixFormat fmt = core::derive_canonical_mix_format(*backend);
+
+	CHECK(fmt.has_audio);
+	CHECK(fmt.channels == 6); // max across tracks
+	CHECK(fmt.sample_rate == 44100); // first audio-bearing track
+	REQUIRE(fmt.track_infos.size() == 3);
+	CHECK(fmt.track_infos[2].sample_rate == 44100);
+}
+
+TEST_CASE("derive_canonical_mix_format: mixed sample rate warns exactly once, later matching tracks silent") {
+	auto backend = std::make_unique<MultiTrackFakeBackend>(std::vector<MultiTrackFakeBackend::TrackSpec>{
+			{1, 44100}, {2, 48000}, {6, 44100}, {2, 48000},
+	});
+
+	const core::CanonicalMixFormat fmt = core::derive_canonical_mix_format(*backend);
+
+	REQUIRE(fmt.warnings.size() == 1);
+	CHECK(fmt.warnings[0].find("differs from the canonical rate") != std::string::npos);
+}
+
+TEST_CASE("derive_canonical_mix_format: a silent clip (no tracks) yields no audio and no warnings") {
+	auto backend = std::make_unique<MultiTrackFakeBackend>(std::vector<MultiTrackFakeBackend::TrackSpec>{});
+
+	const core::CanonicalMixFormat fmt = core::derive_canonical_mix_format(*backend);
+
+	CHECK_FALSE(fmt.has_audio);
+	CHECK(fmt.channels == 0);
+	CHECK(fmt.sample_rate == 0);
+	CHECK(fmt.warnings.empty());
+}
+
+TEST_CASE("derive_canonical_mix_format: channel count clamped to kMaxMixSourceChannels") {
+	auto backend = std::make_unique<MultiTrackFakeBackend>(
+			std::vector<MultiTrackFakeBackend::TrackSpec>{ { 8, 48000 } }); // 8ch exceeds the 6ch cap
+
+	const core::CanonicalMixFormat fmt = core::derive_canonical_mix_format(*backend);
+
+	CHECK(fmt.channels == core::kMaxMixSourceChannels);
+}
+
+TEST_CASE("derive_canonical_mix_format: track metadata without sample-rate audio is still collected") {
+	// A track reporting channels but sample_rate==0 is treated as non-audio-
+	// bearing (no canonical rate contribution) but still appears in track_infos
+	// so mid-stream validation has its metadata.
+	auto backend = std::make_unique<MultiTrackFakeBackend>(std::vector<MultiTrackFakeBackend::TrackSpec>{
+			{2, 0},
+	});
+
+	const core::CanonicalMixFormat fmt = core::derive_canonical_mix_format(*backend);
+
+	CHECK_FALSE(fmt.has_audio);
+	CHECK(fmt.sample_rate == 0);
+	CHECK(fmt.channels == 2); // channel count is still tracked
+	REQUIRE(fmt.track_infos.size() == 1);
+}
+
 // Canonical Mix Format. "load() derives the Canonical Mix Format and warns
 // once on a mixed sample rate" above covers the first-track-rate and
 // one-time-warning branches; this covers the channel clamp and the

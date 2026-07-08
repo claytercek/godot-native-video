@@ -47,6 +47,7 @@
 
 #include "audio_ring.h"
 #include "backend.h"
+#include "canonical_mix_format.h"
 #include "clock.h"
 #include "decode_scheduler.h"
 #include "scrubber.h"
