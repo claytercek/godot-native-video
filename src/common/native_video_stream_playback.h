@@ -78,9 +78,9 @@ protected:
 	static void _bind_methods();
 
 private:
-	// Monotonic wall-clock milliseconds for the Scrubber's velocity/debounce timing
+	// Monotonic wall-clock timestamp for the Scrubber's velocity/debounce timing
 	// (independent of media time, which jumps around during a scrub).
-	static double now_ms();
+	static core::WallClockMs now_ms();
 
 	// Prints any warnings the controller has queued since the last drain
 	// (out-of-range track index, a mixed-sample-rate clip, a failed
