@@ -14,16 +14,7 @@ on:
       - ".github/godot-version"
       - ".github/workflows/core-tests.yml"
   pull_request:
-    paths:
-      - "src/core/**"
-      - "src/backends/**"
-      - "src/common/**"
-      - "tests/**"
-      - "tools/**"
-      - "SConstruct"
-      - ".gitmodules"
-      - ".github/godot-version"
-      - ".github/workflows/core-tests.yml"
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
