@@ -25,6 +25,8 @@ jobs:
             { platform: macos, arch: universal, os: macos-latest },
             { platform: ios, arch: arm64, os: macos-latest },
             { platform: windows, arch: x86_64, os: windows-latest },
+            { platform: windows, arch: x86_32, os: windows-latest },
+            { platform: windows, arch: arm64, os: windows-latest },
           ]
         target-type: [template_debug, template_release]
 
@@ -67,61 +69,6 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item bin/* -Include *.exp,*.lib,*.pdb -Force
-
-      # --- macOS code signing + notarization -------------------------------
-      # Runs only when the Apple signing secrets are configured; skipped
-      # cleanly otherwise so forks and secret-less runs still build.
-      # iOS is intentionally NOT signed here: frameworks are re-signed by the
-      # consuming project's own certificate at export time.
-      #
-      # Required repository secrets:
-      #   APPLE_CERT_BASE64            base64-encoded Developer ID Application .p12
-      #   APPLE_CERT_PASSWORD          password for the .p12
-      #   APPLE_ID                     Apple ID email used for notarization
-      #   APPLE_TEAM_ID                10-character team identifier
-      #   APPLE_APP_SPECIFIC_PASSWORD  app-specific password for the Apple ID
-
-      - name: Import Developer ID certificate
-        if: matrix.target.platform == 'macos' && env.APPLE_CERT_BASE64 != ''
-        shell: bash
-        env:
-          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          KEYCHAIN_PASS=$(uuidgen)
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          echo "$APPLE_CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERT_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          rm -f "$RUNNER_TEMP/cert.p12"
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          security set-key-partition-list -S apple-tool:,apple: -s \
-            -k "$KEYCHAIN_PASS" "$KEYCHAIN" > /dev/null
-
-      - name: Sign and notarize dylib
-        if: matrix.target.platform == 'macos' && env.APPLE_CERT_BASE64 != ''
-        shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-        run: |
-          codesign --force --timestamp --options runtime \
-            --sign "Developer ID Application" bin/macos/*.dylib
-          codesign --verify --verbose bin/macos/*.dylib
-
-          # Notarization tickets cannot be stapled to bare dylibs; Gatekeeper
-          # verifies them via an online lookup instead, so submitting the
-          # signed dylibs is sufficient.
-          ditto -c -k --keepParent bin/macos "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait
-      # ----------------------------------------------------------------------
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
