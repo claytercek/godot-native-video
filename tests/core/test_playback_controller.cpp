@@ -617,6 +617,45 @@ TEST_CASE("one-clock rule: audio exhaustion falls back to the render delta exact
 	controller.shutdown();
 }
 
+TEST_CASE("one-clock rule: the transition tick (drained AND exhausted) advances by real frames only, not real+delta") {
+	// Pin the exact hazard the named helper exists to prevent: a tick where
+	// drive_audio() returns true (real frames consumed) AND audio_exhausted()
+	// becomes true on the SAME tick. The rule must advance by the real frames
+	// only — adding the render delta on top would double-advance. ShortAudioBackend
+	// yields one 100-frame chunk; AcceptAllMixSink drains it in a single tick, so
+	// tick 1 is both a real advance and the moment of exhaustion.
+	PlaybackController controller;
+	controller.load(std::make_unique<ShortAudioBackend>(/*total_frames=*/100), 0.0);
+	controller.play(WallClockMs(0.0));
+	AcceptAllMixSink sink;
+
+	// A huge render delta: if the transition tick stacked it on top of the 100
+	// real frames, media_time would be off by ~1s rather than ~2ms.
+	controller.tick(/*delta_seconds=*/1.0, WallClockMs(16.6), sink);
+
+	CHECK(controller.media_time() == doctest::Approx(100.0 / 48000.0).epsilon(0.01));
+
+	controller.shutdown();
+}
+
+TEST_CASE("one-clock rule: a partial drain that leaves audio remaining does NOT trigger the delta fallback") {
+	// The other side of the rule: when drive_audio() consumes real frames but
+	// audio is NOT yet exhausted (ring still has samples), the delta fallback
+	// must stay off — the clock advances by the accepted real frames only.
+	PlaybackController controller;
+	controller.load(std::make_unique<ShortAudioBackend>(/*total_frames=*/1000), 0.0);
+	controller.play(WallClockMs(0.0));
+	// Accept far fewer than the 1000-frame chunk so the ring is NOT empty after.
+	CappedMixSink sink(/*accept_cap=*/100);
+
+	controller.tick(/*delta_seconds=*/1.0, WallClockMs(16.6), sink);
+
+	// Accepted 100 real frames, ring still has 900 — not exhausted, so no delta.
+	CHECK(controller.media_time() == doctest::Approx(100.0 / 48000.0).epsilon(0.01));
+
+	controller.shutdown();
+}
+
 // -----------------------------------------------------------------------
 // Accepted-vs-real frame accounting. "drive_audio advances the clock by only
 // the accepted-and-real frame count" above covers the back-pressure
