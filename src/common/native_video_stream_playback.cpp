@@ -131,11 +131,11 @@ double NativeVideoStreamPlayback::_get_playback_position() const {
 	return controller_.position();
 }
 
-double NativeVideoStreamPlayback::now_ms() {
+core::WallClockMs NativeVideoStreamPlayback::now_ms() {
 	// Monotonic wall clock for scrub velocity/debounce. steady_clock never jumps.
 	using clock = std::chrono::steady_clock;
 	const auto t = clock::now().time_since_epoch();
-	return std::chrono::duration<double, std::milli>(t).count();
+	return core::WallClockMs(std::chrono::duration<double, std::milli>(t).count());
 }
 
 void NativeVideoStreamPlayback::_seek(double time) {

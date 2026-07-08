@@ -50,6 +50,7 @@
 #include "clock.h"
 #include "decode_scheduler.h"
 #include "scrubber.h"
+#include "wall_clock.h"
 
 namespace core {
 
@@ -112,10 +113,7 @@ public:
 
 	// --- Transport ---
 
-	// `now_ms` is the caller's monotonic wall-clock milliseconds, used only
-	// to force an exact scrub resolve when resuming from a keyframe-scrubbed
-	// position (same injected-time pattern as Scrubber).
-	void play(double now_ms);
+	void play(WallClockMs now);
 	void stop();
 	void set_paused(bool paused);
 	bool is_playing() const { return playing_; }
@@ -133,9 +131,8 @@ public:
 
 	// --- Seek / scrub ---
 	//
-	// Feeds the scrubber and applies the resulting resolve (keyframe or
-	// exact). `now_ms` is the caller's monotonic wall-clock milliseconds.
-	void seek(double time_seconds, double now_ms);
+	// Feeds the scrubber and applies the resulting resolve (keyframe or exact).
+	void seek(double time_seconds, WallClockMs now);
 
 	// --- Audio track selection ---
 	//
@@ -155,7 +152,7 @@ public:
 	// any — the caller performs the actual GPU present and owns the frame's
 	// release() from here on. A no-op (returns nullopt) when not loaded, not
 	// playing, or paused.
-	std::optional<VideoFrame> tick(double delta_seconds, double now_ms, MixSink &sink);
+	std::optional<VideoFrame> tick(double delta_seconds, WallClockMs now, MixSink &sink);
 
 	// --- Diagnostics ---
 	//
