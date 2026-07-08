@@ -55,6 +55,19 @@
 
 namespace core {
 
+// Bounded backoff for the Exact-resolve forward-decode spin in
+// apply_scrub_resolve(). The spin waits for the decode pool worker to top
+// the queue up to the exact scrub target. A pure yield loop (the old
+// kMaxSpins=100000) can hot-loop on a loaded machine; instead we yield a
+// bounded number of times (cheap, sub-ms latency), then sleep in small
+// increments (bounded CPU), then give up and let the present step converge
+// on the next ticks. Total wall-clock ceiling is roughly
+// kScrubMaxYieldSpins yields + kScrubMaxSleepSpins * kScrubSpinSleep.
+inline constexpr int kScrubMaxYieldSpins = 100;
+inline constexpr int kScrubMaxSleepSpins = 1000;
+// 0.1 ms per sleep iteration — responsive without burning a core.
+inline constexpr double kScrubSpinSleepMs = 100.0;
+
 // -----------------------------------------------------------------------
 // MixSink — the one Godot-touching seam the controller calls through.
 //
