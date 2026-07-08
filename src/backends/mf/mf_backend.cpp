@@ -502,7 +502,11 @@ bool MfBackend::seek(double pts_seconds) {
 	// at or before the requested time; subsequent ReadSample calls resume there.
 	PROPVARIANT pos;
 	InitPropVariantFromInt64(seconds_to_mf_ticks(pts_seconds), &pos);
-	HRESULT hr = impl_->reader->SetCurrentPosition(GUID_NULL, pos);
+	// MinGW's import libs don't always provide storage for the GUID_NULL
+	// symbol (MSVC gets it from uuid.lib); a zero-initialized GUID is
+	// semantically identical and sidesteps the link error.
+	const GUID null_guid = { 0, 0, 0, { 0, 0, 0, 0, 0, 0, 0, 0 } };
+	HRESULT hr = impl_->reader->SetCurrentPosition(null_guid, pos);
 	PropVariantClear(&pos);
 	if (FAILED(hr)) {
 		impl_->error = true;

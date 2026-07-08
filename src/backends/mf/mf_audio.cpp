@@ -176,7 +176,11 @@ bool MfBackend::Impl::build_audio_reader(int track_index, double start_time) {
 	// compressed audio frames are all sync points, so this is ~exact).
 	PROPVARIANT pos;
 	InitPropVariantFromInt64(seconds_to_mf_ticks(start_time), &pos);
-	hr = ar->SetCurrentPosition(GUID_NULL, pos);
+	// MinGW's import libs don't always provide storage for the GUID_NULL
+	// symbol (MSVC gets it from uuid.lib); a zero-initialized GUID is
+	// semantically identical and sidesteps the link error.
+	const GUID null_guid = { 0, 0, 0, { 0, 0, 0, 0, 0, 0, 0, 0 } };
+	hr = ar->SetCurrentPosition(null_guid, pos);
 	PropVariantClear(&pos);
 	if (FAILED(hr)) {
 		return false;
