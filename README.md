@@ -51,13 +51,26 @@ Highlights:
 
 ## Scope
 
-v1 targets the **8-bit SDR core matrix**, tested identically on macOS and
-Windows:
+v1 targets the matrix below, tested identically on macOS and Windows:
 
-- **Codecs:** H.264, HEVC (with the per-platform caveat below).
+- **Codecs:** H.264, HEVC (Main and Main10).
 - **Containers:** MP4, MOV — the loader registers `.mp4`, `.mov`, and `.m4v`.
-- **Pixel format:** NV12, BT.709.
-- **Audio:** AAC, stereo.
+- **Pixel formats:** NV12 (8-bit) and x420 / P010 (10-bit), negotiated to
+  match the source's bit depth — `x420` biplanar on macOS, `P010` on Windows.
+  The conversion shader normalises 10-bit payloads in 16-bit GPU words; a
+  BGRA8 software path exists as a fallback.
+- **Colorimetry:** BT.709, BT.601, and BT.2020 YCbCr matrices; BT.709 /
+  BT.601 / BT.2020 / DCI-P3 primaries; BT.709, PQ (ST 2084 / HDR10), and HLG
+  transfer functions; video and full range. Unspecified fields default to
+  BT.709, video range.
+- **HDR:** PQ/HLG clips tone-map to watchable SDR by default, or output
+  scene-linear HDR (RGBA16F, 1.0 = 203-nit Reference White per BT.2408) when
+  the stream's `output_mode` is set to HDR.
+- **Audio:** AAC, decoded to interleaved float32 PCM. Mono, stereo, and 5.1
+  sources are channel-mixed to the clip's canonical output format.
+- **Multi-track audio:** supported — enumerate tracks with
+  `NativeVideoStream.get_audio_tracks()` and select one via
+  `VideoStreamPlayer.audio_track`, either before `play()` or mid-playback.
 
 Decoding is delegated to the OS, so what actually plays depends on the
 platform — and on Windows, on the machine:
@@ -70,8 +83,11 @@ platform — and on Windows, on the machine:
 Beyond the matrix, the extension will attempt to play anything the OS can
 decode, as long as it arrives in one of the registered container extensions
 above. Such content may well work, but only the matrix is tested and
-contractually supported. **Out of scope for v1:** 10-bit / HDR (P010,
-PQ/HLG), VP9/AV1, and multi-track audio — these are tracked as follow-ups.
+contractually supported.
+
+**Out of scope for v1:** VP9/AV1. **Known limitation:** mixed-sample-rate
+clips — the first audio track's sample rate wins, and a mid-stream switch to
+a track with a differing rate is refused.
 
 ## Platform Support
 
@@ -106,10 +122,8 @@ readback before present — the sole, explicit exception to the zero-copy
 contract, and the only drawback of that path.
 
 The Vulkan zero-copy path stays hard-disabled on stock Godot because the
-engine does not enable `VK_KHR_external_memory_win32` on its Vulkan device,
-and even with PR #114940, `texture_create_from_extension`'s hardcoded `COLOR`
-aspect mis-binds the NV12 plane views until godot-proposals#13969 lands
-upstream.
+engine does not enable `VK_KHR_external_memory_win32` on its Vulkan device, and `texture_create_from_extension`'s hardcoded `COLOR`
+aspect mis-binds the NV12 plane views. See #4.
 
 ## Installation
 
