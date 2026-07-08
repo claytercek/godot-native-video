@@ -68,7 +68,12 @@ jobs:
         if: ${{ matrix.target.platform == 'windows' }}
         shell: pwsh
         run: |
-          Remove-Item bin/* -Include *.exp,*.lib,*.pdb -Force
+          # The SharedLibrary target writes the .dll plus linker byproducts
+          # (.lib/.exp import libs for MSVC, .a archives for MinGW/arm64,
+          # .pdb debug info) into bin/windows/. Sweep the whole bin tree so
+          # none of them ship in the release artifact — only the .dll should.
+          Get-ChildItem -Path bin -Recurse -Include *.exp,*.lib,*.a,*.pdb -File |
+            Remove-Item -Force
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
