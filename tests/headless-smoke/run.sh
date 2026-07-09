@@ -43,7 +43,7 @@ else
     LIB_FILE="${LIB_NAME}.${PLATFORM}.${SUFFIX}.x86_64.dll"
 fi
 LIB_SRC="$REPO_ROOT/bin/$PLATFORM/$LIB_FILE"
-LIB_DST="$TEST_PROJECT/bin/$PLATFORM/$LIB_FILE"
+LIB_DST="$TEST_PROJECT/addons/native-video/$PLATFORM/$LIB_FILE"
 
 # --- 1. Generate multi-track clip -----------------------------------------
 if [ ! -f "$CLIP" ]; then

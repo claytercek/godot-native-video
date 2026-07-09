@@ -327,8 +327,8 @@ library = env.SharedLibrary(
     source=sources,
 )
 
-copy = env.Install("{}/bin/{}/".format(projectdir, env["platform"]), library)
-smoke_copy = env.Install("tests/headless-smoke/bin/{}/".format(env["platform"]), library)
+copy = env.Install("{}/addons/native-video/{}/".format(projectdir, env["platform"]), library)
+smoke_copy = env.Install("tests/headless-smoke/addons/native-video/{}/".format(env["platform"]), library)
 
 default_args = [library, copy, smoke_copy]
 Default(*default_args)

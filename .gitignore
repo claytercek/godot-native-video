@@ -2,9 +2,9 @@
 *.gen.*
 .godot/
 
-# Ignore library files but not the gdextension file
-demo/bin/*
-!demo/bin/*.gdextension
+# Ignore built library files but keep the .gdextension manifest.
+demo/addons/native-video/*
+!demo/addons/native-video/*.gdextension
 .sconsign*.dblite
 
 # Ignore custom.py
@@ -72,6 +72,7 @@ demo/synthetic.mp4.uid
 tests/headless-smoke/synthetic.mp4
 tests/headless-smoke/synthetic.mov
 tests/headless-smoke/synthetic.m4v
+tests/headless-smoke/addons/native-video/*
+!tests/headless-smoke/addons/native-video/*.gdextension
 tests/headless-smoke/**/*.uid
 tests/headless-smoke/*.uid
-tests/headless-smoke/bin/

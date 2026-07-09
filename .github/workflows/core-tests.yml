@@ -285,7 +285,7 @@ jobs:
       - name: Verify library installed
         shell: bash
         run: |
-          test -f "tests/headless-smoke/bin/${{ matrix.platform }}/${{ matrix.lib-name }}" && \
+          test -f "tests/headless-smoke/addons/native-video/${{ matrix.platform }}/${{ matrix.lib-name }}" && \
             echo "Library installed to smoke project"
 
       - name: Download test media

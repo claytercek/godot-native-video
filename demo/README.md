@@ -28,7 +28,7 @@ A stock Godot `VideoStreamPlayer` plays a clip through this extension:
   zero-copy present path has no CPU fallback.
 - A platform with a supported backend: **macOS** (AVFoundation) or **Windows**
   (Media Foundation).
-- The built library installed into `demo/bin/<platform>/` by SCons.
+- The built library installed into `demo/addons/native-video/<platform>/` by SCons.
 
 ## Run it
 
@@ -38,7 +38,7 @@ A stock Godot `VideoStreamPlayer` plays a clip through this extension:
    scons target=template_debug platform=macos    # or platform=windows
    ```
 
-   This installs the library into `demo/bin/<platform>/`.
+   This installs the library into `demo/addons/native-video/<platform>/`.
 
 2. Provide a clip. Either point `clip_path` (exported on the demo scene root) at
    any `.mp4/.mov/.m4v` the OS can decode, or generate the synthetic marker

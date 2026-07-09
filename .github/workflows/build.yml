@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Platforms match the entries declared in demo/bin/native-video.gdextension.
+        # Platforms match the entries declared in demo/addons/native-video/native-video.gdextension.
         # Single precision only: the .gdextension ships no double-precision
         # entries (known limitation).
         target:
@@ -102,15 +102,17 @@ jobs:
 
       - name: Create final artifact structure
         run: |
-          mkdir -p final-artifact
-          # Copy contents of each artifact into final-artifact
+          # Godot Asset Library requires plug-in contents under
+          # addons/<addon name>/. The .gdextension, per-platform lib dirs,
+          # LICENSE, and README all live there.
+          mkdir -p final-artifact/addons/native-video
+          # Copy contents of each artifact into the addon folder
           for dir in artifacts/native-video-*; do
-            cp -r "$dir"/* final-artifact/
+            cp -r "$dir"/* final-artifact/addons/native-video/
           done
-          # Copy LICENSE and README.md to root of final artifact
-          cp LICENSE README.md final-artifact/
-          # Copy .gdextension
-          cp demo/bin/native-video.gdextension final-artifact/
+          # Copy LICENSE, README.md, and .gdextension into the addon folder
+          cp LICENSE README.md final-artifact/addons/native-video/
+          cp demo/addons/native-video/native-video.gdextension final-artifact/addons/native-video/
 
       - name: Upload final artifact
         uses: actions/upload-artifact@v4
