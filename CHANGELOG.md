@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/claytercek/godot-native-video/compare/v0.1.0...v0.2.0) (2026-07-09)
+
+
+### Features
+
+* **build:** move plugin contents under addons/native-video ([e22d154](https://github.com/claytercek/godot-native-video/commit/e22d1546b78a7b062307d90e3af9332b701deaf8))
+
+
+### Bug Fixes
+
+* **ci:** strip windows linker byproducts from artifact ([cd383ce](https://github.com/claytercek/godot-native-video/commit/cd383ceaf137fed4e81cc6886939912be1cb04ce))
+
 ## [0.1.0](https://github.com/claytercek/godot-native-video/compare/v0.1.0...v0.1.0) (2026-07-08)
 
 
