@@ -14,6 +14,8 @@
 
 #include "../core/backend.h" // core::PixelFormat
 
+#include <godot_cpp/variant/utility_functions.hpp>
+
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 
@@ -25,8 +27,12 @@ namespace native_video {
 // stay plain C++; freed in MetalSurfaceImporter::~MetalSurfaceImporter.
 struct MetalSurfaceImporter::Impl {
 	RenderingDevice *rd = nullptr;
-	id<MTLDevice> device = nil;             // borrowed: Godot owns it
+	id<MTLDevice> device = nil; // borrowed: Godot owns it
 	CVMetalTextureCacheRef texture_cache = nullptr; // owned (+1)
+	// Some Godot drivers (4.7's metal-cpp rewrite) release imported MTLTextures
+	// they never retained; when true, import_plane hands the driver a spare
+	// reference. Detected at initialize() by probing the live driver.
+	bool donate_reference_to_godot = false;
 
 	~Impl() {
 		if (texture_cache) {
@@ -37,6 +43,57 @@ struct MetalSurfaceImporter::Impl {
 		device = nil;
 	}
 };
+
+// Godot 4.7 rewrote the Metal RD driver onto metal-cpp and lost refcount
+// balance for imported textures: texture_create_from_extension no longer
+// retains the MTLTexture when the format already matches (it did in <= 4.6 via
+// rid::make's __bridge_retained), but texture_free still releases it
+// unconditionally, deallocating the texture out from under its real owner.
+//
+// Rather than gate on version numbers — which can't tell a fixed 4.7.x from a
+// broken one — probe the live driver: hand it a throwaway texture and watch
+// the refcount across texture_create_from_extension. A balanced driver
+// retains on import; the broken one leaves the count untouched. Returns true
+// when the driver will consume a reference it never took, i.e. every import
+// must donate one. CFGetRetainCount is unreliable for managing one's own
+// references, but measuring whether a foreign call took ownership is the one
+// job it does deterministically: nothing else can touch this texture between
+// the two reads.
+static bool driver_steals_import_reference(RenderingDevice *rd, id<MTLDevice> device) {
+	MTLTextureDescriptor *desc =
+			[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+															   width:1
+															  height:1
+														   mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead;
+	id<MTLTexture> probe = [device newTextureWithDescriptor:desc];
+	if (probe == nil) {
+		// Can't probe. Assume broken: donating on a balanced driver leaks, but
+		// not donating on the broken one crashes.
+		return true;
+	}
+
+	const CFIndex before = CFGetRetainCount((__bridge CFTypeRef)probe);
+	RID rid = rd->texture_create_from_extension(
+			RenderingDevice::TEXTURE_TYPE_2D,
+			RenderingDevice::DATA_FORMAT_R8_UNORM,
+			RenderingDevice::TEXTURE_SAMPLES_1,
+			RenderingDevice::TEXTURE_USAGE_SAMPLING_BIT,
+			reinterpret_cast<int64_t>((__bridge void *)probe),
+			1, 1, 1, 1);
+	if (!rid.is_valid()) {
+		return true; // import path is broken anyway; pick the crash-safe default
+	}
+	const bool steals = CFGetRetainCount((__bridge CFTypeRef)probe) <= before;
+
+	// Freeing the probe RID triggers the driver's (possibly unbalanced)
+	// release, so the probe texture needs the same donation real imports get.
+	if (steals) {
+		CFRetain((__bridge CFTypeRef)probe);
+	}
+	rd->free_rid(rid);
+	return steals;
+}
 
 MetalSurfaceImporter::MetalSurfaceImporter() = default;
 
@@ -75,6 +132,13 @@ bool MetalSurfaceImporter::initialize(RenderingDevice *rd) {
 		return false;
 	}
 	impl->texture_cache = cache;
+
+	impl->donate_reference_to_godot = driver_steals_import_reference(rd, impl->device);
+	UtilityFunctions::print_verbose(String("[native-video] Metal import ownership probe: ") +
+			(impl->donate_reference_to_godot
+							? "driver over-releases; donating a reference per imported plane"
+							: "driver is balanced"));
+
 	impl_ = impl;
 	return true;
 }
@@ -89,7 +153,7 @@ bool MetalSurfaceImporter::is_initialized() const {
 static RID import_plane(RenderingDevice *rd, CVMetalTextureCacheRef cache,
 		CVPixelBufferRef pb, size_t plane,
 		RenderingDevice::DataFormat fmt, MTLPixelFormat mtl_fmt,
-		CVMetalTextureRef *out_cv_tex) {
+		bool donate_reference, CVMetalTextureRef *out_cv_tex) {
 	*out_cv_tex = nullptr;
 
 	const size_t w = CVPixelBufferGetWidthOfPlane(pb, plane);
@@ -129,11 +193,20 @@ static RID import_plane(RenderingDevice *rd, CVMetalTextureCacheRef cache,
 			mtl_handle,
 			static_cast<int64_t>(w),
 			static_cast<int64_t>(h),
-			1,  // depth
+			1, // depth
 			1); // layers
 	if (!rid.is_valid()) {
 		CFRelease(cv_tex);
 		return RID();
+	}
+
+	// An unbalanced driver (see driver_steals_import_reference) releases this
+	// MTLTexture in texture_free without ever retaining it. Without the
+	// donated reference, free_rid over-releases the texture out from under
+	// the CVMetalTextureCache and the next import crashes on the recycled
+	// object (Metal abort or SIGSEGV).
+	if (donate_reference) {
+		CFRetain((__bridge CFTypeRef)mtl_tex);
 	}
 
 	*out_cv_tex = cv_tex; // hand ownership to the caller's release closure
@@ -172,23 +245,25 @@ PlaneTextures MetalSurfaceImporter::import(void *cv_pixel_buffer, uint32_t /*pla
 	RID luma;
 	RID chroma;
 
+	const bool donate = impl_->donate_reference_to_godot;
+
 	if (is_10bit) {
 		// 10-bit biplanar: each sample stored in 16 bits (lower 10 bits valid).
 		// Metal texture: R16Unorm luma, RG16Unorm interleaved chroma.
 		luma = import_plane(rd, cache, pb, 0,
 				RenderingDevice::DATA_FORMAT_R16_UNORM,
-				MTLPixelFormatR16Unorm, &cv_luma);
+				MTLPixelFormatR16Unorm, donate, &cv_luma);
 		chroma = import_plane(rd, cache, pb, 1,
 				RenderingDevice::DATA_FORMAT_R16G16_UNORM,
-				MTLPixelFormatRG16Unorm, &cv_chroma);
+				MTLPixelFormatRG16Unorm, donate, &cv_chroma);
 	} else {
 		// 8-bit NV12: each sample a single byte. R8 + RG8.
 		luma = import_plane(rd, cache, pb, 0,
 				RenderingDevice::DATA_FORMAT_R8_UNORM,
-				MTLPixelFormatR8Unorm, &cv_luma);
+				MTLPixelFormatR8Unorm, donate, &cv_luma);
 		chroma = import_plane(rd, cache, pb, 1,
 				RenderingDevice::DATA_FORMAT_R8G8_UNORM,
-				MTLPixelFormatRG8Unorm, &cv_chroma);
+				MTLPixelFormatRG8Unorm, donate, &cv_chroma);
 	}
 
 	if (!luma.is_valid()) {
