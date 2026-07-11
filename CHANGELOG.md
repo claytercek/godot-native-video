@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/claytercek/godot-native-video/compare/v0.2.0...v0.2.1) (2026-07-11)
+
+
+### Bug Fixes
+
+* **macos:** compensate Godot 4.7 Metal texture over-release ([a2e1e04](https://github.com/claytercek/godot-native-video/commit/a2e1e04cdedb5a0701ca1d4d6e47d586f496dec0))
+
 ## [0.2.0](https://github.com/claytercek/godot-native-video/compare/v0.1.0...v0.2.0) (2026-07-09)
 
 
