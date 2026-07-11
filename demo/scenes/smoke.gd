@@ -74,6 +74,11 @@ func _ready() -> void:
 	# Query audio track list and populate the selector.
 	display_tracks(_stream)
 
+	# `godot -- --autoplay` starts playback immediately — used by the
+	# non-headless regression test, where nobody can click Play.
+	if OS.get_cmdline_user_args().has("--autoplay"):
+		_on_play_pressed.call_deferred()
+
 
 func _on_toggle_output_mode() -> void:
 	hdr_mode = not hdr_mode
