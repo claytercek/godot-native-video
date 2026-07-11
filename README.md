@@ -127,7 +127,17 @@ aspect mis-binds the NV12 plane views. See #4.
 
 ## Installation
 
-TODO
+### Godot 4.7+ — Asset Store
+
+Install [Native Video](https://store.godotengine.org/asset/claytercek/native-video/)
+from the Godot Asset Store, or search for "Native Video" in the editor's
+AssetLib tab.
+
+### Earlier Godot versions — GitHub Releases
+
+1. Download the latest release zip from
+   [GitHub Releases](https://github.com/claytercek/gdextension-platform-media-streams/releases).
+2. Extract it into your project so the plugin lives at `addons/native-video/`.
 
 ## Development & Contributing
 
