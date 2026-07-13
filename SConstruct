@@ -94,15 +94,33 @@ if ARGUMENTS.get("target", "") == "core_tests":
     # library; everywhere else link pthread.
     if sys.platform != "win32":
         core_env.Append(LIBS=["pthread"])
-    # Allow an ASan build of the core tests to prove the retire-ring is
-    # use-after-free clean:  scons target=core_tests asan=yes
-    # (MSVC supports /fsanitize=address; GCC/Clang use -fsanitize=address.)
-    if ARGUMENTS.get("asan", "") in ("1", "yes", "true"):
+    # Sanitizer flavors of the core tests (mutually exclusive):
+    #   scons target=core_tests asan=yes   — ASan + UBSan (MSVC: ASan only);
+    #                                        proves e.g. the retire-ring is
+    #                                        use-after-free clean.
+    #   scons target=core_tests tsan=yes   — TSan (GCC/Clang only); the
+    #                                        scheduler/frame-queue tests spin
+    #                                        real threads, so races surface.
+    want_asan = ARGUMENTS.get("asan", "") in ("1", "yes", "true")
+    want_tsan = ARGUMENTS.get("tsan", "") in ("1", "yes", "true")
+    if want_asan and want_tsan:
+        print("asan=yes and tsan=yes are mutually exclusive — pick one.")
+        Exit(1)
+    if want_asan:
         if sys.platform == "win32":
             core_env.Append(CXXFLAGS=["/fsanitize=address", "/Zi"])
         else:
-            core_env.Append(CXXFLAGS=["-fsanitize=address", "-fno-omit-frame-pointer", "-g"])
-            core_env.Append(LINKFLAGS=["-fsanitize=address"])
+            # -fno-sanitize-recover makes UBSan findings fatal (non-zero exit)
+            # instead of printed-and-continued, so CI actually fails.
+            san = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+            core_env.Append(CXXFLAGS=san + ["-fno-omit-frame-pointer", "-g"])
+            core_env.Append(LINKFLAGS=san)
+    if want_tsan:
+        if sys.platform == "win32":
+            print("tsan=yes is not supported by MSVC; use a GCC/Clang host.")
+            Exit(1)
+        core_env.Append(CXXFLAGS=["-fsanitize=thread", "-fno-omit-frame-pointer", "-g"])
+        core_env.Append(LINKFLAGS=["-fsanitize=thread"])
     core_tests = core_env.Program("bin/core_tests", core_sources)
     # Belt-and-suspenders: make sure the generated shader header exists before
     # anything in core_tests compiles. The implicit CPPPATH include scanner
