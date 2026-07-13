@@ -96,8 +96,20 @@ jobs:
 
   core-tests:
     # No ffmpeg / test media needed: the Engine Core tests are hermetic.
-    name: Core Tests (macOS)
+    # Three flavors: plain, ASan+UBSan (memory safety / UB), and TSan (the
+    # scheduler and frame-queue tests spin real threads, so races surface).
+    name: Core Tests (macOS, ${{ matrix.flavor }})
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: plain
+            scons-args: ""
+          - flavor: asan+ubsan
+            scons-args: "asan=yes"
+          - flavor: tsan
+            scons-args: "tsan=yes"
 
     steps:
       - name: Checkout
@@ -109,7 +121,7 @@ jobs:
         run: brew install scons
 
       - name: Build Engine Core tests
-        run: scons target=core_tests
+        run: scons target=core_tests ${{ matrix.scons-args }}
 
       - name: Run Engine Core tests
         run: ./bin/core_tests --reporters=console --no-intro
