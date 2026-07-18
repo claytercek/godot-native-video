@@ -1,0 +1,11 @@
+; Zig-port demo/verification project
+config_version=5
+
+[application]
+
+config/name="native-video-zig-demo"
+run/main_scene="res://main.tscn"
+
+[rendering]
+
+renderer/rendering_method="forward_plus"

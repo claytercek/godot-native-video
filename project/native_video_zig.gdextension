@@ -1,0 +1,8 @@
+[configuration]
+entry_symbol = "native_video_init"
+compatibility_minimum = "4.4"
+reloadable = false
+
+[libraries]
+macos.debug = "lib/libnative_video_zig.dylib"
+macos.release = "lib/libnative_video_zig.dylib"

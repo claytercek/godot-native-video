@@ -1,0 +1,16 @@
+.{
+    .name = .native_video_zig,
+    .fingerprint = 0xbad401ad9bad7f1,
+    .version = "0.0.0",
+    .dependencies = .{
+        .gdzig = .{
+            .url = "git+https://github.com/gdzig/gdzig#ba4ef259189cf5c4dc254c0d6eda0e2b643b204d",
+            .hash = "godot-0.0.0-dev-q0GYjmN_CADKUSdG6dsaVy4l-0l6Ag3me7cCIdyPUjST",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
