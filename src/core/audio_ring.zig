@@ -40,7 +40,7 @@ pub const AudioRing = struct {
     /// `channel_count` interleaved channels; `frame_capacity` frames of
     /// head-room.
     pub fn init(allocator: std.mem.Allocator, channel_count: i32, frame_capacity: usize) !AudioRing {
-        const channels: i32 = if (channel_count < 1) 1 else channel_count;
+        const channels: i32 = @max(channel_count, 1);
         const capacity_floats = (frame_capacity + 1) * @as(usize, @intCast(channels));
         const buffer = try allocator.alloc(f32, capacity_floats);
         @memset(buffer, 0.0);
@@ -92,14 +92,14 @@ pub const AudioRing = struct {
     /// channels floats). Stores as many whole frames as fit; returns frames
     /// stored.
     pub fn write(self: *AudioRing, interleaved: []const f32, frame_count: usize) usize {
-        const can = self.freeFrames();
-        const n = if (frame_count < can) frame_count else can;
+        const n = @min(frame_count, self.freeFrames());
         const floats = n * @as(usize, @intCast(self.channels));
-        var i: usize = 0;
-        while (i < floats) : (i += 1) {
-            self.buffer[self.tail] = interleaved[i];
-            self.tail = (self.tail + 1) % self.capacity_floats;
-        }
+        const src = interleaved[0..floats];
+        // Bulk copy in at most two segments (before/after the wrap point).
+        const first = @min(src.len, self.capacity_floats - self.tail);
+        @memcpy(self.buffer[self.tail..][0..first], src[0..first]);
+        @memcpy(self.buffer[0 .. src.len - first], src[first..]);
+        self.tail = (self.tail + floats) % self.capacity_floats;
         return n;
     }
 
@@ -109,20 +109,16 @@ pub const AudioRing = struct {
     /// this to advance the master clock by exactly what the listener will
     /// hear.
     pub fn readFrames(self: *AudioRing, out: []f32, frame_count: usize) usize {
-        const have = self.availableFrames();
-        const real = if (frame_count < have) frame_count else have;
-
         const ch: usize = @intCast(self.channels);
-        // Copy the real frames.
-        var i: usize = 0;
-        while (i < real * ch) : (i += 1) {
-            out[i] = self.buffer[self.head];
-            self.head = (self.head + 1) % self.capacity_floats;
-        }
+        const real = @min(frame_count, self.availableFrames());
+        const floats = real * ch;
+        // Bulk copy out in at most two segments (before/after the wrap point).
+        const first = @min(floats, self.capacity_floats - self.head);
+        @memcpy(out[0..first], self.buffer[self.head..][0..first]);
+        @memcpy(out[first..floats], self.buffer[0 .. floats - first]);
+        self.head = (self.head + floats) % self.capacity_floats;
         // Zero-fill the underrun tail.
-        while (i < frame_count * ch) : (i += 1) {
-            out[i] = 0.0;
-        }
+        @memset(out[floats .. frame_count * ch], 0.0);
         return real;
     }
 };
@@ -130,9 +126,9 @@ pub const AudioRing = struct {
 test "AudioRing starts empty" {
     var r = try AudioRing.init(std.testing.allocator, 2, 1024);
     defer r.deinit();
-    try std.testing.expectEqual(@as(i32, 2), r.channelCount());
+    try std.testing.expectEqual(2, r.channelCount());
     try std.testing.expect(r.empty());
-    try std.testing.expectEqual(@as(usize, 0), r.availableFrames());
+    try std.testing.expectEqual(0, r.availableFrames());
 }
 
 test "AudioRing round-trips interleaved stereo frames" {
@@ -140,11 +136,11 @@ test "AudioRing round-trips interleaved stereo frames" {
     defer r.deinit();
     // 3 stereo frames: L,R per frame.
     const in = [_]f32{ 1, 2, 3, 4, 5, 6 };
-    try std.testing.expectEqual(@as(usize, 3), r.write(&in, 3));
-    try std.testing.expectEqual(@as(usize, 3), r.availableFrames());
+    try std.testing.expectEqual(3, r.write(&in, 3));
+    try std.testing.expectEqual(3, r.availableFrames());
 
     var out = [_]f32{-1.0} ** 6;
-    try std.testing.expectEqual(@as(usize, 3), r.readFrames(&out, 3));
+    try std.testing.expectEqual(3, r.readFrames(&out, 3));
     try std.testing.expectEqualSlices(f32, &in, &out);
     try std.testing.expect(r.empty());
 }
@@ -153,27 +149,27 @@ test "AudioRing underrun produces silence and reports real frame count" {
     var r = try AudioRing.init(std.testing.allocator, 1, 64);
     defer r.deinit();
     const in = [_]f32{ 7, 8 };
-    try std.testing.expectEqual(@as(usize, 2), r.write(&in, 2));
+    try std.testing.expectEqual(2, r.write(&in, 2));
 
     var out = [_]f32{99.0} ** 5;
     // Ask for 5 mono frames but only 2 are available.
     const real = r.readFrames(&out, 5);
-    try std.testing.expectEqual(@as(usize, 2), real);
-    try std.testing.expectApproxEqAbs(@as(f32, 7.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 8.0), out[1], 1e-6);
+    try std.testing.expectEqual(2, real);
+    try std.testing.expectApproxEqAbs(7.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(8.0, out[1], 1e-6);
     // Underrun tail is silence.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[2], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[3], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[4], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[3], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[4], 1e-6);
 }
 
 test "AudioRing full read on empty ring is all silence" {
     var r = try AudioRing.init(std.testing.allocator, 2, 16);
     defer r.deinit();
     var out = [_]f32{1.0} ** 8;
-    try std.testing.expectEqual(@as(usize, 0), r.readFrames(&out, 4));
+    try std.testing.expectEqual(0, r.readFrames(&out, 4));
     for (out) |v| {
-        try std.testing.expectApproxEqAbs(@as(f32, 0.0), v, 1e-6);
+        try std.testing.expectApproxEqAbs(0.0, v, 1e-6);
     }
 }
 
@@ -191,10 +187,10 @@ test "AudioRing clear discards buffered audio" {
     defer r.deinit();
     const in = [_]f32{ 1, 2, 3, 4 };
     _ = r.write(&in, 2);
-    try std.testing.expectEqual(@as(usize, 2), r.availableFrames());
+    try std.testing.expectEqual(2, r.availableFrames());
     r.clear();
     try std.testing.expect(r.empty());
-    try std.testing.expectEqual(@as(usize, 0), r.availableFrames());
+    try std.testing.expectEqual(0, r.availableFrames());
 }
 
 test "AudioRing wraps around correctly" {
@@ -211,7 +207,7 @@ test "AudioRing wraps around correctly" {
     var drained = [_]f32{0.0} ** 16;
     const real = r.readFrames(&drained, 2 + stored);
     try std.testing.expectEqual(2 + stored, real);
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), drained[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 6.0), drained[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), drained[2], 1e-6);
+    try std.testing.expectApproxEqAbs(5.0, drained[0], 1e-6);
+    try std.testing.expectApproxEqAbs(6.0, drained[1], 1e-6);
+    try std.testing.expectApproxEqAbs(10.0, drained[2], 1e-6);
 }

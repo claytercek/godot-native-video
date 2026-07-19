@@ -250,13 +250,13 @@ test "Push constant: does not write past byte 31" {
     const color: backend.Colorimetry = .{}; // default/zero Colorimetry
     packPushConstants(buf[2..], 0, 0, color, 0.0);
     // Guard bytes before the written region must stay untouched.
-    try testing.expectEqual(@as(u8, 0xAB), buf[0]);
-    try testing.expectEqual(@as(u8, 0xAB), buf[1]);
+    try testing.expectEqual(0xAB, buf[0]);
+    try testing.expectEqual(0xAB, buf[1]);
     // Guard bytes after the written region must stay untouched.
-    try testing.expectEqual(@as(u8, 0xAB), buf[push_constant_size + 2]);
-    try testing.expectEqual(@as(u8, 0xAB), buf[push_constant_size + 3]);
+    try testing.expectEqual(0xAB, buf[push_constant_size + 2]);
+    try testing.expectEqual(0xAB, buf[push_constant_size + 3]);
     // The written region (buf[2..34]) is zeroed by memset inside
     // packPushConstants. Spot-check the first and last written bytes.
-    try testing.expectEqual(@as(u8, 0), buf[2]);
-    try testing.expectEqual(@as(u8, 0), buf[2 + push_constant_size - 1]);
+    try testing.expectEqual(0, buf[2]);
+    try testing.expectEqual(0, buf[2 + push_constant_size - 1]);
 }

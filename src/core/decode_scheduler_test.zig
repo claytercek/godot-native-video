@@ -159,8 +159,8 @@ const FakeBackend = struct {
 // -----------------------------------------------------------------------
 test "requiredPoolDepth = queue depth + in-flight + frame latency" {
     // 7 usable queue slots + 1 being presented + 3 retire-ring frames = 11.
-    try std.testing.expectEqual(@as(usize, 11), ds.requiredPoolDepth(7, 3));
-    try std.testing.expectEqual(@as(usize, 2), ds.requiredPoolDepth(0, 1));
+    try std.testing.expectEqual(11, ds.requiredPoolDepth(7, 3));
+    try std.testing.expectEqual(2, ds.requiredPoolDepth(0, 1));
     try std.testing.expectEqual(
         (ds.kDecodeAheadCapacity - 1) + 1 + 3,
         ds.requiredPoolDepth(ds.kDecodeAheadCapacity - 1, 3),
@@ -171,7 +171,7 @@ test "worker count is bounded and independent of stream count" {
     const alloc = std.testing.allocator;
     const sched = try DecodeScheduler.init(alloc, 2, false);
     defer sched.deinit();
-    try std.testing.expectEqual(@as(usize, 2), sched.workerCount());
+    try std.testing.expectEqual(2, sched.workerCount());
 
     var live = std.atomic.Value(i32).init(0);
     var released = std.atomic.Value(i64).init(0);
@@ -184,10 +184,10 @@ test "worker count is bounded and independent of stream count" {
             FakeBackend.create(alloc, i, 30, &live, &released, 0).backend(),
         ));
     }
-    try std.testing.expectEqual(@as(usize, 2), sched.workerCount()); // still 2
+    try std.testing.expectEqual(2, sched.workerCount()); // still 2
 
     for (streams.items) |s| sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic)); // no surface leaked
+    try std.testing.expectEqual(0, live.load(.monotonic)); // no surface leaked
 }
 
 // -----------------------------------------------------------------------
@@ -207,7 +207,7 @@ test "multi-stream stress: per-stream order preserved, no corruption" {
 
         const sched = try DecodeScheduler.init(alloc, kWorkers, false);
         defer sched.deinit();
-        try std.testing.expectEqual(@as(usize, kWorkers), sched.workerCount());
+        try std.testing.expectEqual(kWorkers, sched.workerCount());
 
         var streams: std.ArrayList(StreamHandle) = .empty;
         defer streams.deinit(alloc);
@@ -255,14 +255,14 @@ test "multi-stream stress: per-stream order preserved, no corruption" {
         // Every stream delivered exactly its frames, in order.
         var s: usize = 0;
         while (s < kStreams) : (s += 1) {
-            try std.testing.expectEqual(@as(i32, kFramesPerStream), next_expected[s]);
+            try std.testing.expectEqual(kFramesPerStream, next_expected[s]);
             try std.testing.expect(sched.atEnd(streams.items[s]));
         }
 
         for (streams.items) |st| sched.unregisterStream(st);
         // No surface left alive; every produced surface released exactly once.
-        try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
-        try std.testing.expectEqual(@as(i64, total_expected), released.load(.monotonic));
+        try std.testing.expectEqual(0, live.load(.monotonic));
+        try std.testing.expectEqual(total_expected, released.load(.monotonic));
     }
 }
 
@@ -299,7 +299,7 @@ test "unregister mid-decode releases buffered surfaces, no leak" {
     }
 
     for (streams.items) |s| sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
+    try std.testing.expectEqual(0, live.load(.monotonic));
 }
 
 // -----------------------------------------------------------------------
@@ -337,11 +337,11 @@ test "request_seek flushes and resumes decode-ahead at the target" {
         f = sched.nextFrame(s);
         try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
-    try std.testing.expectEqual(@as(i32, 150), f.?.height);
+    try std.testing.expectEqual(150, f.?.height);
     f.?.release();
 
     sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
+    try std.testing.expectEqual(0, live.load(.monotonic));
 }
 
 // -----------------------------------------------------------------------
@@ -358,7 +358,7 @@ test "force-synchronous mode: no workers, deterministic in-order decode" {
     const sched = try DecodeScheduler.init(alloc, 4, true);
     defer sched.deinit();
     try std.testing.expect(sched.isSynchronous());
-    try std.testing.expectEqual(@as(usize, 0), sched.workerCount()); // no threads spawned
+    try std.testing.expectEqual(0, sched.workerCount()); // no threads spawned
 
     const kStreams = 6;
     const kFrames = 50;
@@ -391,8 +391,8 @@ test "force-synchronous mode: no workers, deterministic in-order decode" {
     }
 
     for (streams.items) |s| sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
-    try std.testing.expectEqual(@as(i64, total), released.load(.monotonic));
+    try std.testing.expectEqual(0, live.load(.monotonic));
+    try std.testing.expectEqual(total, released.load(.monotonic));
 }
 
 // -----------------------------------------------------------------------
@@ -589,14 +589,14 @@ test "reselect_audio_track switches audio and preserves video flow" {
         vf = sched.nextFrame(s);
         try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
-    try std.testing.expectEqual(@as(i32, 0), vf.?.width); // stream 0
+    try std.testing.expectEqual(0, vf.?.width); // stream 0
     vf.?.release();
 
     // Verify the initial audio track is 0.
     var probe0 = AudioProbe{};
     sched.withBackend(s, &probe0, AudioProbe.run);
-    try std.testing.expectEqual(@as(i32, 512), probe0.frame_count); // track 0 = 512
-    try std.testing.expectEqual(@as(i32, 0), probe0.tag);
+    try std.testing.expectEqual(512, probe0.frame_count); // track 0 = 512
+    try std.testing.expectEqual(0, probe0.tag);
 
     // Reselect to track 1.
     var resel = ReselectProbe{ .index = 1 };
@@ -610,17 +610,17 @@ test "reselect_audio_track switches audio and preserves video flow" {
         vf = sched.nextFrame(s);
         try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
-    try std.testing.expectEqual(@as(i32, 0), vf.?.width);
+    try std.testing.expectEqual(0, vf.?.width);
     vf.?.release();
 
     // Verify the active audio track is now 1.
     var probe1 = AudioProbe{};
     sched.withBackend(s, &probe1, AudioProbe.run);
-    try std.testing.expectEqual(@as(i32, 256), probe1.frame_count); // track 1 = 256
-    try std.testing.expectEqual(@as(i32, 1), probe1.tag);
+    try std.testing.expectEqual(256, probe1.frame_count); // track 1 = 256
+    try std.testing.expectEqual(1, probe1.tag);
 
     sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
+    try std.testing.expectEqual(0, live.load(.monotonic));
 }
 
 test "with_backend is serialized against worker decode during reselect" {
@@ -652,8 +652,8 @@ test "with_backend is serialized against worker decode during reselect" {
         }
         try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
-    try std.testing.expectEqual(@as(i32, 3), consumed);
+    try std.testing.expectEqual(3, consumed);
 
     sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
+    try std.testing.expectEqual(0, live.load(.monotonic));
 }

@@ -143,8 +143,8 @@ test "repeated drops collapse a backlog to one frame in a single tick" {
         }
         // Should land on Show for the last (newest due) frame.
         try std.testing.expectEqual(PresentAction.show, a);
-        try std.testing.expectEqual(@as(usize, 3), i); // pts[3] == 0.95 is the survivor
+        try std.testing.expectEqual(3, i); // pts[3] == 0.95 is the survivor
         break;
     }
-    try std.testing.expectEqual(@as(i32, 3), drops);
+    try std.testing.expectEqual(3, drops);
 }

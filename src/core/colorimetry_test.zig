@@ -32,7 +32,7 @@ test "Colorimetry default-constructs to the per-frame Unspecified convention" {
     try std.testing.expectEqual(ColorPrimaries.unspecified, color.primaries);
     try std.testing.expectEqual(TransferFunction.unspecified, color.transfer);
     try std.testing.expectEqual(ColorRange.unspecified, color.range);
-    try std.testing.expectEqual(@as(i32, 8), color.bit_depth);
+    try std.testing.expectEqual(8, color.bit_depth);
 }
 
 test "Colorimetry.bt709_defaults returns the negotiated-default convention" {
@@ -41,7 +41,7 @@ test "Colorimetry.bt709_defaults returns the negotiated-default convention" {
     try std.testing.expectEqual(ColorPrimaries.bt709, color.primaries);
     try std.testing.expectEqual(TransferFunction.bt709, color.transfer);
     try std.testing.expectEqual(ColorRange.video, color.range);
-    try std.testing.expectEqual(@as(i32, 8), color.bit_depth);
+    try std.testing.expectEqual(8, color.bit_depth);
 }
 
 // Minimal stub implementing only the required vtable entries of
@@ -99,5 +99,5 @@ test "Backend.colorimetry() base implementation returns the negotiated defaults"
     try std.testing.expectEqual(ColorPrimaries.bt709, color.primaries);
     try std.testing.expectEqual(TransferFunction.bt709, color.transfer);
     try std.testing.expectEqual(ColorRange.video, color.range);
-    try std.testing.expectEqual(@as(i32, 8), color.bit_depth);
+    try std.testing.expectEqual(8, color.bit_depth);
 }

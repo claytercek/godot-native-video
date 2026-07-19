@@ -165,7 +165,7 @@ pub const AudioMasterClock = struct {
 
     pub fn mediaTime(self: *const AudioMasterClock) f64 {
         const t = self.accumulated_seconds - self.latency_seconds;
-        return if (t < 0.0) 0.0 else t;
+        return @max(t, 0.0);
     }
 
     /// advance() is a no-op for the audio-master clock; time is governed
@@ -331,33 +331,33 @@ pub const ClockBridge = struct {
 
 test "MonotonicClock starts at given initial time" {
     var c = MonotonicClock.init(0.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
 
     var c2 = MonotonicClock.init(1.5);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.5), c2.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.5, c2.mediaTime(), 1e-9);
 }
 
 test "MonotonicClock advance accumulates time" {
     var c = MonotonicClock.init(0.0);
     c.advance(0.016); // ~60 fps frame
-    try std.testing.expectApproxEqAbs(@as(f64, 0.016), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.016, c.mediaTime(), 1e-9);
     c.advance(0.016);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.032), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.032, c.mediaTime(), 1e-9);
 }
 
 test "MonotonicClock ignores negative or zero delta" {
     var c = MonotonicClock.init(1.0);
     c.advance(-0.5);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, c.mediaTime(), 1e-9);
     c.advance(0.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, c.mediaTime(), 1e-9);
 }
 
 test "MonotonicClock set_time repositions the clock" {
     var c = MonotonicClock.init(0.0);
     c.advance(2.5);
     c.setTime(10.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 10.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(10.0, c.mediaTime(), 1e-9);
 }
 
 test "MonotonicClock paused does not advance" {
@@ -365,7 +365,7 @@ test "MonotonicClock paused does not advance" {
     c.setPaused(true);
     try std.testing.expect(c.isPaused());
     c.advance(1.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 5.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(5.0, c.mediaTime(), 1e-9);
 }
 
 test "MonotonicClock resumes after unpause" {
@@ -375,7 +375,7 @@ test "MonotonicClock resumes after unpause" {
     c.setPaused(false);
     try std.testing.expect(!c.isPaused());
     c.advance(0.5);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.5, c.mediaTime(), 1e-9);
 }
 
 test "MonotonicClock many small advances accumulate without drift" {
@@ -395,14 +395,14 @@ test "MonotonicClock many small advances accumulate without drift" {
 
 test "AudioMasterClock starts at zero" {
     var c = AudioMasterClock.init(48000, 0.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
 }
 
 test "AudioMasterClock advances by sample count" {
     var c = AudioMasterClock.init(48000, 0.0);
     // 48000 frames / 48000 Hz = 1 second
     c.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, c.mediaTime(), 1e-9);
 }
 
 test "AudioMasterClock accumulates multiple mix calls" {
@@ -420,45 +420,45 @@ test "AudioMasterClock latency compensation shifts time back" {
     var c = AudioMasterClock.init(48000, latency);
     // Mix exactly the latency worth of audio; should still read 0 (clamped).
     c.onAudioMixed(@intFromFloat(latency * 48000));
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
 
     // Mix another second; reported time should be 1 second behind the
     // accumulated time.
     c.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), c.mediaTime(), 1e-4);
+    try std.testing.expectApproxEqAbs(1.0, c.mediaTime(), 1e-4);
 }
 
 test "AudioMasterClock clamps to zero when latency exceeds accumulated" {
     var c = AudioMasterClock.init(48000, 0.1);
     c.onAudioMixed(100); // tiny amount
     // 100/48000 ~ 2 ms < 100 ms latency => media time should be 0
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
 }
 
 test "AudioMasterClock set_time repositions (e.g. after seek)" {
     var c = AudioMasterClock.init(48000, 0.0);
     c.onAudioMixed(48000); // 1 s
     c.setTime(30.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 30.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(30.0, c.mediaTime(), 1e-9);
 }
 
 test "AudioMasterClock paused does not advance on mix" {
     var c = AudioMasterClock.init(48000, 0.0);
     c.setPaused(true);
     c.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
 }
 
 test "AudioMasterClock advance() is a no-op" {
     var c = AudioMasterClock.init(48000, 0.0);
     c.advance(999.0); // should be ignored
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), c.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
 }
 
 test "AudioMasterClock sample_rate and latency accessors" {
     const c = AudioMasterClock.init(44100, 0.05);
-    try std.testing.expectEqual(@as(i32, 44100), c.sample_rate);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.05), c.latency_seconds, 1e-9);
+    try std.testing.expectEqual(44100, c.sample_rate);
+    try std.testing.expectApproxEqAbs(0.05, c.latency_seconds, 1e-9);
 }
 
 // -----------------------------------------------------------------------
@@ -495,28 +495,28 @@ fn makeNullAudioBridge(initial: f64, request_audio_master: bool) ClockBridge {
 test "ClockBridge starts as audio-master" {
     var b = makeAudioBridge(0.0);
     try std.testing.expect(b.isAudioMaster());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge starts as monotonic-master" {
     var b = makeMonoBridge(5.0);
     try std.testing.expect(!b.isAudioMaster());
-    try std.testing.expectApproxEqAbs(@as(f64, 5.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(5.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge audio-master: advance is no-op, on_audio_mixed advances" {
     var b = makeAudioBridge(0.0);
     b.advance(1.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, b.mediaTime(), 1e-9);
     b.onAudioMixed(48000); // 1 s
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge audio-master: on_audio_mixed accumulates" {
     var b = makeAudioBridge(0.0);
     b.onAudioMixed(48000);
     b.onAudioMixed(24000);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge handoff seeds monotonic at audio position" {
@@ -525,7 +525,7 @@ test "ClockBridge handoff seeds monotonic at audio position" {
     b.handoffToMonotonic();
     try std.testing.expect(!b.isAudioMaster());
     // After handoff, the monotonic clock starts at the audio clock's position.
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge handoff is idempotent" {
@@ -533,11 +533,11 @@ test "ClockBridge handoff is idempotent" {
     b.onAudioMixed(24000); // 0.5 s
     b.handoffToMonotonic();
     try std.testing.expect(!b.isAudioMaster());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.5, b.mediaTime(), 1e-9);
     // Second handoff should be a no-op.
     b.handoffToMonotonic();
     try std.testing.expect(!b.isAudioMaster());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge handoff then advance advances monotonic" {
@@ -545,7 +545,7 @@ test "ClockBridge handoff then advance advances monotonic" {
     b.onAudioMixed(48000); // 1 s
     b.handoffToMonotonic();
     b.advance(0.5);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge re-anchor keeps position continuous" {
@@ -556,7 +556,7 @@ test "ClockBridge re-anchor keeps position continuous" {
     b.reanchorToAudio();
     try std.testing.expect(b.isAudioMaster());
     // Position should be 3.0 — no backward jump.
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(3.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge re-anchor is idempotent" {
@@ -565,11 +565,11 @@ test "ClockBridge re-anchor is idempotent" {
     b.handoffToMonotonic();
     b.reanchorToAudio();
     try std.testing.expect(b.isAudioMaster());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.5, b.mediaTime(), 1e-9);
     // Second re-anchor should be a no-op.
     b.reanchorToAudio();
     try std.testing.expect(b.isAudioMaster());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge on_audio_mixed is no-op in monotonic mode" {
@@ -578,7 +578,7 @@ test "ClockBridge on_audio_mixed is no-op in monotonic mode" {
     b.handoffToMonotonic();
     // on_audio_mixed while in monotonic mode should be ignored.
     b.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge re-anchor then on_audio_mixed advances audio" {
@@ -588,7 +588,7 @@ test "ClockBridge re-anchor then on_audio_mixed advances audio" {
     b.advance(2.0); // 3 s
     b.reanchorToAudio();
     b.onAudioMixed(48000); // +1 s
-    try std.testing.expectApproxEqAbs(@as(f64, 4.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(4.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge long gap via monotonic" {
@@ -599,20 +599,20 @@ test "ClockBridge long gap via monotonic" {
     b.handoffToMonotonic();
     b.advance(300.0); // 5 minute gap
     b.reanchorToAudio();
-    try std.testing.expectApproxEqAbs(@as(f64, 301.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(301.0, b.mediaTime(), 1e-9);
     // Audio clock should now be master and can continue from 301 s.
     b.onAudioMixed(48000); // +1 s
-    try std.testing.expectApproxEqAbs(@as(f64, 302.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(302.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge set_time synchronizes both clocks" {
     var b = makeAudioBridge(0.0);
     b.onAudioMixed(48000); // 1 s
     b.setTime(10.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 10.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(10.0, b.mediaTime(), 1e-9);
     // Handoff after set_time: monotonic should be at 10.0 too.
     b.handoffToMonotonic();
-    try std.testing.expectApproxEqAbs(@as(f64, 10.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(10.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge set_paused pauses both clocks" {
@@ -621,15 +621,15 @@ test "ClockBridge set_paused pauses both clocks" {
     try std.testing.expect(b.isPaused());
     // Neither audio nor monotonic should advance.
     b.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, b.mediaTime(), 1e-9);
     // Handoff while paused, then advance — should stay put.
     b.handoffToMonotonic();
     b.advance(1.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, b.mediaTime(), 1e-9);
     // Unpause: monotonic should start advancing.
     b.setPaused(false);
     b.advance(0.5);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge latency compensation works through bridge" {
@@ -638,37 +638,37 @@ test "ClockBridge latency compensation works through bridge" {
     try std.testing.expectApproxEqAbs(latency, b.latencySeconds(), 1e-9);
     // Mix exactly the latency worth of audio; should still read 0.
     b.onAudioMixed(@intFromFloat(latency * 48000));
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, b.mediaTime(), 1e-9);
     // Mix another second; reported time is 1 s behind accumulated.
     b.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), b.mediaTime(), 1e-4);
+    try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-4);
     // Handoff seeds mono at the latency-compensated position.
     b.handoffToMonotonic();
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), b.mediaTime(), 1e-4);
+    try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-4);
 }
 
 test "ClockBridge round-trip: audio to mono to audio to mono" {
     var b = makeAudioBridge(0.0);
     // Phase 1: audio advances 1s.
     b.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-9);
     // Phase 2: handoff to mono, advance 2s.
     b.handoffToMonotonic();
     b.advance(2.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(3.0, b.mediaTime(), 1e-9);
     // Phase 3: re-anchor to audio, advance 1s via audio.
     b.reanchorToAudio();
     b.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 4.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(4.0, b.mediaTime(), 1e-9);
     // Phase 4: handoff back to mono, advance 0.5s.
     b.handoffToMonotonic();
     b.advance(0.5);
-    try std.testing.expectApproxEqAbs(@as(f64, 4.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(4.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge sample_rate delegation" {
     var b = makeAudioBridge(0.0);
-    try std.testing.expectEqual(@as(i32, 48000), b.sampleRate());
+    try std.testing.expectEqual(48000, b.sampleRate());
 }
 
 // -----------------------------------------------------------------------
@@ -682,26 +682,26 @@ test "ClockBridge with null audio forces monotonic-master" {
 
 test "ClockBridge with null audio: media_time advances via advance()" {
     var b = makeNullAudioBridge(0.0, true);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, b.mediaTime(), 1e-9);
     b.advance(1.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-9);
     b.advance(0.5);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.5), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.5, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge with null audio: set_time and set_paused work" {
     var b = makeNullAudioBridge(0.0, true);
     b.setTime(10.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 10.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(10.0, b.mediaTime(), 1e-9);
 
     b.setPaused(true);
     try std.testing.expect(b.isPaused());
     b.advance(5.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 10.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(10.0, b.mediaTime(), 1e-9);
 
     b.setPaused(false);
     b.advance(1.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 11.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(11.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge with null audio: reanchor_to_audio is a safe no-op" {
@@ -709,18 +709,18 @@ test "ClockBridge with null audio: reanchor_to_audio is a safe no-op" {
     b.advance(2.0);
     b.reanchorToAudio();
     try std.testing.expect(!b.isAudioMaster());
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(2.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge with null audio: on_audio_mixed is a safe no-op" {
     var b = makeNullAudioBridge(0.0, true);
     b.advance(1.0);
     b.onAudioMixed(48000);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), b.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-9);
 }
 
 test "ClockBridge with null audio: sample_rate and latency_seconds are zero" {
     var b = makeNullAudioBridge(0.0, true);
-    try std.testing.expectEqual(@as(i32, 0), b.sampleRate());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), b.latencySeconds(), 1e-9);
+    try std.testing.expectEqual(0, b.sampleRate());
+    try std.testing.expectApproxEqAbs(0.0, b.latencySeconds(), 1e-9);
 }

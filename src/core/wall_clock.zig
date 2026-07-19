@@ -24,10 +24,10 @@ pub const WallClockMs = struct {
 
 test "WallClockMs default is zero" {
     const w: WallClockMs = .{};
-    try std.testing.expectEqual(@as(f64, 0.0), w.ms);
+    try std.testing.expectEqual(0.0, w.ms);
 }
 
 test "WallClockMs init carries the raw value" {
     const w = WallClockMs.init(123.5);
-    try std.testing.expectEqual(@as(f64, 123.5), w.ms);
+    try std.testing.expectEqual(123.5, w.ms);
 }

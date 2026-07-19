@@ -199,8 +199,7 @@ pub const DecodeScheduler = struct {
             for (self.workers.items) |t| t.join();
             self.workers.deinit(allocator);
         }
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
+        for (0..n) |_| {
             const t = try std.Thread.spawn(.{}, workerMain, .{self});
             self.workers.appendAssumeCapacity(t);
         }
@@ -385,7 +384,7 @@ pub const DecodeScheduler = struct {
             // with the flush below, corrupting the queue.
             while (stream.busy) self.cv.wait(&self.mu);
             stream.seek_pending = true;
-            stream.seek_target = if (pts_seconds < 0.0) 0.0 else pts_seconds;
+            stream.seek_target = @max(pts_seconds, 0.0);
             stream.eos = false;
             if (stream.dead) {
                 self.mu.unlock();

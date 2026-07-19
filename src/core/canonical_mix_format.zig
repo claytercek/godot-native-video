@@ -56,11 +56,10 @@ pub fn deriveCanonicalMixFormat(allocator: std.mem.Allocator, backend: Backend) 
     var fmt: CanonicalMixFormat = .{};
     errdefer fmt.deinit(allocator);
 
-    const track_count = backend.audioTrackCount();
+    const track_count: usize = @intCast(@max(backend.audioTrackCount(), 0));
     var warned_mixed_sample_rates = false;
-    var i: i32 = 0;
-    while (i < track_count) : (i += 1) {
-        const info = backend.audioTrackInfo(i);
+    for (0..track_count) |i| {
+        const info = backend.audioTrackInfo(@intCast(i));
         try fmt.track_infos.append(allocator, info);
         if (info.channels > fmt.channels) {
             fmt.channels = info.channels;
@@ -160,11 +159,11 @@ test "derive_canonical_mix_format picks max channels and first track's rate" {
     var fmt = try deriveCanonicalMixFormat(std.testing.allocator, fake.backend());
     defer fmt.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(i32, 6), fmt.channels);
-    try std.testing.expectEqual(@as(i32, 44100), fmt.sample_rate);
+    try std.testing.expectEqual(6, fmt.channels);
+    try std.testing.expectEqual(44100, fmt.sample_rate);
     try std.testing.expect(fmt.has_audio);
-    try std.testing.expectEqual(@as(usize, 2), fmt.track_infos.items.len);
-    try std.testing.expectEqual(@as(usize, 1), fmt.warnings.items.len);
+    try std.testing.expectEqual(2, fmt.track_infos.items.len);
+    try std.testing.expectEqual(1, fmt.warnings.items.len);
 }
 
 test "derive_canonical_mix_format clamps channels to the mixer max" {
@@ -183,7 +182,7 @@ test "derive_canonical_mix_format with no tracks has no audio" {
     defer fmt.deinit(std.testing.allocator);
 
     try std.testing.expect(!fmt.has_audio);
-    try std.testing.expectEqual(@as(i32, 0), fmt.channels);
-    try std.testing.expectEqual(@as(i32, 0), fmt.sample_rate);
-    try std.testing.expectEqual(@as(usize, 0), fmt.warnings.items.len);
+    try std.testing.expectEqual(0, fmt.channels);
+    try std.testing.expectEqual(0, fmt.sample_rate);
+    try std.testing.expectEqual(0, fmt.warnings.items.len);
 }

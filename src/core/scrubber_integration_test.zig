@@ -225,7 +225,7 @@ test "exact-frame-on-settle: settle resolves to the precise target frame" {
     try std.testing.expectEqual(want, exact.presented_index);
 
     sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
+    try std.testing.expectEqual(0, live.load(.monotonic));
 }
 
 test "scrub-latency perf metric: keyframe scrub reaches a frame far sooner than exact" {
@@ -250,12 +250,12 @@ test "scrub-latency perf metric: keyframe scrub reaches a frame far sooner than 
     try std.testing.expectEqual(want, exact.presented_index);
 
     // A keyframe scrub presents immediately (one frame); exact decodes forward.
-    try std.testing.expectEqual(@as(i64, 1), kf.frames_to_present);
+    try std.testing.expectEqual(1, kf.frames_to_present);
     try std.testing.expect(kf.frames_to_present < exact.frames_to_present);
     // Real win: with the target at the back of the GOP, exact must decode forward
     // at least half a GOP further than the keyframe scrub.
     try std.testing.expect(exact.frames_to_present >= kf.frames_to_present + @as(i64, @intCast(@divTrunc(kGopFrames, 2))));
 
     sched.unregisterStream(s);
-    try std.testing.expectEqual(@as(i32, 0), live.load(.monotonic));
+    try std.testing.expectEqual(0, live.load(.monotonic));
 }

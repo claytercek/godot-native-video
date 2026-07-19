@@ -348,9 +348,7 @@ pub const PlaybackController = struct {
     // Feeds the scrubber and applies the resulting resolve (keyframe or exact).
     pub fn seek(self: *PlaybackController, time_seconds: f64, now: WallClockMs) void {
         if (self.stream_ == null or self.master() == null) return;
-        var t = time_seconds;
-        if (t < 0.0) t = 0.0;
-        const resolve = self.scrubber_.onSeek(t, now.ms);
+        const resolve = self.scrubber_.onSeek(@max(time_seconds, 0.0), now.ms);
         self.applyScrubResolve(resolve);
     }
 
@@ -619,7 +617,7 @@ pub const PlaybackController = struct {
     fn applyScrubResolve(self: *PlaybackController, resolve: ScrubResolve) void {
         const c = self.master() orelse return;
         if (self.stream_ == null) return;
-        const target = if (resolve.target_seconds < 0.0) 0.0 else resolve.target_seconds;
+        const target = @max(resolve.target_seconds, 0.0);
 
         if (self.audio_ring_) |*r| r.clear(); // stale audio must not play after a (re)seek
         const sched = DecodeScheduler.instance();

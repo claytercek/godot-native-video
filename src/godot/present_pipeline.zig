@@ -106,7 +106,7 @@ pub const PresentPipeline = struct {
     pipeline: Rid = si.rid_invalid,
     sampler: Rid = si.rid_invalid,
 
-    ring: [ring_depth]RingSlot = [_]RingSlot{.{}} ** ring_depth,
+    ring: [ring_depth]RingSlot = @splat(.{}),
     ring_index: usize = 0,
 
     // Lazily created in getTexture(); identity stable for the pipeline's

@@ -56,12 +56,10 @@ pub fn RetireRing(comptime N: usize) type {
         // has now survived its N frames of GPU latency.
         const capacity: usize = N;
 
-        slots: [capacity]ReleaseFn = [_]ReleaseFn{.{}} ** capacity,
+        slots: [capacity]ReleaseFn = @splat(.{}),
         head: usize = 0,
 
-        pub fn init() Self {
-            return .{};
-        }
+        pub const init: Self = .{};
 
         pub fn deinit(self: *Self) void {
             self.drain();
@@ -98,10 +96,8 @@ pub fn RetireRing(comptime N: usize) type {
             // The oldest surface sits in the slot advance() would next reuse,
             // i.e. (head + 1). Walk forward from there so we release oldest
             // -> newest.
-            var k: usize = 0;
-            while (k < capacity) : (k += 1) {
-                const i = (self.head + 1 + k) % capacity;
-                self.releaseSlot(i);
+            for (0..capacity) |k| {
+                self.releaseSlot((self.head + 1 + k) % capacity);
             }
         }
 
@@ -130,7 +126,7 @@ pub fn RetireRing(comptime N: usize) type {
 
 test "a surface is held for exactly N frames then released once" {
     const N = 3;
-    var ring = RetireRing(N).init();
+    var ring: RetireRing(N) = .init;
 
     var releases: i32 = 0;
     const Ctx = struct {
@@ -143,20 +139,20 @@ test "a surface is held for exactly N frames then released once" {
     // Frame 0: park a surface.
     ring.advance();
     ring.retain(.{ .ctx = &releases, .func = Ctx.bump });
-    try std.testing.expectEqual(@as(usize, 1), ring.liveCount());
+    try std.testing.expectEqual(1, ring.liveCount());
 
     // It must survive the next N-1 advances...
     var f: usize = 1;
     while (f < N) : (f += 1) {
         ring.advance();
         ring.retain(.{}); // no new surface this frame
-        try std.testing.expectEqual(@as(i32, 0), releases); // still alive
+        try std.testing.expectEqual(0, releases); // still alive
     }
 
     // ...and be released on the N-th advance after it was parked.
     ring.advance();
-    try std.testing.expectEqual(@as(i32, 1), releases);
-    try std.testing.expectEqual(@as(usize, 0), ring.liveCount());
+    try std.testing.expectEqual(1, releases);
+    try std.testing.expectEqual(0, ring.liveCount());
 
     // And never released again.
     var i: i32 = 0;
@@ -164,12 +160,12 @@ test "a surface is held for exactly N frames then released once" {
         ring.advance();
         ring.retain(.{});
     }
-    try std.testing.expectEqual(@as(i32, 1), releases);
+    try std.testing.expectEqual(1, releases);
 }
 
 test "each frame's surface is released exactly once, in order" {
     const N = 2;
-    var ring = RetireRing(N).init();
+    var ring: RetireRing(N) = .init;
 
     var released_order = std.ArrayList(i32).empty;
     defer released_order.deinit(std.testing.allocator);
@@ -198,7 +194,7 @@ test "each frame's surface is released exactly once, in order" {
     ring.drain();
 
     // Every surface released exactly once...
-    try std.testing.expectEqual(@as(usize, kFrames), released_order.items.len);
+    try std.testing.expectEqual(kFrames, released_order.items.len);
     // ...and in FIFO order.
     i = 0;
     while (i < kFrames) : (i += 1) {
@@ -207,7 +203,7 @@ test "each frame's surface is released exactly once, in order" {
 }
 
 test "drain releases all parked surfaces and is idempotent" {
-    var ring = RetireRing(4).init();
+    var ring: RetireRing(4) = .init;
     var releases: i32 = 0;
 
     const Ctx = struct {
@@ -222,14 +218,14 @@ test "drain releases all parked surfaces and is idempotent" {
         ring.advance();
         ring.retain(.{ .ctx = &releases, .func = Ctx.bump });
     }
-    try std.testing.expectEqual(@as(i32, 0), releases);
+    try std.testing.expectEqual(0, releases);
 
     ring.drain();
-    try std.testing.expectEqual(@as(i32, 3), releases);
+    try std.testing.expectEqual(3, releases);
 
     // Second drain must not double-release.
     ring.drain();
-    try std.testing.expectEqual(@as(i32, 3), releases);
+    try std.testing.expectEqual(3, releases);
 }
 
 test "destructor releases outstanding surfaces (no leak)" {
@@ -246,7 +242,7 @@ test "destructor releases outstanding surfaces (no leak)" {
         }
     };
     {
-        var ring = RetireRing(3).init();
+        var ring: RetireRing(3) = .init;
         ring.advance();
         ring.retain(.{ .ctx = &released, .func = Ctx.markReleased });
         try std.testing.expect(!released);
@@ -256,6 +252,6 @@ test "destructor releases outstanding surfaces (no leak)" {
 }
 
 test "latency_frames reports the configured N" {
-    try std.testing.expectEqual(@as(usize, 1), RetireRing(1).latencyFrames());
-    try std.testing.expectEqual(@as(usize, 5), RetireRing(5).latencyFrames());
+    try std.testing.expectEqual(1, RetireRing(1).latencyFrames());
+    try std.testing.expectEqual(5, RetireRing(5).latencyFrames());
 }

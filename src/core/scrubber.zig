@@ -181,7 +181,7 @@ test "first seek with no prior history resolves exactly (no burst yet)" {
     // so it must resolve to the exact frame, not a keyframe.
     const r = s.onSeek(5.0, 1000.0);
     try std.testing.expectEqual(ResolveMode.exact, r.mode);
-    try std.testing.expectApproxEqAbs(@as(f64, 5.0), r.target_seconds, 1e-9);
+    try std.testing.expectApproxEqAbs(5.0, r.target_seconds, 1e-9);
 }
 
 test "a fast burst of seeks resolves to nearest keyframe for low latency" {
@@ -194,7 +194,7 @@ test "a fast burst of seeks resolves to nearest keyframe for low latency" {
     try std.testing.expectEqual(ResolveMode.keyframe, r1.mode);
     const r2 = s.onSeek(3.2, 40.0);
     try std.testing.expectEqual(ResolveMode.keyframe, r2.mode);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.2), r2.target_seconds, 1e-9);
+    try std.testing.expectApproxEqAbs(3.2, r2.target_seconds, 1e-9);
 }
 
 test "a slow drag (below velocity threshold) resolves exactly" {
@@ -222,7 +222,7 @@ test "poll after the debounce emits an exact resolve to the last target (settle)
     const r = s.poll(141.0);
     try std.testing.expect(r != null);
     try std.testing.expectEqual(ResolveMode.exact, r.?.mode);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), r.?.target_seconds, 1e-9);
+    try std.testing.expectApproxEqAbs(3.0, r.?.target_seconds, 1e-9);
 }
 
 test "settle fires exactly once until the next seek" {
@@ -252,7 +252,7 @@ test "playback resume forces an exact resolve at the last scrub target" {
     _ = s.onSeek(2.0, 20.0); // keyframe scrub at 2.0
     const r = s.onResume(30.0);
     try std.testing.expectEqual(ResolveMode.exact, r.mode);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.0), r.target_seconds, 1e-9);
+    try std.testing.expectApproxEqAbs(2.0, r.target_seconds, 1e-9);
     // After resume, the settle is consumed (resume already did the exact resolve).
     try std.testing.expect(s.poll(200.0) == null);
 }

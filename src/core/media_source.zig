@@ -103,15 +103,15 @@ test "MediaSource default name() mirrors the C++ base class" {
     var fake: Fake = .{ .data = "hello" };
     const src: MediaSource = .{ .ptr = &fake, .vtable = &Fake.vtable };
 
-    try std.testing.expectEqual(@as(u64, 5), src.size());
+    try std.testing.expectEqual(5, src.size());
     try std.testing.expect(!src.eof());
     try std.testing.expectEqualStrings("", src.name());
 
     var buf: [3]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 3), src.read(&buf));
+    try std.testing.expectEqual(3, src.read(&buf));
     try std.testing.expectEqualStrings("hel", &buf);
-    try std.testing.expectEqual(@as(u64, 3), src.tell());
+    try std.testing.expectEqual(3, src.tell());
 
     try std.testing.expect(src.seek(0));
-    try std.testing.expectEqual(@as(u64, 0), src.tell());
+    try std.testing.expectEqual(0, src.tell());
 }

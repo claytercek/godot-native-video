@@ -124,10 +124,8 @@ fn mixSinkMix(ptr: *anyopaque, interleaved: []const f32, frame_count: i32, chann
     if (@as(i64, @intCast(self.mix_buffer.size())) < total) {
         _ = self.mix_buffer.resize(total);
     }
-    const n: usize = @intCast(total);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        self.mix_buffer.set(@intCast(i), interleaved[i]);
+    for (interleaved[0..@intCast(total)], 0..) |sample, i| {
+        self.mix_buffer.set(@intCast(i), sample);
     }
     return self.base.mixAudio(frame_count, .{ .buffer = self.mix_buffer, .offset = 0 });
 }

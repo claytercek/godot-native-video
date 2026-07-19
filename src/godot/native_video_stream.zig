@@ -161,11 +161,10 @@ pub fn getAudioTracks(self: *NativeVideoStream) Array {
         return tracks;
     }
 
-    const count = backend.audioTrackCount();
+    const count: usize = @intCast(@max(backend.audioTrackCount(), 0));
     _ = tracks.resize(@intCast(count));
-    var i: i32 = 0;
-    while (i < count) : (i += 1) {
-        const dinfo = backend.audioTrackInfo(i);
+    for (0..count) |i| {
+        const dinfo = backend.audioTrackInfo(@intCast(i));
         var dict = Dictionary.init();
         setDictString(&dict, "language", dinfo.language);
         setDictString(&dict, "name", dinfo.name);

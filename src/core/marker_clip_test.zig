@@ -164,8 +164,8 @@ test "MarkerClip canonical channels is max across tracks" {
     }
 
     // The canonical format is the max across all tracks.
-    try std.testing.expectEqual(@as(i32, 6), max_ch); // 5.1 track
-    try std.testing.expectEqual(@as(i32, 48000), max_rate);
+    try std.testing.expectEqual(6, max_ch); // 5.1 track
+    try std.testing.expectEqual(48000, max_rate);
 
     // The mixer knows how to handle this.
     try std.testing.expect(max_ch <= channel_mixer.max_mix_source_channels);
@@ -185,9 +185,9 @@ test "MarkerClip stereo track pumps 2ch chunks; mixer converts to 6ch" {
     // Pump a chunk from the backend (native stereo).
     const chunk = b.nextAudioChunk();
     try std.testing.expect(chunk != null);
-    try std.testing.expectEqual(@as(i32, 2), chunk.?.channel_count);
-    try std.testing.expectEqual(@as(i32, 256), chunk.?.frame_count);
-    try std.testing.expectEqual(@as(i32, 48000), chunk.?.sample_rate);
+    try std.testing.expectEqual(2, chunk.?.channel_count);
+    try std.testing.expectEqual(256, chunk.?.frame_count);
+    try std.testing.expectEqual(48000, chunk.?.sample_rate);
 
     // Mix from native (2ch) to canonical (6ch).
     const n: usize = @as(usize, @intCast(chunk.?.frame_count)) * @as(usize, @intCast(canonical));
@@ -198,12 +198,12 @@ test "MarkerClip stereo track pumps 2ch chunks; mixer converts to 6ch" {
 
     // Stereo -> 5.1: L -> L, R -> R; C, LFE, Ls, Rs should be silence.
     // For the first chunk (chunks_pumped_ = 0), values are 0.1 and 0.2.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), mixed[0], 1e-5); // L
-    try std.testing.expectApproxEqAbs(@as(f32, 0.2), mixed[1], 1e-5); // R
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[2], 1e-5); // C
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[3], 1e-5); // LFE
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[4], 1e-5); // Ls
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), mixed[5], 1e-5); // Rs
+    try std.testing.expectApproxEqAbs(0.1, mixed[0], 1e-5); // L
+    try std.testing.expectApproxEqAbs(0.2, mixed[1], 1e-5); // R
+    try std.testing.expectApproxEqAbs(0.0, mixed[2], 1e-5); // C
+    try std.testing.expectApproxEqAbs(0.0, mixed[3], 1e-5); // LFE
+    try std.testing.expectApproxEqAbs(0.0, mixed[4], 1e-5); // Ls
+    try std.testing.expectApproxEqAbs(0.0, mixed[5], 1e-5); // Rs
 }
 
 test "MarkerClip 5.1 track pumps 6ch chunks; mixer passes through" {
@@ -220,8 +220,8 @@ test "MarkerClip 5.1 track pumps 6ch chunks; mixer passes through" {
     // Pump a chunk from the backend (native 6ch).
     const chunk = b.nextAudioChunk();
     try std.testing.expect(chunk != null);
-    try std.testing.expectEqual(@as(i32, 6), chunk.?.channel_count);
-    try std.testing.expectEqual(@as(i32, 256), chunk.?.frame_count);
+    try std.testing.expectEqual(6, chunk.?.channel_count);
+    try std.testing.expectEqual(256, chunk.?.frame_count);
 
     // Mix from native (6ch) to canonical (6ch) — this is identity.
     const n: usize = @as(usize, @intCast(chunk.?.frame_count)) * @as(usize, @intCast(canonical));
@@ -231,20 +231,20 @@ test "MarkerClip 5.1 track pumps 6ch chunks; mixer passes through" {
     channel_mixer.mixChannels(chunk.?.samples, chunk.?.channel_count, mixed, canonical, chunk.?.frame_count);
 
     // For the first chunk, values are 0.1, 0.2, 0.3, 0.4, 0.5, 0.6.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), mixed[0], 1e-5); // L
-    try std.testing.expectApproxEqAbs(@as(f32, 0.2), mixed[1], 1e-5); // R
-    try std.testing.expectApproxEqAbs(@as(f32, 0.3), mixed[2], 1e-5); // C
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), mixed[3], 1e-5); // LFE
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mixed[4], 1e-5); // Ls
-    try std.testing.expectApproxEqAbs(@as(f32, 0.6), mixed[5], 1e-5); // Rs
+    try std.testing.expectApproxEqAbs(0.1, mixed[0], 1e-5); // L
+    try std.testing.expectApproxEqAbs(0.2, mixed[1], 1e-5); // R
+    try std.testing.expectApproxEqAbs(0.3, mixed[2], 1e-5); // C
+    try std.testing.expectApproxEqAbs(0.4, mixed[3], 1e-5); // LFE
+    try std.testing.expectApproxEqAbs(0.5, mixed[4], 1e-5); // Ls
+    try std.testing.expectApproxEqAbs(0.6, mixed[5], 1e-5); // Rs
 
     // Verify the second frame as well.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), mixed[6], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.2), mixed[7], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.3), mixed[8], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), mixed[9], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mixed[10], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.6), mixed[11], 1e-5);
+    try std.testing.expectApproxEqAbs(0.1, mixed[6], 1e-5);
+    try std.testing.expectApproxEqAbs(0.2, mixed[7], 1e-5);
+    try std.testing.expectApproxEqAbs(0.3, mixed[8], 1e-5);
+    try std.testing.expectApproxEqAbs(0.4, mixed[9], 1e-5);
+    try std.testing.expectApproxEqAbs(0.5, mixed[10], 1e-5);
+    try std.testing.expectApproxEqAbs(0.6, mixed[11], 1e-5);
 }
 
 test "MarkerClip track selection changes native channel count" {
@@ -258,12 +258,12 @@ test "MarkerClip track selection changes native channel count" {
     _ = b.seek(0.0);
     const ch0 = b.nextAudioChunk();
     try std.testing.expect(ch0 != null);
-    try std.testing.expectEqual(@as(i32, 2), ch0.?.channel_count);
+    try std.testing.expectEqual(2, ch0.?.channel_count);
 
     // Track 1 (5.1) -> 6ch chunks
     b.selectAudioTrack(1);
     _ = b.seek(0.0);
     const ch1 = b.nextAudioChunk();
     try std.testing.expect(ch1 != null);
-    try std.testing.expectEqual(@as(i32, 6), ch1.?.channel_count);
+    try std.testing.expectEqual(6, ch1.?.channel_count);
 }

@@ -22,7 +22,7 @@ const std = @import("std");
 pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
     comptime {
         if (cap < 2) @compileError("Capacity must be at least 2");
-        if ((cap & (cap - 1)) != 0) @compileError("Capacity must be a power of two");
+        if (!std.math.isPowerOfTwo(cap)) @compileError("Capacity must be a power of two");
     }
 
     return struct {
@@ -30,9 +30,10 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
         const mask: usize = cap - 1;
 
         // Pad the two hot counters into separate cache lines to avoid false
-        // sharing between producer and consumer threads.
-        head: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
-        tail: std.atomic.Value(usize) align(64) = std.atomic.Value(usize).init(0),
+        // sharing between producer and consumer threads (128 bytes on
+        // aarch64 big cores, 64 on most x86_64).
+        head: std.atomic.Value(usize) align(std.atomic.cache_line) = std.atomic.Value(usize).init(0),
+        tail: std.atomic.Value(usize) align(std.atomic.cache_line) = std.atomic.Value(usize).init(0),
 
         // Storage sized cap; the ring uses cap-1 usable slots to distinguish
         // full from empty without a separate counter.
@@ -45,9 +46,7 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
             return (idx + 1) & mask;
         }
 
-        pub fn init() Self {
-            return .{};
-        }
+        pub const init: Self = .{};
 
         /// Push an item onto the queue (producer side).
         /// Returns true on success, false if the queue is full.
@@ -128,22 +127,22 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
 // -----------------------------------------------------------------------
 
 test "FrameQueue starts empty" {
-    var q = FrameQueue(i32, 4).init();
+    var q: FrameQueue(i32, 4) = .init;
     try std.testing.expect(q.empty());
     try std.testing.expect(!q.full());
 }
 
 test "FrameQueue push and pop round-trips values" {
-    var q = FrameQueue(i32, 4).init();
+    var q: FrameQueue(i32, 4) = .init;
     try std.testing.expect(q.push(42));
     const v = q.pop();
     try std.testing.expect(v != null);
-    try std.testing.expectEqual(@as(i32, 42), v.?);
+    try std.testing.expectEqual(42, v.?);
     try std.testing.expect(q.empty());
 }
 
 test "FrameQueue preserves FIFO order" {
-    var q = FrameQueue(i32, 8).init();
+    var q: FrameQueue(i32, 8) = .init;
     var i: i32 = 0;
     while (i < 7) : (i += 1) {
         try std.testing.expect(q.push(i));
@@ -157,32 +156,32 @@ test "FrameQueue preserves FIFO order" {
 }
 
 test "FrameQueue pop on empty returns null" {
-    var q = FrameQueue(i32, 4).init();
+    var q: FrameQueue(i32, 4) = .init;
     const v = q.pop();
     try std.testing.expect(v == null);
 }
 
 test "FrameQueue peek is non-destructive and sees the front" {
-    var q = FrameQueue(i32, 8).init();
+    var q: FrameQueue(i32, 8) = .init;
     try std.testing.expect(q.peek() == null); // empty
     try std.testing.expect(q.peekNext() == null); // empty
     try std.testing.expect(q.push(10));
     try std.testing.expect(q.peek() != null);
-    try std.testing.expectEqual(@as(i32, 10), q.peek().?.*);
+    try std.testing.expectEqual(10, q.peek().?.*);
     try std.testing.expect(q.peekNext() == null); // only one item
     try std.testing.expect(q.push(20));
-    try std.testing.expectEqual(@as(i32, 10), q.peek().?.*);
+    try std.testing.expectEqual(10, q.peek().?.*);
     try std.testing.expect(q.peekNext() != null);
-    try std.testing.expectEqual(@as(i32, 20), q.peekNext().?.*);
+    try std.testing.expectEqual(20, q.peekNext().?.*);
     const v = q.pop();
     try std.testing.expect(v != null);
-    try std.testing.expectEqual(@as(i32, 10), v.?);
-    try std.testing.expectEqual(@as(i32, 20), q.peek().?.*);
+    try std.testing.expectEqual(10, v.?);
+    try std.testing.expectEqual(20, q.peek().?.*);
     try std.testing.expect(q.peekNext() == null);
 }
 
 test "FrameQueue push returns false when full" {
-    var q = FrameQueue(i32, 4).init(); // capacity == 3 usable slots
+    var q: FrameQueue(i32, 4) = .init; // capacity == 3 usable slots
     try std.testing.expect(q.push(1));
     try std.testing.expect(q.push(2));
     try std.testing.expect(q.push(3));
@@ -192,7 +191,7 @@ test "FrameQueue push returns false when full" {
 }
 
 test "FrameQueue is not full after a pop makes space" {
-    var q = FrameQueue(i32, 4).init();
+    var q: FrameQueue(i32, 4) = .init;
     _ = q.push(1);
     _ = q.push(2);
     _ = q.push(3);
@@ -206,7 +205,7 @@ test "FrameQueue is not full after a pop makes space" {
 
 test "FrameQueue wraps around ring correctly" {
     // Fill, drain, fill again to exercise wrap-around
-    var q = FrameQueue(i32, 4).init(); // 3 usable slots
+    var q: FrameQueue(i32, 4) = .init; // 3 usable slots
     var round: i32 = 0;
     while (round < 3) : (round += 1) {
         var i: i32 = 0;
@@ -226,13 +225,13 @@ test "FrameQueue works with move-only type" {
     // C++ exercises std::unique_ptr<int>; Zig has no move-only type, so we
     // exercise the same "owns a heap allocation transferred through the
     // queue" property with an allocated pointer instead.
-    var q = FrameQueue(?*i32, 4).init();
+    var q: FrameQueue(?*i32, 4) = .init;
     const p = try std.testing.allocator.create(i32);
     p.* = 7;
     _ = q.push(p);
     const v = q.pop();
     try std.testing.expect(v != null);
-    try std.testing.expectEqual(@as(i32, 7), v.?.?.*);
+    try std.testing.expectEqual(7, v.?.?.*);
     std.testing.allocator.destroy(v.?.?);
 }
 
@@ -242,7 +241,7 @@ test "FrameQueue works with move-only type" {
 
 test "FrameQueue SPSC concurrent push/pop" {
     const kItems: i32 = 100_000;
-    var q = FrameQueue(i32, 64).init();
+    var q: FrameQueue(i32, 64) = .init;
 
     var consumed = std.atomic.Value(i32).init(0);
     var sum_produced = std.atomic.Value(i64).init(0);

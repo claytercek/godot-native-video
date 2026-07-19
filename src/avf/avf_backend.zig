@@ -117,10 +117,10 @@ pub const AvfBackend = struct {
     color: core.Colorimetry = core.Colorimetry.bt709_defaults,
 
     // Per-track audio metadata. Strings point into `string_storage`.
-    audio_tracks: std.ArrayListUnmanaged(core.AudioTrackInfo) = .empty,
+    audio_tracks: std.ArrayList(core.AudioTrackInfo) = .empty,
     // Owned copies of the language strings backing audio_tracks[*].language;
     // valid until close().
-    string_storage: std.ArrayListUnmanaged([]u8) = .empty,
+    string_storage: std.ArrayList([]u8) = .empty,
 
     selected_audio_index: i32 = 0,
     audio_channels: i32 = 0,
@@ -158,22 +158,27 @@ pub const AvfBackend = struct {
     }
 
     // ---- lifecycle ----
+    // The vtable contract is bool, so openImpl translates the error union at
+    // the boundary: any failure marks err and tears back down to closed.
     fn openImpl(self: *AvfBackend, url_or_path: []const u8) bool {
+        self.openInner(url_or_path) catch {
+            self.err = true;
+            self.closeImpl();
+            return false;
+        };
+        return true;
+    }
+
+    fn openInner(self: *AvfBackend, url_or_path: []const u8) !void {
         self.closeImpl();
         self.err = false;
 
         // NUL-terminate the path for the C boundary.
-        const path_z = self.allocator.dupeZ(u8, url_or_path) catch {
-            self.err = true;
-            return false;
-        };
+        const path_z = try self.allocator.dupeZ(u8, url_or_path);
         defer self.allocator.free(path_z);
 
         var info: c_open_info = undefined;
-        if (nv_avf_open(self.shim, path_z.ptr, &info) == 0) {
-            self.err = true;
-            return false;
-        }
+        if (nv_avf_open(self.shim, path_z.ptr, &info) == 0) return error.OpenFailed;
 
         self.opened = true;
         self.duration = info.duration_seconds;
@@ -184,35 +189,26 @@ pub const AvfBackend = struct {
 
         // Cache per-track audio metadata, duplicating language strings into
         // backend-owned storage so the slices stay valid until close().
-        const count: i32 = @intCast(info.audio_track_count);
-        var i: i32 = 0;
-        while (i < count) : (i += 1) {
+        const count: usize = @intCast(@max(info.audio_track_count, 0));
+        for (0..count) |i| {
             var track: c_audio_track_info = undefined;
-            if (nv_avf_get_audio_track_info(self.shim, i, &track) == 0) continue;
+            if (nv_avf_get_audio_track_info(self.shim, @intCast(i), &track) == 0) continue;
 
             const lang_src: []const u8 = if (track.language) |p| std.mem.span(p) else "";
-            const lang_copy = self.allocator.dupe(u8, lang_src) catch {
-                self.err = true;
-                self.closeImpl();
-                return false;
-            };
-            self.string_storage.append(self.allocator, lang_copy) catch {
-                self.allocator.free(lang_copy);
-                self.err = true;
-                self.closeImpl();
-                return false;
-            };
-            self.audio_tracks.append(self.allocator, .{
+            const lang_copy = try self.allocator.dupe(u8, lang_src);
+            {
+                // Owned by string_storage from here; closeImpl frees it on any
+                // later failure.
+                errdefer self.allocator.free(lang_copy);
+                try self.string_storage.append(self.allocator, lang_copy);
+            }
+            try self.audio_tracks.append(self.allocator, .{
                 .language = lang_copy,
                 .name = "", // not surfaced by AVFoundation in v1 (matches C++)
                 .channels = @intCast(track.channels),
                 .sample_rate = @intCast(track.sample_rate),
                 .is_default = track.is_default != 0,
-            }) catch {
-                self.err = true;
-                self.closeImpl();
-                return false;
-            };
+            });
         }
 
         // Initialise selection from the first (default) track, mirroring the
@@ -231,11 +227,7 @@ pub const AvfBackend = struct {
             self.selected_audio_index
         else
             -1;
-        if (nv_avf_build_reader(self.shim, 0.0, audio_idx) != 1) {
-            self.err = true;
-            return false;
-        }
-        return true;
+        if (nv_avf_build_reader(self.shim, 0.0, audio_idx) != 1) return error.BuildReaderFailed;
     }
 
     fn closeImpl(self: *AvfBackend) void {
@@ -265,7 +257,7 @@ pub const AvfBackend = struct {
 
     fn seekImpl(self: *AvfBackend, pts_seconds: f64) bool {
         if (!self.opened) return false;
-        const target = if (pts_seconds < 0.0) 0.0 else pts_seconds;
+        const target = @max(pts_seconds, 0.0);
         // Tear down any dedicated audio-only reader so seek builds a fresh
         // combined reader with both video and the selected audio track.
         nv_avf_teardown_audio_reader(self.shim);
@@ -293,7 +285,7 @@ pub const AvfBackend = struct {
         const count: i32 = @intCast(self.audio_tracks.items.len);
         if (count == 0) return false; // no audio tracks to select
         const clamped = std.math.clamp(index, 0, count - 1);
-        const target = if (pts_seconds < 0.0) 0.0 else pts_seconds;
+        const target = @max(pts_seconds, 0.0);
 
         // Mirrors C++ build_audio_reader() clearing the error flag at entry;
         // a hard reader failure (-1) sets it, a soft failure (0) leaves it.

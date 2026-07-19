@@ -476,10 +476,10 @@ const AcceptAllMixSink = struct {
 test "WallClockMs holds its value and supports comparison/arithmetic via .ms" {
     const a = WallClockMs.init(100.0);
     const b = WallClockMs.init(30.0);
-    try std.testing.expectEqual(@as(f64, 100.0), a.ms);
-    try std.testing.expectEqual(@as(f64, 30.0), b.ms);
-    try std.testing.expectApproxEqAbs(@as(f64, 70.0), a.ms - b.ms, 1e-9);
-    try std.testing.expectEqual(@as(f64, 0.0), (WallClockMs{}).ms);
+    try std.testing.expectEqual(100.0, a.ms);
+    try std.testing.expectEqual(30.0, b.ms);
+    try std.testing.expectApproxEqAbs(70.0, a.ms - b.ms, 1e-9);
+    try std.testing.expectEqual(0.0, (WallClockMs{}).ms);
 }
 
 // =======================================================================
@@ -496,15 +496,15 @@ test "load() derives the Canonical Mix Format and warns once on a mixed sample r
     }, 4096).backend(), 0.0);
 
     try std.testing.expect(controller.isLoaded());
-    try std.testing.expectEqual(@as(i32, 6), controller.canonicalChannels()); // max across tracks
-    try std.testing.expectEqual(@as(i32, 44100), controller.canonicalSampleRate()); // first audio-bearing
+    try std.testing.expectEqual(6, controller.canonicalChannels()); // max across tracks
+    try std.testing.expectEqual(44100, controller.canonicalSampleRate()); // first audio-bearing
 
     var warnings = controller.takeWarnings();
     defer {
         for (warnings.items) |s| alloc.free(s);
         warnings.deinit(alloc);
     }
-    try std.testing.expectEqual(@as(usize, 1), warnings.items.len);
+    try std.testing.expectEqual(1, warnings.items.len);
     try expectContains(warnings.items[0], "differs from the canonical rate");
 
     controller.shutdown();
@@ -516,8 +516,8 @@ test "a silent clip (no audio tracks) reports zero channels and no warnings" {
     try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
 
     try std.testing.expect(controller.isLoaded());
-    try std.testing.expectEqual(@as(i32, 0), controller.canonicalChannels());
-    try std.testing.expectEqual(@as(i32, 0), controller.canonicalSampleRate());
+    try std.testing.expectEqual(0, controller.canonicalChannels());
+    try std.testing.expectEqual(0, controller.canonicalSampleRate());
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
@@ -538,13 +538,13 @@ test "an out-of-range pre-load track selection is validated and reset once load(
 
     try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 2, .sample_rate = 48000 }}, 4096).backend(), 0.0);
 
-    try std.testing.expectEqual(@as(i32, 0), controller.desiredAudioTrack()); // out of range -> fell back to 0
+    try std.testing.expectEqual(0, controller.desiredAudioTrack()); // out of range -> fell back to 0
     var warnings = controller.takeWarnings();
     defer {
         for (warnings.items) |s| alloc.free(s);
         warnings.deinit(alloc);
     }
-    try std.testing.expectEqual(@as(usize, 1), warnings.items.len);
+    try std.testing.expectEqual(1, warnings.items.len);
     try expectContains(warnings.items[0], "out of range");
 
     controller.shutdown();
@@ -577,19 +577,19 @@ test "a mid-stream reselect the backend refuses rolls the desired track back" {
     controller.play(WallClockMs.init(0.0));
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
-    try std.testing.expectEqual(@as(i32, 1), controller.desiredAudioTrack());
+    try std.testing.expectEqual(1, controller.desiredAudioTrack());
 
     var sink = CappedMixSink{ .accept_cap = 4096 };
     _ = controller.tick(1.0 / 60.0, WallClockMs.init(16.6), sink.sink());
 
-    try std.testing.expectEqual(@as(i32, 0), controller.desiredAudioTrack()); // rolled back
-    try std.testing.expectEqual(@as(i32, 0), controller.liveAudioTrack());
+    try std.testing.expectEqual(0, controller.desiredAudioTrack()); // rolled back
+    try std.testing.expectEqual(0, controller.liveAudioTrack());
     var warnings = controller.takeWarnings();
     defer {
         for (warnings.items) |s| alloc.free(s);
         warnings.deinit(alloc);
     }
-    try std.testing.expectEqual(@as(usize, 1), warnings.items.len);
+    try std.testing.expectEqual(1, warnings.items.len);
     try expectContains(warnings.items[0], "failed; recovering via seek");
 
     controller.shutdown();
@@ -607,7 +607,7 @@ test "stop() resets transport state and tick() is a no-op before load()" {
 
     controller.stop();
     try std.testing.expect(!controller.isPlaying());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), controller.position(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, controller.position(), 1e-9);
 
     controller.shutdown();
 }
@@ -625,10 +625,10 @@ test "request_audio_track while stopped applies immediately via select_audio_tra
 
     controller.requestAudioTrack(1);
 
-    try std.testing.expectEqual(@as(i32, 1), controller.desiredAudioTrack());
-    try std.testing.expectEqual(@as(i32, 1), controller.liveAudioTrack()); // applied immediately
-    try std.testing.expectEqual(@as(i32, 1), be.select_calls);
-    try std.testing.expectEqual(@as(i32, 0), be.reselect_calls); // cheap path never touches reselect
+    try std.testing.expectEqual(1, controller.desiredAudioTrack());
+    try std.testing.expectEqual(1, controller.liveAudioTrack()); // applied immediately
+    try std.testing.expectEqual(1, be.select_calls);
+    try std.testing.expectEqual(0, be.reselect_calls); // cheap path never touches reselect
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
@@ -644,15 +644,15 @@ test "a live reselect success converges desired/live, and a converged reconcile 
     controller.play(WallClockMs.init(0.0));
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
-    try std.testing.expectEqual(@as(i32, 1), controller.desiredAudioTrack());
-    try std.testing.expectEqual(@as(i32, 0), controller.liveAudioTrack()); // not yet reconciled
+    try std.testing.expectEqual(1, controller.desiredAudioTrack());
+    try std.testing.expectEqual(0, controller.liveAudioTrack()); // not yet reconciled
 
     var sink = CappedMixSink{ .accept_cap = 4096 };
     _ = controller.tick(1.0 / 60.0, WallClockMs.init(16.6), sink.sink()); // reconciles: reselect succeeds
 
-    try std.testing.expectEqual(@as(i32, 1), controller.desiredAudioTrack());
-    try std.testing.expectEqual(@as(i32, 1), controller.liveAudioTrack());
-    try std.testing.expectEqual(@as(i32, 1), be.reselect_calls);
+    try std.testing.expectEqual(1, controller.desiredAudioTrack());
+    try std.testing.expectEqual(1, controller.liveAudioTrack());
+    try std.testing.expectEqual(1, be.reselect_calls);
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
@@ -661,7 +661,7 @@ test "a live reselect success converges desired/live, and a converged reconcile 
     // stop it from reselecting again every tick.
     _ = controller.tick(1.0 / 60.0, WallClockMs.init(33.2), sink.sink());
     _ = controller.tick(1.0 / 60.0, WallClockMs.init(49.8), sink.sink());
-    try std.testing.expectEqual(@as(i32, 1), be.reselect_calls); // unchanged
+    try std.testing.expectEqual(1, be.reselect_calls); // unchanged
 
     controller.shutdown();
 }
@@ -671,12 +671,12 @@ test "requesting the already-desired track is a no-op and never touches the back
     defer controller.deinit();
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
     try controller.load(alloc, be.backend(), 0.0);
-    try std.testing.expectEqual(@as(i32, 0), be.select_calls); // load() had no pending switch to apply
+    try std.testing.expectEqual(0, be.select_calls); // load() had no pending switch to apply
 
     controller.requestAudioTrack(0); // already desired -> short-circuits
 
-    try std.testing.expectEqual(@as(i32, 0), be.select_calls);
-    try std.testing.expectEqual(@as(i32, 0), be.reselect_calls);
+    try std.testing.expectEqual(0, be.select_calls);
+    try std.testing.expectEqual(0, be.reselect_calls);
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
@@ -714,9 +714,9 @@ test "one-clock rule: a silent clip advances the clock by exactly the render del
     var sink = CappedMixSink{ .accept_cap = 4096 }; // never invoked: no audio track
 
     _ = controller.tick(0.1, WallClockMs.init(100.0), sink.sink());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.1), controller.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.1, controller.mediaTime(), 1e-9);
     _ = controller.tick(0.1, WallClockMs.init(200.0), sink.sink());
-    try std.testing.expectApproxEqAbs(@as(f64, 0.2), controller.mediaTime(), 1e-9); // linear, not doubled
+    try std.testing.expectApproxEqAbs(0.2, controller.mediaTime(), 1e-9); // linear, not doubled
 
     controller.shutdown();
 }
@@ -813,10 +813,10 @@ test "derive_canonical_mix_format: max channel count across tracks; first audio-
     defer fmt.deinit(alloc);
 
     try std.testing.expect(fmt.has_audio);
-    try std.testing.expectEqual(@as(i32, 6), fmt.channels); // max across tracks
-    try std.testing.expectEqual(@as(i32, 44100), fmt.sample_rate); // first audio-bearing track
-    try std.testing.expectEqual(@as(usize, 3), fmt.track_infos.items.len);
-    try std.testing.expectEqual(@as(i32, 44100), fmt.track_infos.items[2].sample_rate);
+    try std.testing.expectEqual(6, fmt.channels); // max across tracks
+    try std.testing.expectEqual(44100, fmt.sample_rate); // first audio-bearing track
+    try std.testing.expectEqual(3, fmt.track_infos.items.len);
+    try std.testing.expectEqual(44100, fmt.track_infos.items[2].sample_rate);
 }
 
 test "derive_canonical_mix_format: mixed sample rate warns exactly once, later matching tracks silent" {
@@ -829,7 +829,7 @@ test "derive_canonical_mix_format: mixed sample rate warns exactly once, later m
     var fmt = try canonical_mix_format.deriveCanonicalMixFormat(alloc, be.backend());
     defer fmt.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), fmt.warnings.items.len);
+    try std.testing.expectEqual(1, fmt.warnings.items.len);
     try expectContains(fmt.warnings.items[0], "differs from the canonical rate");
 }
 
@@ -841,8 +841,8 @@ test "derive_canonical_mix_format: a silent clip (no tracks) yields no audio and
     defer fmt.deinit(alloc);
 
     try std.testing.expect(!fmt.has_audio);
-    try std.testing.expectEqual(@as(i32, 0), fmt.channels);
-    try std.testing.expectEqual(@as(i32, 0), fmt.sample_rate);
+    try std.testing.expectEqual(0, fmt.channels);
+    try std.testing.expectEqual(0, fmt.sample_rate);
     try std.testing.expect(fmt.warnings.items.len == 0);
 }
 
@@ -864,9 +864,9 @@ test "derive_canonical_mix_format: track metadata without sample-rate audio is s
     defer fmt.deinit(alloc);
 
     try std.testing.expect(!fmt.has_audio);
-    try std.testing.expectEqual(@as(i32, 0), fmt.sample_rate);
-    try std.testing.expectEqual(@as(i32, 2), fmt.channels); // channel count is still tracked
-    try std.testing.expectEqual(@as(usize, 1), fmt.track_infos.items.len);
+    try std.testing.expectEqual(0, fmt.sample_rate);
+    try std.testing.expectEqual(2, fmt.channels); // channel count is still tracked
+    try std.testing.expectEqual(1, fmt.track_infos.items.len);
 }
 
 test "load() clamps a track's channel count to kMaxMixSourceChannels" {
@@ -888,13 +888,13 @@ test "a mid-stream switch to a differing sample-rate track is refused while play
 
     controller.requestAudioTrack(1); // differing rate while playing -> refused
 
-    try std.testing.expectEqual(@as(i32, 0), controller.desiredAudioTrack()); // unchanged
+    try std.testing.expectEqual(0, controller.desiredAudioTrack()); // unchanged
     var warnings = controller.takeWarnings();
     defer {
         for (warnings.items) |s| alloc.free(s);
         warnings.deinit(alloc);
     }
-    try std.testing.expectEqual(@as(usize, 1), warnings.items.len);
+    try std.testing.expectEqual(1, warnings.items.len);
     try expectContains(warnings.items[0], "Rejecting switch");
 
     controller.shutdown();
@@ -909,8 +909,8 @@ test "a switch to a differing sample-rate track is allowed while stopped" {
 
     controller.requestAudioTrack(1); // stopped: no live audio path to disturb
 
-    try std.testing.expectEqual(@as(i32, 1), controller.desiredAudioTrack());
-    try std.testing.expectEqual(@as(i32, 1), controller.liveAudioTrack());
+    try std.testing.expectEqual(1, controller.desiredAudioTrack());
+    try std.testing.expectEqual(1, controller.liveAudioTrack());
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
@@ -971,7 +971,7 @@ test "the exact-resolve spin treats a frame within epsilon of the target as arri
         controller.seek(target, WallClockMs.init(0.0));
         // Check before shutdown(): unregister releases the in-tolerance survivor,
         // which would otherwise inflate this count by one.
-        try std.testing.expectEqual(@as(i32, 0), drops_in_tolerance.load(.monotonic));
+        try std.testing.expectEqual(0, drops_in_tolerance.load(.monotonic));
         controller.shutdown();
     }
 
@@ -983,7 +983,7 @@ test "the exact-resolve spin treats a frame within epsilon of the target as arri
         defer controller.deinit();
         try controller.load(alloc, ExactPtsBackend.create(alloc, &.{ target - kSpinEps * 2.0, target - kSpinEps * 0.5 }, &drops_out_of_tolerance).backend(), 0.0);
         controller.seek(target, WallClockMs.init(0.0));
-        try std.testing.expectEqual(@as(i32, 1), drops_out_of_tolerance.load(.monotonic));
+        try std.testing.expectEqual(1, drops_out_of_tolerance.load(.monotonic));
         controller.shutdown();
     }
 }

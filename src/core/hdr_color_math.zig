@@ -158,18 +158,10 @@ const transfer_pq: i32 = @intFromEnum(backend.TransferFunction.pq);
 
 pub fn hdrToSdr(r: *f64, g: *f64, b: *f64, transfer: i32) void {
     // Step 1: EOTF (non-linear -> linear absolute luminance)
-    var lr: f64 = undefined;
-    var lg: f64 = undefined;
-    var lb: f64 = undefined;
-    if (transfer == transfer_pq) {
-        lr = pqEotf(r.*);
-        lg = pqEotf(g.*);
-        lb = pqEotf(b.*);
-    } else {
-        lr = hlgDisplayEotf(r.*);
-        lg = hlgDisplayEotf(g.*);
-        lb = hlgDisplayEotf(b.*);
-    }
+    var lr: f64, var lg: f64, var lb: f64 = if (transfer == transfer_pq)
+        .{ pqEotf(r.*), pqEotf(g.*), pqEotf(b.*) }
+    else
+        .{ hlgDisplayEotf(r.*), hlgDisplayEotf(g.*), hlgDisplayEotf(b.*) };
 
     // Step 2: Tone-map each channel to SDR-normalized [0, 1].
     lr = toneMap(lr, reference_white);

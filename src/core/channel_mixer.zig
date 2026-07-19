@@ -86,17 +86,11 @@ pub fn mixChannels(
         // min(src_channels, dst_channels) samples of each frame and zero
         // anything left over in the destination.
         const copy_channels: usize = @intCast(@min(src_channels, dst_channels));
-        var f: usize = 0;
-        while (f < @as(usize, @intCast(frame_count))) : (f += 1) {
+        for (0..@intCast(frame_count)) |f| {
             const in = src[f * sc ..];
             const out = dst[f * dc ..];
-            var c: usize = 0;
-            while (c < copy_channels) : (c += 1) {
-                out[c] = in[c];
-            }
-            while (c < dc) : (c += 1) {
-                out[c] = 0.0;
-            }
+            @memcpy(out[0..copy_channels], in[0..copy_channels]);
+            @memset(out[copy_channels..dc], 0.0);
         }
         return;
     }
@@ -107,16 +101,12 @@ pub fn mixChannels(
     // owns iteration and the zero-fill shared by every layout.
     // -------------------------------------------------------------------
 
-    var f: usize = 0;
-    while (f < @as(usize, @intCast(frame_count))) : (f += 1) {
+    for (0..@intCast(frame_count)) |f| {
         const in = src[f * sc ..];
         const out = dst[f * dc ..];
 
         // Zero the output frame first so unset channels are silence.
-        var c: usize = 0;
-        while (c < dc) : (c += 1) {
-            out[c] = 0.0;
-        }
+        @memset(out[0..dc], 0.0);
 
         switch (src_channels) {
             1 => mixFrameFromMono(in, out, dst_channels),
@@ -197,9 +187,9 @@ test "mix_channels passthrough same channel count (1->1)" {
     const in = [_]f32{ 0.5, -0.25, 1.0 };
     var out = [_]f32{-999.0} ** 3;
     mixChannels(&in, 1, &out, 1, 3);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.25), out[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(0.5, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(-0.25, out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0, out[2], 1e-6);
 }
 
 test "mix_channels passthrough same channel count (2->2)" {
@@ -220,16 +210,16 @@ test "mix_channels empty frame_count writes nothing" {
     const in = [_]f32{ 1.0, 2.0 };
     var out = [_]f32{ 999.0, 999.0 };
     mixChannels(&in, 2, &out, 1, 0);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[1], 1e-6);
 }
 
 test "mix_channels degenerate src_channels writes nothing" {
     const in = [_]f32{ 1.0, 2.0 };
     var out = [_]f32{ 999.0, 999.0 };
     mixChannels(&in, 0, &out, 2, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[1], 1e-6);
 }
 
 // -----------------------------------------------------------------------
@@ -242,12 +232,12 @@ test "mix_channels mono to stereo" {
     var out = [_]f32{-999.0} ** 6;
     mixChannels(&in, 1, &out, 2, 3);
     // Each mono frame should duplicate to both L and R.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.25), out[2], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.25), out[3], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[4], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[5], 1e-6);
+    try std.testing.expectApproxEqAbs(0.5, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.5, out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(-0.25, out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(-0.25, out[3], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0, out[4], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0, out[5], 1e-6);
 }
 
 // -----------------------------------------------------------------------
@@ -260,19 +250,19 @@ test "mix_channels mono to 5.1" {
     var out = [_]f32{0.0} ** 12;
     mixChannels(&in, 1, &out, 6, 2);
     // Only C (index 2) should be set; L, R, LFE, Ls, Rs remain 0.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6); // L
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[1], 1e-6); // R
-    try std.testing.expectApproxEqAbs(@as(f32, 0.8), out[2], 1e-6); // C
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[3], 1e-6); // LFE
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[4], 1e-6); // Ls
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 1e-6); // Rs
+    try std.testing.expectApproxEqAbs(0.0, out[0], 1e-6); // L
+    try std.testing.expectApproxEqAbs(0.0, out[1], 1e-6); // R
+    try std.testing.expectApproxEqAbs(0.8, out[2], 1e-6); // C
+    try std.testing.expectApproxEqAbs(0.0, out[3], 1e-6); // LFE
+    try std.testing.expectApproxEqAbs(0.0, out[4], 1e-6); // Ls
+    try std.testing.expectApproxEqAbs(0.0, out[5], 1e-6); // Rs
 
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[6], 1e-6); // L
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[7], 1e-6); // R
-    try std.testing.expectApproxEqAbs(@as(f32, -0.4), out[8], 1e-6); // C
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[9], 1e-6); // LFE
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[10], 1e-6); // Ls
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[11], 1e-6); // Rs
+    try std.testing.expectApproxEqAbs(0.0, out[6], 1e-6); // L
+    try std.testing.expectApproxEqAbs(0.0, out[7], 1e-6); // R
+    try std.testing.expectApproxEqAbs(-0.4, out[8], 1e-6); // C
+    try std.testing.expectApproxEqAbs(0.0, out[9], 1e-6); // LFE
+    try std.testing.expectApproxEqAbs(0.0, out[10], 1e-6); // Ls
+    try std.testing.expectApproxEqAbs(0.0, out[11], 1e-6); // Rs
 }
 
 // -----------------------------------------------------------------------
@@ -285,9 +275,9 @@ test "mix_channels stereo to mono" {
     var out = [_]f32{-999.0} ** 3;
     mixChannels(&in, 2, &out, 1, 3);
     // Mono = 0.5*(L+R)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6); // 0.5*(1 + 0)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[1], 1e-6); // 0.5*(0 + 1)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[2], 1e-6); // 0.5*(0.5 + 0.5)
+    try std.testing.expectApproxEqAbs(0.5, out[0], 1e-6); // 0.5*(1 + 0)
+    try std.testing.expectApproxEqAbs(0.5, out[1], 1e-6); // 0.5*(0 + 1)
+    try std.testing.expectApproxEqAbs(0.5, out[2], 1e-6); // 0.5*(0.5 + 0.5)
 }
 
 // -----------------------------------------------------------------------
@@ -300,16 +290,16 @@ test "mix_channels stereo to 5.1" {
     var out = [_]f32{-999.0} ** 12;
     mixChannels(&in, 2, &out, 6, 2);
     // L -> L, R -> R; C, LFE, Ls, Rs remain 0.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.6), out[0], 1e-6); // L
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), out[1], 1e-6); // R
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[2], 1e-6); // C
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[3], 1e-6); // LFE
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[4], 1e-6); // Ls
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[5], 1e-6); // Rs
+    try std.testing.expectApproxEqAbs(0.6, out[0], 1e-6); // L
+    try std.testing.expectApproxEqAbs(0.4, out[1], 1e-6); // R
+    try std.testing.expectApproxEqAbs(0.0, out[2], 1e-6); // C
+    try std.testing.expectApproxEqAbs(0.0, out[3], 1e-6); // LFE
+    try std.testing.expectApproxEqAbs(0.0, out[4], 1e-6); // Ls
+    try std.testing.expectApproxEqAbs(0.0, out[5], 1e-6); // Rs
 
-    try std.testing.expectApproxEqAbs(@as(f32, -0.2), out[6], 1e-6); // L
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9), out[7], 1e-6); // R
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[8], 1e-6); // C
+    try std.testing.expectApproxEqAbs(-0.2, out[6], 1e-6); // L
+    try std.testing.expectApproxEqAbs(0.9, out[7], 1e-6); // R
+    try std.testing.expectApproxEqAbs(0.0, out[8], 1e-6); // C
 }
 
 // -----------------------------------------------------------------------
@@ -323,8 +313,8 @@ test "mix_channels 5.1 to stereo downmix" {
     const in = [_]f32{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
     var out = [_]f32{-999.0} ** 2;
     mixChannels(&in, 6, &out, 2, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[1], 1e-6);
 }
 
 test "mix_channels 5.1 to stereo centre bleeds into both channels" {
@@ -332,8 +322,8 @@ test "mix_channels 5.1 to stereo centre bleeds into both channels" {
     const in = [_]f32{ 0.0, 0.0, 1.0, 0.0, 0.0, 0.0 };
     var out = [_]f32{-999.0} ** 2;
     mixChannels(&in, 6, &out, 2, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.707), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.707), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(0.707, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.707, out[1], 1e-6);
 }
 
 test "mix_channels 5.1 to stereo surrounds bleed into opposite" {
@@ -341,8 +331,8 @@ test "mix_channels 5.1 to stereo surrounds bleed into opposite" {
     const in = [_]f32{ 0.0, 0.0, 0.0, 0.0, 1.0, 0.0 };
     var out = [_]f32{-999.0} ** 2;
     mixChannels(&in, 6, &out, 2, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.707), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(0.707, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[1], 1e-6);
 }
 
 test "mix_channels 5.1 to stereo LFE excluded" {
@@ -350,8 +340,8 @@ test "mix_channels 5.1 to stereo LFE excluded" {
     const in = [_]f32{ 0.0, 0.0, 0.0, 1.0, 0.0, 0.0 };
     var out = [_]f32{-999.0} ** 2;
     mixChannels(&in, 6, &out, 2, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[1], 1e-6);
 }
 
 test "mix_channels 5.1 to stereo complex signal" {
@@ -361,8 +351,8 @@ test "mix_channels 5.1 to stereo complex signal" {
     const in = [_]f32{ 0.5, 0.3, 0.2, 0.1, 0.4, 0.6 };
     var out = [_]f32{-999.0} ** 2;
     mixChannels(&in, 6, &out, 2, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9242), out[0], 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.8656), out[1], 1e-4);
+    try std.testing.expectApproxEqAbs(0.9242, out[0], 1e-4);
+    try std.testing.expectApproxEqAbs(0.8656, out[1], 1e-4);
 }
 
 // -----------------------------------------------------------------------
@@ -374,7 +364,7 @@ test "mix_channels 5.1 to mono centre-only" {
     const in = [_]f32{ 0.0, 0.0, 1.0, 0.0, 0.0, 0.0 };
     var out = [_]f32{-999.0} ** 1;
     mixChannels(&in, 6, &out, 1, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.414), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0 / 3.414, out[0], 1e-6);
 }
 
 test "mix_channels 5.1 to mono all channels active" {
@@ -393,7 +383,7 @@ test "mix_channels 5.1 to mono LFE excluded from 5.1" {
     const in = [_]f32{ 0.0, 0.0, 0.0, 1.0, 0.0, 0.0 };
     var out = [_]f32{-999.0} ** 1;
     mixChannels(&in, 6, &out, 1, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[0], 1e-6);
 }
 
 // -----------------------------------------------------------------------
@@ -422,8 +412,8 @@ test "mix_channels converts multiple frames correctly" {
     const in = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
     var out = [_]f32{-999.0} ** 2;
     mixChannels(&in, 2, &out, 1, 2);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(0.5, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.5, out[1], 1e-6);
 }
 
 // -----------------------------------------------------------------------
@@ -456,10 +446,8 @@ test "mix_channels 8ch source to 6ch dst never overflows the dst buffer" {
 
     // First dst_channels samples of each frame equal the source's first
     // dst_channels samples.
-    var f: usize = 0;
-    while (f < @as(usize, @intCast(frame_count))) : (f += 1) {
-        var c: usize = 0;
-        while (c < @as(usize, @intCast(dst_channels))) : (c += 1) {
+    for (0..@intCast(frame_count)) |f| {
+        for (0..@intCast(dst_channels)) |c| {
             try std.testing.expectApproxEqAbs(
                 in[f * @as(usize, @intCast(src_channels)) + c],
                 out[f * @as(usize, @intCast(dst_channels)) + c],
@@ -469,9 +457,8 @@ test "mix_channels 8ch source to 6ch dst never overflows the dst buffer" {
     }
 
     // Canary region past the dst buffer must be untouched.
-    var i: usize = dst_size;
-    while (i < dst_size + canary_count) : (i += 1) {
-        try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[i], 1e-6);
+    for (out[dst_size..]) |v| {
+        try std.testing.expectApproxEqAbs(999.0, v, 1e-6);
     }
 }
 
@@ -479,19 +466,19 @@ test "mix_channels 5ch to 2ch copies first two channels only" {
     const in = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0 };
     var out = [_]f32{-999.0} ** 2;
     mixChannels(&in, 5, &out, 2, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(2.0, out[1], 1e-6);
 }
 
 test "mix_channels 2ch to 5ch copies two channels and zeros the rest" {
     const in = [_]f32{ 0.6, 0.4 };
     var out = [_]f32{-999.0} ** 5;
     mixChannels(&in, 2, &out, 5, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.6), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), out[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[2], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[3], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[4], 1e-6);
+    try std.testing.expectApproxEqAbs(0.6, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(0.4, out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[3], 1e-6);
+    try std.testing.expectApproxEqAbs(0.0, out[4], 1e-6);
 }
 
 test "mix_channels 3ch to 3ch uses the memcpy fast path" {
@@ -506,12 +493,12 @@ test "mix_channels degenerate frame_count and src_channels write nothing (canary
     var out = [_]f32{ 999.0, 999.0, 999.0 };
 
     mixChannels(&in, 3, &out, 3, 0);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[2], 1e-6);
 
     mixChannels(&in, 0, &out, 3, 1);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[1], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), out[2], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[1], 1e-6);
+    try std.testing.expectApproxEqAbs(999.0, out[2], 1e-6);
 }

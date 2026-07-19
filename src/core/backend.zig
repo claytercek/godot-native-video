@@ -309,13 +309,13 @@ test "default audio track helpers mirror C++ base class" {
 
     var with_audio: Fake = .{ .channels = 2 };
     const b: Backend = .{ .ptr = &with_audio, .vtable = &Fake.vtable };
-    try std.testing.expectEqual(@as(i32, 1), b.audioTrackCount());
-    try std.testing.expectEqual(@as(i32, 2), b.audioTrackInfo(0).channels);
+    try std.testing.expectEqual(1, b.audioTrackCount());
+    try std.testing.expectEqual(2, b.audioTrackInfo(0).channels);
     try std.testing.expect(b.audioTrackInfo(0).is_default);
-    try std.testing.expectEqual(@as(i32, 0), b.audioTrackInfo(1).channels);
+    try std.testing.expectEqual(0, b.audioTrackInfo(1).channels);
     try std.testing.expect(!b.reselectAudioTrack(0, 0.0));
 
     var no_audio: Fake = .{ .channels = 0 };
     const b2: Backend = .{ .ptr = &no_audio, .vtable = &Fake.vtable };
-    try std.testing.expectEqual(@as(i32, 0), b2.audioTrackCount());
+    try std.testing.expectEqual(0, b2.audioTrackCount());
 }
