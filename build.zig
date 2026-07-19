@@ -2,15 +2,29 @@ const std = @import("std");
 const Build = std.Build;
 const gdzig = @import("gdzig");
 
-// Machine-specific default so `zig build run` works with zero args; override
-// with -Dgodot-path or the GODOT_PATH env var.
+// Machine-specific convenience so `zig build run` works with zero args; only
+// used when the file exists. Override with -Dgodot-path or the GODOT_PATH env
+// var.
 const default_godot = "/Users/clay/.gdvm/installs/registry.gdvm.io-7999f4302078c203/default/4.6.3-stable/Godot.app/Contents/MacOS/Godot";
+
+// Downloaded by the build for bindgen when no local Godot binary is available
+// (e.g. CI). Resolves to the newest matching stable release.
+const default_godot_version = "4.6";
 
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
     const env_godot = b.graph.environ_map.get("GODOT_PATH");
-    const godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot orelse default_godot;
+    const opt_godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot;
+    const opt_godot_version = b.option([]const u8, "godot-version", "Godot version to download for bindgen (e.g. `4.6`)");
+
+    // Explicit path > explicit version > local default binary > downloaded
+    // default version.
+    const godot_path: ?[]const u8 = opt_godot_path orelse blk: {
+        if (opt_godot_version != null) break :blk null;
+        std.Io.Dir.accessAbsolute(b.graph.io, default_godot, .{}) catch break :blk null;
+        break :blk default_godot;
+    };
 
     // --- Core: pure Zig, no Godot dependency. Mirrors src/core/ in C++. ---
     const core_mod = b.createModule(.{
@@ -24,10 +38,14 @@ pub fn build(b: *Build) !void {
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
     // --- Godot extension: gdzig glue + AVFoundation backend. ---
-    const gdzig_dep = b.dependency("gdzig", .{
+    const gdzig_dep = if (godot_path) |p| b.dependency("gdzig", .{
         .target = target,
         .optimize = optimize,
-        .@"godot-path" = godot_path,
+        .@"godot-path" = p,
+    }) else b.dependency("gdzig", .{
+        .target = target,
+        .optimize = optimize,
+        .@"godot-version" = opt_godot_version orelse default_godot_version,
     });
 
     // AVFoundation backend as its own module so src/avf can import "core"

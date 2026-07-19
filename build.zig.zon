@@ -2,9 +2,10 @@
     .name = .native_video_zig,
     .fingerprint = 0xbad401ad9bad7f1,
     .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .gdzig = .{
-            .path = "../gdzig-016",
+            .path = "vendor/gdzig",
         },
     },
     .paths = .{
