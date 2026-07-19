@@ -118,9 +118,9 @@ pub const PresentPipeline = struct {
     width: i32 = 0,
     height: i32 = 0,
     state: State = .unbuilt,
-    output_mode_: OutputMode = .sdr,
+    output_mode: OutputMode = .sdr,
 
-    cpu_copy_count_: u64 = 0, // invariant: 0 on the zero-copy Import Paths
+    cpu_copy_count: u64 = 0, // invariant: 0 on the zero-copy Import Paths
 
     pub fn init(allocator: std.mem.Allocator) PresentPipeline {
         return .{ .allocator = allocator };
@@ -135,11 +135,11 @@ pub const PresentPipeline = struct {
     }
 
     pub fn outputMode(self: *const PresentPipeline) OutputMode {
-        return self.output_mode_;
+        return self.output_mode;
     }
 
     pub fn cpuCopyCount(self: *const PresentPipeline) u64 {
-        return self.cpu_copy_count_;
+        return self.cpu_copy_count;
     }
 
     /// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
@@ -147,8 +147,8 @@ pub const PresentPipeline = struct {
     /// rgba16f), so buildResources() rebuilds everything, shader included.
     /// No-op if Disabled: there is nothing to rebuild.
     pub fn setOutputMode(self: *PresentPipeline, mode: OutputMode) void {
-        if (mode != self.output_mode_) {
-            self.output_mode_ = mode;
+        if (mode != self.output_mode) {
+            self.output_mode = mode;
             if (self.state == .ready) {
                 self.state = .unbuilt; // force rebuild on next ensureReady
             }
@@ -213,7 +213,7 @@ pub const PresentPipeline = struct {
         }
 
         // --- Compile the shader variant for the active output mode. ---
-        const want_hdr = self.output_mode_ == .hdr;
+        const want_hdr = self.output_mode == .hdr;
         const label = if (want_hdr) "nv12_to_rgb_hdr" else "nv12_to_rgb";
         self.shader = compileShader(rd, want_hdr);
         if (!self.shader.isValid()) return false;
@@ -384,7 +384,7 @@ pub const PresentPipeline = struct {
 
         // Count this frame if the CPU-Copy Import Path produced the planes.
         if (!importer.isZeroCopy()) {
-            self.cpu_copy_count_ += 1;
+            self.cpu_copy_count += 1;
         }
 
         // Park this frame's surfaces (plane textures + uniform set + the

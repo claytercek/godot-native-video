@@ -47,7 +47,7 @@ pub fn unregister(r: *Registry) void {
 allocator: Allocator,
 base: *VideoStream,
 
-output_mode_: i64 = 0, // matches NativeVideoStreamPlayback OutputMode
+output_mode: i64 = 0, // matches NativeVideoStreamPlayback OutputMode
 
 // Instance ids of playbacks instantiated from this stream. ObjectIDs, not
 // refs, on purpose: the stream must never extend a playback's lifetime.
@@ -113,18 +113,18 @@ fn resolvePlayback(id: u64) ?*NativeVideoStreamPlayback {
 
 pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
     if (mode < 0 or mode > 1) return;
-    self.output_mode_ = mode;
+    self.output_mode = mode;
     // Forward to every still-alive playback instantiated from this stream.
     self.pruneDeadPlaybacks();
     for (self.playback_ids.items) |id| {
         if (resolvePlayback(id)) |playback| {
-            playback.setOutputMode(self.output_mode_);
+            playback.setOutputMode(self.output_mode);
         }
     }
 }
 
 pub fn getOutputMode(self: *NativeVideoStream) i64 {
-    return self.output_mode_;
+    return self.output_mode;
 }
 
 /// Lazy, cached probe of audio track metadata. Probes exactly once; the result
@@ -184,7 +184,7 @@ pub fn getAudioTracks(self: *NativeVideoStream) Array {
 /// the stream to obtain a playback. Mirrors C++ _instantiate_playback().
 pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     const playback = NativeVideoStreamPlayback.create(&self.allocator) catch return null;
-    playback.setOutputMode(self.output_mode_);
+    playback.setOutputMode(self.output_mode);
 
     // Prune dead ids, then record the new playback's id so setOutputMode() can
     // reach it later. The list stays bounded across many instantiations.

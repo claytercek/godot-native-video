@@ -206,7 +206,7 @@ pub fn _stop(self: *NativeVideoStreamPlayback) void {
 }
 
 pub fn _isPlaying(self: *NativeVideoStreamPlayback) bool {
-    return self.controller.isPlaying();
+    return self.controller.playing;
 }
 
 pub fn _setPaused(self: *NativeVideoStreamPlayback, paused: bool) void {
@@ -214,15 +214,15 @@ pub fn _setPaused(self: *NativeVideoStreamPlayback, paused: bool) void {
 }
 
 pub fn _isPaused(self: *NativeVideoStreamPlayback) bool {
-    return self.controller.isPaused();
+    return self.controller.paused;
 }
 
 pub fn _getLength(self: *NativeVideoStreamPlayback) f64 {
-    return self.controller.length();
+    return self.controller.length;
 }
 
 pub fn _getPlaybackPosition(self: *NativeVideoStreamPlayback) f64 {
-    return self.controller.position();
+    return self.controller.position;
 }
 
 pub fn _seek(self: *NativeVideoStreamPlayback, time: f64) void {
@@ -261,12 +261,12 @@ pub fn _getChannels(self: *NativeVideoStreamPlayback) i32 {
     // Canonical Mix Format channel count (maximum across all audio tracks,
     // computed at load). Godot sizes its mix buffer from this and queries it
     // once at play start, so it is stable for the playback's lifetime.
-    return self.controller.canonicalChannels();
+    return self.controller.canonical_channels;
 }
 
 pub fn _getMixRate(self: *NativeVideoStreamPlayback) i32 {
     // Canonical Mix Format sample rate: the FIRST audio-bearing track's rate.
-    return self.controller.canonicalSampleRate();
+    return self.controller.canonical_sample_rate;
 }
 
 // --- Colorimetry ---
@@ -275,7 +275,7 @@ pub fn _getMixRate(self: *NativeVideoStreamPlayback) i32 {
 /// load() succeeds. Untagged clips return BT.709 video-range defaults. Always
 /// includes an "output_mode" key (0 or 1) reporting the effective output mode.
 pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
-    const color: Colorimetry = self.controller.colorimetry();
+    const color: Colorimetry = self.controller.color;
     var info = Dictionary.init();
     setDictInt(&info, "matrix", @intFromEnum(color.matrix));
     setDictInt(&info, "primaries", @intFromEnum(color.primaries));

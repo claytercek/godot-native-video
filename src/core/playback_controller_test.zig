@@ -495,9 +495,9 @@ test "load() derives the Canonical Mix Format and warns once on a mixed sample r
         .{ .channels = 6, .sample_rate = 44100 }, // track 2: matches canonical rate -> no warning
     }, 4096).backend(), 0.0);
 
-    try std.testing.expect(controller.isLoaded());
-    try std.testing.expectEqual(6, controller.canonicalChannels()); // max across tracks
-    try std.testing.expectEqual(44100, controller.canonicalSampleRate()); // first audio-bearing
+    try std.testing.expect(controller.loaded);
+    try std.testing.expectEqual(6, controller.canonical_channels); // max across tracks
+    try std.testing.expectEqual(44100, controller.canonical_sample_rate); // first audio-bearing
 
     var warnings = controller.takeWarnings();
     defer {
@@ -515,9 +515,9 @@ test "a silent clip (no audio tracks) reports zero channels and no warnings" {
     defer controller.deinit();
     try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
 
-    try std.testing.expect(controller.isLoaded());
-    try std.testing.expectEqual(0, controller.canonicalChannels());
-    try std.testing.expectEqual(0, controller.canonicalSampleRate());
+    try std.testing.expect(controller.loaded);
+    try std.testing.expectEqual(0, controller.canonical_channels);
+    try std.testing.expectEqual(0, controller.canonical_sample_rate);
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
@@ -538,7 +538,7 @@ test "an out-of-range pre-load track selection is validated and reset once load(
 
     try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 2, .sample_rate = 48000 }}, 4096).backend(), 0.0);
 
-    try std.testing.expectEqual(0, controller.desiredAudioTrack()); // out of range -> fell back to 0
+    try std.testing.expectEqual(0, controller.desired_track); // out of range -> fell back to 0
     var warnings = controller.takeWarnings();
     defer {
         for (warnings.items) |s| alloc.free(s);
@@ -577,13 +577,13 @@ test "a mid-stream reselect the backend refuses rolls the desired track back" {
     controller.play(WallClockMs.init(0.0));
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
-    try std.testing.expectEqual(1, controller.desiredAudioTrack());
+    try std.testing.expectEqual(1, controller.desired_track);
 
     var sink = CappedMixSink{ .accept_cap = 4096 };
     _ = controller.tick(1.0 / 60.0, WallClockMs.init(16.6), sink.sink());
 
-    try std.testing.expectEqual(0, controller.desiredAudioTrack()); // rolled back
-    try std.testing.expectEqual(0, controller.liveAudioTrack());
+    try std.testing.expectEqual(0, controller.desired_track); // rolled back
+    try std.testing.expectEqual(0, controller.live_track);
     var warnings = controller.takeWarnings();
     defer {
         for (warnings.items) |s| alloc.free(s);
@@ -603,11 +603,11 @@ test "stop() resets transport state and tick() is a no-op before load()" {
 
     try controller.load(alloc, makeStereoBackend(), 0.0);
     controller.play(WallClockMs.init(0.0));
-    try std.testing.expect(controller.isPlaying());
+    try std.testing.expect(controller.playing);
 
     controller.stop();
-    try std.testing.expect(!controller.isPlaying());
-    try std.testing.expectApproxEqAbs(0.0, controller.position(), 1e-9);
+    try std.testing.expect(!controller.playing);
+    try std.testing.expectApproxEqAbs(0.0, controller.position, 1e-9);
 
     controller.shutdown();
 }
@@ -621,12 +621,12 @@ test "request_audio_track while stopped applies immediately via select_audio_tra
     defer controller.deinit();
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
     try controller.load(alloc, be.backend(), 0.0);
-    try std.testing.expect(!controller.isPlaying());
+    try std.testing.expect(!controller.playing);
 
     controller.requestAudioTrack(1);
 
-    try std.testing.expectEqual(1, controller.desiredAudioTrack());
-    try std.testing.expectEqual(1, controller.liveAudioTrack()); // applied immediately
+    try std.testing.expectEqual(1, controller.desired_track);
+    try std.testing.expectEqual(1, controller.live_track); // applied immediately
     try std.testing.expectEqual(1, be.select_calls);
     try std.testing.expectEqual(0, be.reselect_calls); // cheap path never touches reselect
     var w = controller.takeWarnings();
@@ -644,14 +644,14 @@ test "a live reselect success converges desired/live, and a converged reconcile 
     controller.play(WallClockMs.init(0.0));
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
-    try std.testing.expectEqual(1, controller.desiredAudioTrack());
-    try std.testing.expectEqual(0, controller.liveAudioTrack()); // not yet reconciled
+    try std.testing.expectEqual(1, controller.desired_track);
+    try std.testing.expectEqual(0, controller.live_track); // not yet reconciled
 
     var sink = CappedMixSink{ .accept_cap = 4096 };
     _ = controller.tick(1.0 / 60.0, WallClockMs.init(16.6), sink.sink()); // reconciles: reselect succeeds
 
-    try std.testing.expectEqual(1, controller.desiredAudioTrack());
-    try std.testing.expectEqual(1, controller.liveAudioTrack());
+    try std.testing.expectEqual(1, controller.desired_track);
+    try std.testing.expectEqual(1, controller.live_track);
     try std.testing.expectEqual(1, be.reselect_calls);
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
@@ -874,7 +874,7 @@ test "load() clamps a track's channel count to kMaxMixSourceChannels" {
     defer controller.deinit();
     try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 8, .sample_rate = 48000 }}, 4096).backend(), 0.0);
 
-    try std.testing.expectEqual(channel_mixer.max_mix_source_channels, controller.canonicalChannels());
+    try std.testing.expectEqual(channel_mixer.max_mix_source_channels, controller.canonical_channels);
 
     controller.shutdown();
 }
@@ -888,7 +888,7 @@ test "a mid-stream switch to a differing sample-rate track is refused while play
 
     controller.requestAudioTrack(1); // differing rate while playing -> refused
 
-    try std.testing.expectEqual(0, controller.desiredAudioTrack()); // unchanged
+    try std.testing.expectEqual(0, controller.desired_track); // unchanged
     var warnings = controller.takeWarnings();
     defer {
         for (warnings.items) |s| alloc.free(s);
@@ -905,12 +905,12 @@ test "a switch to a differing sample-rate track is allowed while stopped" {
     defer controller.deinit();
     try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 44100 } }, 4096).backend(), 0.0);
     drainWarnings(&controller); // drain load()'s own mixed-sample-rate warning
-    try std.testing.expect(!controller.isPlaying());
+    try std.testing.expect(!controller.playing);
 
     controller.requestAudioTrack(1); // stopped: no live audio path to disturb
 
-    try std.testing.expectEqual(1, controller.desiredAudioTrack());
-    try std.testing.expectEqual(1, controller.liveAudioTrack());
+    try std.testing.expectEqual(1, controller.desired_track);
+    try std.testing.expectEqual(1, controller.live_track);
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
