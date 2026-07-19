@@ -11,6 +11,43 @@
 
 const std = @import("std");
 
+/// Generates the ptr+vtable forwarding shims for a type T that implements the
+/// Clock interface as plain methods (mediaTime/advance/setTime/setPaused/
+/// isPaused). MonotonicClock, AudioMasterClock, and ClockBridge each had an
+/// identical copy of this boilerplate; this comptime helper collapses the
+/// three into one.
+fn vtableFor(comptime T: type) Clock.VTable {
+    const Impl = struct {
+        fn mediaTimeVt(ptr: *anyopaque) f64 {
+            const self: *const T = @ptrCast(@alignCast(ptr));
+            return self.mediaTime();
+        }
+        fn advanceVt(ptr: *anyopaque, delta_seconds: f64) void {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            self.advance(delta_seconds);
+        }
+        fn setTimeVt(ptr: *anyopaque, time_seconds: f64) void {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            self.setTime(time_seconds);
+        }
+        fn setPausedVt(ptr: *anyopaque, paused: bool) void {
+            const self: *T = @ptrCast(@alignCast(ptr));
+            self.setPaused(paused);
+        }
+        fn isPausedVt(ptr: *anyopaque) bool {
+            const self: *const T = @ptrCast(@alignCast(ptr));
+            return self.isPaused();
+        }
+    };
+    return .{
+        .media_time = Impl.mediaTimeVt,
+        .advance = Impl.advanceVt,
+        .set_time = Impl.setTimeVt,
+        .set_paused = Impl.setPausedVt,
+        .is_paused = Impl.isPausedVt,
+    };
+}
+
 /// Pure-virtual C++ Clock → ptr + vtable (see backend.zig for the pattern).
 /// MonotonicClock, AudioMasterClock, and ClockBridge each expose `asClock()`
 /// to obtain this interface without owning-pointer indirection.
@@ -88,34 +125,7 @@ pub const MonotonicClock = struct {
         return self.paused;
     }
 
-    fn mediaTimeVt(ptr: *anyopaque) f64 {
-        const self: *const MonotonicClock = @ptrCast(@alignCast(ptr));
-        return self.mediaTime();
-    }
-    fn advanceVt(ptr: *anyopaque, delta_seconds: f64) void {
-        const self: *MonotonicClock = @ptrCast(@alignCast(ptr));
-        self.advance(delta_seconds);
-    }
-    fn setTimeVt(ptr: *anyopaque, time_seconds: f64) void {
-        const self: *MonotonicClock = @ptrCast(@alignCast(ptr));
-        self.setTime(time_seconds);
-    }
-    fn setPausedVt(ptr: *anyopaque, paused: bool) void {
-        const self: *MonotonicClock = @ptrCast(@alignCast(ptr));
-        self.setPaused(paused);
-    }
-    fn isPausedVt(ptr: *anyopaque) bool {
-        const self: *const MonotonicClock = @ptrCast(@alignCast(ptr));
-        return self.isPaused();
-    }
-
-    const vtable: Clock.VTable = .{
-        .media_time = mediaTimeVt,
-        .advance = advanceVt,
-        .set_time = setTimeVt,
-        .set_paused = setPausedVt,
-        .is_paused = isPausedVt,
-    };
+    const vtable: Clock.VTable = vtableFor(MonotonicClock);
 
     pub fn asClock(self: *MonotonicClock) Clock {
         return .{ .ptr = self, .vtable = &vtable };
@@ -178,34 +188,7 @@ pub const AudioMasterClock = struct {
         return self.paused;
     }
 
-    fn mediaTimeVt(ptr: *anyopaque) f64 {
-        const self: *const AudioMasterClock = @ptrCast(@alignCast(ptr));
-        return self.mediaTime();
-    }
-    fn advanceVt(ptr: *anyopaque, delta_seconds: f64) void {
-        const self: *AudioMasterClock = @ptrCast(@alignCast(ptr));
-        self.advance(delta_seconds);
-    }
-    fn setTimeVt(ptr: *anyopaque, time_seconds: f64) void {
-        const self: *AudioMasterClock = @ptrCast(@alignCast(ptr));
-        self.setTime(time_seconds);
-    }
-    fn setPausedVt(ptr: *anyopaque, paused: bool) void {
-        const self: *AudioMasterClock = @ptrCast(@alignCast(ptr));
-        self.setPaused(paused);
-    }
-    fn isPausedVt(ptr: *anyopaque) bool {
-        const self: *const AudioMasterClock = @ptrCast(@alignCast(ptr));
-        return self.isPaused();
-    }
-
-    const vtable: Clock.VTable = .{
-        .media_time = mediaTimeVt,
-        .advance = advanceVt,
-        .set_time = setTimeVt,
-        .set_paused = setPausedVt,
-        .is_paused = isPausedVt,
-    };
+    const vtable: Clock.VTable = vtableFor(AudioMasterClock);
 
     pub fn asClock(self: *AudioMasterClock) Clock {
         return .{ .ptr = self, .vtable = &vtable };
@@ -319,43 +302,23 @@ pub const ClockBridge = struct {
         }
     }
 
+    /// Read a field of the inner audio clock, or `default` for a silent clip
+    /// (no audio track) — the "no audio -> silent clip" defaulting shared by
+    /// sampleRate() and latencySeconds().
+    fn audioFieldOr(self: *const ClockBridge, comptime field: []const u8, default: anytype) @TypeOf(default) {
+        return if (self.audio) |a| @field(a, field) else default;
+    }
+
     /// Accessors delegated to the inner audio clock. Return zero when there
     /// is no audio clock (silent clip).
     pub fn sampleRate(self: *const ClockBridge) i32 {
-        return if (self.audio) |a| a.sample_rate else 0;
+        return self.audioFieldOr("sample_rate", @as(i32, 0));
     }
     pub fn latencySeconds(self: *const ClockBridge) f64 {
-        return if (self.audio) |a| a.latency_seconds else 0.0;
+        return self.audioFieldOr("latency_seconds", @as(f64, 0.0));
     }
 
-    fn mediaTimeVt(ptr: *anyopaque) f64 {
-        const self: *const ClockBridge = @ptrCast(@alignCast(ptr));
-        return self.mediaTime();
-    }
-    fn advanceVt(ptr: *anyopaque, delta_seconds: f64) void {
-        const self: *ClockBridge = @ptrCast(@alignCast(ptr));
-        self.advance(delta_seconds);
-    }
-    fn setTimeVt(ptr: *anyopaque, time_seconds: f64) void {
-        const self: *ClockBridge = @ptrCast(@alignCast(ptr));
-        self.setTime(time_seconds);
-    }
-    fn setPausedVt(ptr: *anyopaque, paused: bool) void {
-        const self: *ClockBridge = @ptrCast(@alignCast(ptr));
-        self.setPaused(paused);
-    }
-    fn isPausedVt(ptr: *anyopaque) bool {
-        const self: *const ClockBridge = @ptrCast(@alignCast(ptr));
-        return self.isPaused();
-    }
-
-    const vtable: Clock.VTable = .{
-        .media_time = mediaTimeVt,
-        .advance = advanceVt,
-        .set_time = setTimeVt,
-        .set_paused = setPausedVt,
-        .is_paused = isPausedVt,
-    };
+    const vtable: Clock.VTable = vtableFor(ClockBridge);
 
     pub fn asClock(self: *ClockBridge) Clock {
         return .{ .ptr = self, .vtable = &vtable };

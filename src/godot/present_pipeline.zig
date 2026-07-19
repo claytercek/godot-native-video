@@ -215,34 +215,8 @@ pub const PresentPipeline = struct {
         // --- Compile the shader variant for the active output mode. ---
         const want_hdr = self.output_mode_ == .hdr;
         const label = if (want_hdr) "nv12_to_rgb_hdr" else "nv12_to_rgb";
-        const source_text = if (want_hdr) shaders.nv12_to_rgb_hdr_compute else shaders.nv12_to_rgb_compute;
-
-        const src = RdShaderSource.init();
-        defer if (src.unreference()) src.destroy();
-        src.setLanguage(.shader_language_glsl);
-        var source_str = String.fromLatin1(source_text);
-        defer source_str.deinit();
-        src.setStageSource(.shader_stage_compute, source_str);
-
-        const spirv = rd.shaderCompileSpirvFromSource(src, .{}) orelse {
-            log.err("{s} shader compile returned null.", .{label});
-            return false;
-        };
-        defer if (spirv.unreference()) spirv.destroy();
-        var compile_err = spirv.getStageCompileError(.shader_stage_compute);
-        defer compile_err.deinit();
-        if (compile_err.length() != 0) {
-            log.err("{s} shader compile error.", .{label});
-            return false;
-        }
-
-        var label_str = String.fromLatin1(label);
-        defer label_str.deinit();
-        self.shader = rd.shaderCreateFromSpirv(spirv, .{ .name = label_str });
-        if (!self.shader.isValid()) {
-            log.err("{s} shader_create_from_spirv failed.", .{label});
-            return false;
-        }
+        self.shader = compileShader(rd, want_hdr);
+        if (!self.shader.isValid()) return false;
 
         self.pipeline = rd.computePipelineCreate(self.shader, .{});
         if (!self.pipeline.isValid()) {
@@ -266,7 +240,58 @@ pub const PresentPipeline = struct {
             .data_format_r16g16b16a16_sfloat
         else
             .data_format_r8g8b8a8_unorm;
+        if (!self.buildRingTextures(rd, tex_fmt, width, height)) return false;
 
+        self.width = width;
+        self.height = height;
+        self.ring_index = 0;
+        // Point the stable output texture at slot 0. This fires `changed`, so
+        // the player's cached texture picks up the real dimensions.
+        self.getTexture().setTextureRdRid(self.ring[0].rgba_rid);
+        self.state = .ready;
+        return true;
+    }
+
+    /// Compile the NV12->RGB compute shader for the requested output mode and
+    /// create the RD shader object. Returns si.rid_invalid on any compile or
+    /// creation failure (logged).
+    fn compileShader(rd: *RenderingDevice, want_hdr: bool) Rid {
+        const label = if (want_hdr) "nv12_to_rgb_hdr" else "nv12_to_rgb";
+        const source_text = if (want_hdr) shaders.nv12_to_rgb_hdr_compute else shaders.nv12_to_rgb_compute;
+
+        const src = RdShaderSource.init();
+        defer if (src.unreference()) src.destroy();
+        src.setLanguage(.shader_language_glsl);
+        var source_str = String.fromLatin1(source_text);
+        defer source_str.deinit();
+        src.setStageSource(.shader_stage_compute, source_str);
+
+        const spirv = rd.shaderCompileSpirvFromSource(src, .{}) orelse {
+            log.err("{s} shader compile returned null.", .{label});
+            return si.rid_invalid;
+        };
+        defer if (spirv.unreference()) spirv.destroy();
+        var compile_err = spirv.getStageCompileError(.shader_stage_compute);
+        defer compile_err.deinit();
+        if (compile_err.length() != 0) {
+            log.err("{s} shader compile error.", .{label});
+            return si.rid_invalid;
+        }
+
+        var label_str = String.fromLatin1(label);
+        defer label_str.deinit();
+        const shader = rd.shaderCreateFromSpirv(spirv, .{ .name = label_str });
+        if (!shader.isValid()) {
+            log.err("{s} shader_create_from_spirv failed.", .{label});
+            return si.rid_invalid;
+        }
+        return shader;
+    }
+
+    /// Build the N engine-owned RGBA output storage textures (rgba16f for
+    /// HDR, rgba8 for SDR) into self.ring. Returns false on any failure
+    /// (logged); self.ring holds whatever slots were created so far.
+    fn buildRingTextures(self: *PresentPipeline, rd: *RenderingDevice, tex_fmt: RenderingDevice.DataFormat, width: i32, height: i32) bool {
         for (0..ring_depth) |i| {
             const tf = RdTextureFormat.init();
             defer if (tf.unreference()) tf.destroy();
@@ -293,14 +318,6 @@ pub const PresentPipeline = struct {
             }
             self.ring[i].rgba_rid = rgba;
         }
-
-        self.width = width;
-        self.height = height;
-        self.ring_index = 0;
-        // Point the stable output texture at slot 0. This fires `changed`, so
-        // the player's cached texture picks up the real dimensions.
-        self.getTexture().setTextureRdRid(self.ring[0].rgba_rid);
-        self.state = .ready;
         return true;
     }
 
@@ -333,39 +350,7 @@ pub const PresentPipeline = struct {
         self.ring_index = (self.ring_index + 1) % ring_depth;
         const slot = self.ring[self.ring_index];
 
-
-        // --- Build the uniform set: luma(0), chroma(1), rgba_out(2). ---
-        const u_luma = RdUniform.init();
-        defer if (u_luma.unreference()) u_luma.destroy();
-        u_luma.setUniformType(.uniform_type_sampler_with_texture);
-        u_luma.setBinding(0);
-        u_luma.addId(self.sampler);
-        u_luma.addId(planes.luma);
-
-        const u_chroma = RdUniform.init();
-        defer if (u_chroma.unreference()) u_chroma.destroy();
-        u_chroma.setUniformType(.uniform_type_sampler_with_texture);
-        u_chroma.setBinding(1);
-        u_chroma.addId(self.sampler);
-        u_chroma.addId(planes.chroma);
-
-        const u_out = RdUniform.init();
-        defer if (u_out.unreference()) u_out.destroy();
-        u_out.setUniformType(.uniform_type_image);
-        u_out.setBinding(2);
-        u_out.addId(slot.rgba_rid);
-
-        var uniforms = Array.init();
-        defer uniforms.deinit();
-        // Boxing a RefCounted into a Variant takes a ref; deinit the local
-        // Variant after append (which takes its own) or the uniform leaks.
-        inline for (.{ u_luma, u_chroma, u_out }) |u| {
-            var v = Variant.init(*RdUniform, u);
-            uniforms.append(v);
-            v.deinit();
-        }
-
-        const uniform_set = rd.uniformSetCreate(uniforms, self.shader, 0);
+        const uniform_set = self.buildUniformSet(rd, planes, slot);
         if (!uniform_set.isValid()) {
             planes.release.call();
             frame.release();
@@ -374,21 +359,8 @@ pub const PresentPipeline = struct {
 
         // Push constant: output dimensions + colorimetry + bit depth + the
         // importer's 10-bit sample scale (std430, push_constant_size bytes).
-        var pc = PackedByteArray.init();
+        var pc = self.buildPushConstants(frame, planes.sample_scale);
         defer pc.deinit();
-        _ = pc.resize(@intCast(push_constants.push_constant_size));
-        {
-            // pack into a stack buffer, then copy into the PackedByteArray.
-            var buf: [push_constants.push_constant_size]u8 = undefined;
-            push_constants.packPushConstants(
-                &buf,
-                @intCast(self.width),
-                @intCast(self.height),
-                frame.color,
-                planes.sample_scale,
-            );
-            for (buf, 0..) |b, i| pc.set(@intCast(i), @intCast(b));
-        }
 
         // Cross-API sync hooks (no-op on macOS: acquire/release are empty).
         planes.acquire.call();
@@ -434,6 +406,64 @@ pub const PresentPipeline = struct {
         };
         self.retire.retain(.{ .ctx = payload, .func = RetirePayload.run });
         return true;
+    }
+
+    /// Build the uniform set binding the decoded planes and the output ring
+    /// slot to the compute shader: luma(0), chroma(1), rgba_out(2). Returns
+    /// whatever rd.uniformSetCreate() returns (si.rid_invalid on failure);
+    /// the caller is responsible for releasing `planes`/`frame` on failure.
+    fn buildUniformSet(self: *PresentPipeline, rd: *RenderingDevice, planes: PlaneTextures, slot: RingSlot) Rid {
+        const u_luma = RdUniform.init();
+        defer if (u_luma.unreference()) u_luma.destroy();
+        u_luma.setUniformType(.uniform_type_sampler_with_texture);
+        u_luma.setBinding(0);
+        u_luma.addId(self.sampler);
+        u_luma.addId(planes.luma);
+
+        const u_chroma = RdUniform.init();
+        defer if (u_chroma.unreference()) u_chroma.destroy();
+        u_chroma.setUniformType(.uniform_type_sampler_with_texture);
+        u_chroma.setBinding(1);
+        u_chroma.addId(self.sampler);
+        u_chroma.addId(planes.chroma);
+
+        const u_out = RdUniform.init();
+        defer if (u_out.unreference()) u_out.destroy();
+        u_out.setUniformType(.uniform_type_image);
+        u_out.setBinding(2);
+        u_out.addId(slot.rgba_rid);
+
+        var uniforms = Array.init();
+        defer uniforms.deinit();
+        // Boxing a RefCounted into a Variant takes a ref; deinit the local
+        // Variant after append (which takes its own) or the uniform leaks.
+        inline for (.{ u_luma, u_chroma, u_out }) |u| {
+            var v = Variant.init(*RdUniform, u);
+            uniforms.append(v);
+            v.deinit();
+        }
+
+        return rd.uniformSetCreate(uniforms, self.shader, 0);
+    }
+
+    /// Pack the compute shader's push constants (output dimensions +
+    /// colorimetry + bit depth + the importer's 10-bit sample scale) into a
+    /// PackedByteArray ready for rd.computeListSetPushConstant(). The caller
+    /// owns the returned array and must deinit() it.
+    fn buildPushConstants(self: *PresentPipeline, frame: VideoFrame, sample_scale: f32) PackedByteArray {
+        var pc = PackedByteArray.init();
+        _ = pc.resize(@intCast(push_constants.push_constant_size));
+        // pack into a stack buffer, then copy into the PackedByteArray.
+        var buf: [push_constants.push_constant_size]u8 = undefined;
+        push_constants.packPushConstants(
+            &buf,
+            @intCast(self.width),
+            @intCast(self.height),
+            frame.color,
+            sample_scale,
+        );
+        for (buf, 0..) |b, i| pc.set(@intCast(i), @intCast(b));
+        return pc;
     }
 
     fn freeResources(self: *PresentPipeline) void {

@@ -38,6 +38,13 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
         // full from empty without a separate counter.
         storage: [cap]T = undefined,
 
+        /// Ring-advance: the slot index one step past `idx`, wrapping via
+        /// mask. Shared by push()/full()/peekNext() so the wrap arithmetic
+        /// lives in exactly one place.
+        fn nextIndex(idx: usize) usize {
+            return (idx + 1) & mask;
+        }
+
         pub fn init() Self {
             return .{};
         }
@@ -46,7 +53,7 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
         /// Returns true on success, false if the queue is full.
         pub fn push(self: *Self, item: T) bool {
             const tail = self.tail.load(.monotonic);
-            const next = (tail + 1) & mask;
+            const next = nextIndex(tail);
 
             if (next == self.head.load(.acquire)) {
                 // Queue is full.
@@ -79,7 +86,7 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
             if (head == tail) {
                 return null; // empty
             }
-            const second = (head + 1) & mask;
+            const second = nextIndex(head);
             if (second == tail) {
                 return null; // exactly one item
             }
@@ -111,20 +118,7 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
         /// Only reliable when called from the producer thread.
         pub fn full(self: *const Self) bool {
             const tail = self.tail.load(.monotonic);
-            const next = (tail + 1) & mask;
-            return next == self.head.load(.acquire);
-        }
-
-        /// Approximate item count. Not exact under concurrent access.
-        pub fn sizeApprox(self: *const Self) usize {
-            const tail = self.tail.load(.acquire);
-            const head = self.head.load(.acquire);
-            return (tail +% cap -% head) & mask;
-        }
-
-        /// The maximum number of items the queue can hold.
-        pub fn capacity() usize {
-            return cap - 1;
+            return nextIndex(tail) == self.head.load(.acquire);
         }
     };
 }
@@ -137,14 +131,6 @@ test "FrameQueue starts empty" {
     var q = FrameQueue(i32, 4).init();
     try std.testing.expect(q.empty());
     try std.testing.expect(!q.full());
-    try std.testing.expectEqual(@as(usize, 0), q.sizeApprox());
-}
-
-test "FrameQueue capacity is Capacity-1" {
-    // With cap=4 the usable slots are 3 (one sentinel for full/empty)
-    try std.testing.expectEqual(@as(usize, 3), FrameQueue(i32, 4).capacity());
-    try std.testing.expectEqual(@as(usize, 7), FrameQueue(i32, 8).capacity());
-    try std.testing.expectEqual(@as(usize, 15), FrameQueue(i32, 16).capacity());
 }
 
 test "FrameQueue push and pop round-trips values" {
@@ -188,8 +174,6 @@ test "FrameQueue peek is non-destructive and sees the front" {
     try std.testing.expectEqual(@as(i32, 10), q.peek().?.*);
     try std.testing.expect(q.peekNext() != null);
     try std.testing.expectEqual(@as(i32, 20), q.peekNext().?.*);
-    // Peeking did not consume anything.
-    try std.testing.expectEqual(@as(usize, 2), q.sizeApprox());
     const v = q.pop();
     try std.testing.expect(v != null);
     try std.testing.expectEqual(@as(i32, 10), v.?);
@@ -218,19 +202,6 @@ test "FrameQueue is not full after a pop makes space" {
     try std.testing.expect(v != null);
     try std.testing.expect(!q.full());
     try std.testing.expect(q.push(99));
-}
-
-test "FrameQueue size_approx tracks item count" {
-    var q = FrameQueue(i32, 8).init();
-    try std.testing.expectEqual(@as(usize, 0), q.sizeApprox());
-    _ = q.push(1);
-    try std.testing.expectEqual(@as(usize, 1), q.sizeApprox());
-    _ = q.push(2);
-    try std.testing.expectEqual(@as(usize, 2), q.sizeApprox());
-    _ = q.pop();
-    try std.testing.expectEqual(@as(usize, 1), q.sizeApprox());
-    _ = q.pop();
-    try std.testing.expectEqual(@as(usize, 0), q.sizeApprox());
 }
 
 test "FrameQueue wraps around ring correctly" {

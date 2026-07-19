@@ -10,6 +10,10 @@
 //! `Mutex`/`Condition` below wrap the new primitives behind the old
 //! infallible, io-free call shape (lock/unlock/wait/signal/broadcast) so
 //! call sites elsewhere are unchanged.
+//!
+//! global_single_threaded only disables Io's async task spawning; its futex
+//! ops are real OS futexes, so Mutex/Condition here are fully correct across
+//! std.Thread.spawn worker pools — that's why this io-free facade is sound.
 
 const std = @import("std");
 
@@ -27,10 +31,6 @@ pub const Mutex = struct {
 
     pub fn unlock(m: *Mutex) void {
         m.inner.unlock(io());
-    }
-
-    pub fn tryLock(m: *Mutex) bool {
-        return m.inner.tryLock();
     }
 };
 

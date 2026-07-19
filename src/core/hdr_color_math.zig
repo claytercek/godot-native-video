@@ -12,6 +12,7 @@
 //! All normalized signal values are in [0, 1] unless noted.
 
 const std = @import("std");
+const backend = @import("backend.zig");
 
 // =======================================================================
 // Reference white (SDR target) — 203 cd/m^2 per BT.2408-2 §4.1.
@@ -150,14 +151,17 @@ pub fn bt709Eotf(v: f64) f64 {
 // Input:  R, G, B in non-linear PQ or HLG encoded domain, BT.2020 primaries.
 // Output: R, G, B in non-linear BT.709 domain, clamped to [0, 1].
 //
-// transfer: 2 = PQ (SMPTE ST 2084), 3 = HLG (BT.2100)
+// transfer: backend.TransferFunction.pq or .hlg, packed as the raw int this
+// mirrors in the compute shader's push constants (see push_constants.zig).
 // =======================================================================
+const transfer_pq: i32 = @intFromEnum(backend.TransferFunction.pq);
+
 pub fn hdrToSdr(r: *f64, g: *f64, b: *f64, transfer: i32) void {
     // Step 1: EOTF (non-linear -> linear absolute luminance)
     var lr: f64 = undefined;
     var lg: f64 = undefined;
     var lb: f64 = undefined;
-    if (transfer == 2) {
+    if (transfer == transfer_pq) {
         lr = pqEotf(r.*);
         lg = pqEotf(g.*);
         lb = pqEotf(b.*);

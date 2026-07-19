@@ -102,7 +102,9 @@ pub fn mixChannels(
     }
 
     // -------------------------------------------------------------------
-    // Supported conversions. All coefficients are float literals.
+    // Supported conversions. All coefficients are float literals. Each
+    // per-source-layout helper mixes ONE already-zeroed frame; this loop
+    // owns iteration and the zero-fill shared by every layout.
     // -------------------------------------------------------------------
 
     var f: usize = 0;
@@ -116,61 +118,65 @@ pub fn mixChannels(
             out[c] = 0.0;
         }
 
-        // --- 1 ch (Mono) -> anything ---
-        if (src_channels == 1) {
-            const C = in[0];
-            if (dst_channels == 2) {
-                // Mono -> Stereo: centre to both L and R.
-                out[0] = C;
-                out[1] = C;
-            } else if (dst_channels == 6) {
-                // Mono -> 5.1: centre to C only.
-                out[2] = C; // C
-                // L, R, LFE, Ls, Rs remain 0.0
-            }
-            continue;
+        switch (src_channels) {
+            1 => mixFrameFromMono(in, out, dst_channels),
+            2 => mixFrameFromStereo(in, out, dst_channels),
+            6 => mixFrameFrom51(in, out, dst_channels),
+            else => unreachable, // known_layouts guarantees src_channels in {1,2,6}
         }
+    }
+}
 
-        // --- 2 ch (Stereo) -> anything ---
-        if (src_channels == 2) {
-            const L = in[0];
-            const R = in[1];
-            if (dst_channels == 1) {
-                // Stereo -> Mono: equal-weighted sum.
-                out[0] = 0.5 * L + 0.5 * R;
-            } else if (dst_channels == 6) {
-                // Stereo -> 5.1: L -> L, R -> R. C, LFE, Ls, Rs remain 0.
-                out[0] = L;
-                out[1] = R;
-            }
-            continue;
-        }
+/// Mix one Mono (1ch) source frame into `out` (already zeroed).
+fn mixFrameFromMono(in: []const f32, out: []f32, dst_channels: i32) void {
+    const C = in[0];
+    if (dst_channels == 2) {
+        // Mono -> Stereo: centre to both L and R.
+        out[0] = C;
+        out[1] = C;
+    } else if (dst_channels == 6) {
+        // Mono -> 5.1: centre to C only.
+        out[2] = C; // C
+        // L, R, LFE, Ls, Rs remain 0.0
+    }
+}
 
-        // --- 6 ch (5.1) -> anything ---
-        if (src_channels == 6) {
-            const L = in[0];
-            const R = in[1];
-            const C = in[2];
-            // in[3] = LFE — excluded from all downmixes
-            const Ls = in[4];
-            const Rs = in[5];
+/// Mix one Stereo (2ch) source frame into `out` (already zeroed).
+fn mixFrameFromStereo(in: []const f32, out: []f32, dst_channels: i32) void {
+    const L = in[0];
+    const R = in[1];
+    if (dst_channels == 1) {
+        // Stereo -> Mono: equal-weighted sum.
+        out[0] = 0.5 * L + 0.5 * R;
+    } else if (dst_channels == 6) {
+        // Stereo -> 5.1: L -> L, R -> R. C, LFE, Ls, Rs remain 0.
+        out[0] = L;
+        out[1] = R;
+    }
+}
 
-            if (dst_channels == 1) {
-                // 5.1 -> Mono: L + R + C + 0.707*(Ls + Rs), scaled by 1/3.414
-                // so a full-scale sine in any single channel produces ~0.29
-                // peak (safe from clipping when multiple channels are
-                // active).
-                out[0] = (L + R + C + 0.707 * (Ls + Rs)) / 3.414;
-            } else if (dst_channels == 2) {
-                // 5.1 -> Stereo (ITU-R BS.775 downmix).
-                // Lt = L + 0.707*C + 0.707*Ls
-                // Rt = R + 0.707*C + 0.707*Rs
-                // LFE excluded.
-                out[0] = L + 0.707 * C + 0.707 * Ls;
-                out[1] = R + 0.707 * C + 0.707 * Rs;
-            }
-            continue;
-        }
+/// Mix one 5.1 (6ch) source frame into `out` (already zeroed).
+fn mixFrameFrom51(in: []const f32, out: []f32, dst_channels: i32) void {
+    const L = in[0];
+    const R = in[1];
+    const C = in[2];
+    // in[3] = LFE — excluded from all downmixes
+    const Ls = in[4];
+    const Rs = in[5];
+
+    if (dst_channels == 1) {
+        // 5.1 -> Mono: L + R + C + 0.707*(Ls + Rs), scaled by 1/3.414
+        // so a full-scale sine in any single channel produces ~0.29
+        // peak (safe from clipping when multiple channels are
+        // active).
+        out[0] = (L + R + C + 0.707 * (Ls + Rs)) / 3.414;
+    } else if (dst_channels == 2) {
+        // 5.1 -> Stereo (ITU-R BS.775 downmix).
+        // Lt = L + 0.707*C + 0.707*Ls
+        // Rt = R + 0.707*C + 0.707*Rs
+        // LFE excluded.
+        out[0] = L + 0.707 * C + 0.707 * Ls;
+        out[1] = R + 0.707 * C + 0.707 * Rs;
     }
 }
 

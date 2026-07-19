@@ -407,12 +407,8 @@ pub const PlaybackController = struct {
         const c = clock.?;
 
         // Settle check runs regardless of play/pause: scrubbing commonly happens
-        // while paused (dragging a timeline). Once a fast drag has gone quiet for
-        // the debounce window, upgrade the approximate keyframe frame to the
-        // exact target frame.
-        if (self.scrubber_.poll(now.ms)) |settle| {
-            self.applyScrubResolve(settle);
-        }
+        // while paused (dragging a timeline).
+        self.settleScrub(now);
 
         // Reconcile any pending track switch. Runs even while paused so a switch
         // requested mid-pause (or during a scrub) is picked up promptly.
@@ -421,29 +417,49 @@ pub const PlaybackController = struct {
         if (!self.playing_ or self.paused_) return null;
         const sched = DecodeScheduler.instance();
 
-        // No-op when audio-master; keeps video advancing through
-        // monotonic-master silence (silent clip, or the handoff window during a
-        // track switch).
+        const media_now = self.advanceClock(delta_seconds, sink, c);
+        const chosen = self.selectPresentFrame(sched, media_now);
+        self.checkEndOfPlayback(sched);
+
+        return chosen;
+    }
+
+    // Settle check runs regardless of play/pause: scrubbing commonly happens
+    // while paused (dragging a timeline). Once a fast drag has gone quiet for
+    // the debounce window, upgrade the approximate keyframe frame to the
+    // exact target frame.
+    fn settleScrub(self: *PlaybackController, now: WallClockMs) void {
+        if (self.scrubber_.poll(now.ms)) |settle| {
+            self.applyScrubResolve(settle);
+        }
+    }
+
+    // Advance the master clock for this tick and return the resulting media
+    // time. `c.advance()` is a no-op when audio-master; it keeps video moving
+    // through monotonic-master silence (silent clip, or the handoff window
+    // during a track switch). One clock rule: advance from real audio samples
+    // when any exist; once no more can ever come (a shorter audio track fully
+    // drained — legitimate in real-world files), advance by the render delta
+    // instead — see advanceMasterClock().
+    fn advanceClock(self: *PlaybackController, delta_seconds: f64, sink: MixSink, c: *ClockBridge) f64 {
         c.advance(delta_seconds);
 
-        // One clock rule: advance from real audio samples when any exist; once no
-        // more can ever come (a shorter audio track fully drained — legitimate in
-        // real-world files), advance by the render delta instead. Extracted into
-        // advanceMasterClock() so the rule is a single named concept a future
-        // edit can't silently break by reordering the ifs.
         var advanced_from_audio = false;
         if (self.has_audio_) {
             self.fillAudio();
             advanced_from_audio = self.driveAudio(sink);
         }
         self.advanceMasterClock(delta_seconds, advanced_from_audio);
-        const media_now = c.mediaTime();
+        return c.mediaTime();
+    }
 
-        // --- Present step: drop-late / hold-early, via the Godot-free selector.
-        // Peek head/next PTS non-destructively (frame order is never disturbed):
-        //   * Drop  — head stale: pop+release, loop.
-        //   * Show  — head is the due frame for `media_now`: pop and present it.
-        //   * Hold  — head in the future: present nothing new.
+    // Present step: drop-late / hold-early, via the Godot-free selector. Peek
+    // head/next PTS non-destructively (frame order is never disturbed):
+    //   * Drop  — head stale: pop+release, loop.
+    //   * Show  — head is the due frame for `media_now`: pop and present it.
+    //   * Hold  — head in the future: present nothing new.
+    // Updates self.position_ when a frame is chosen.
+    fn selectPresentFrame(self: *PlaybackController, sched: *DecodeScheduler, media_now: f64) ?VideoFrame {
         const frame_interval = 1.0 / 30.0; // nominal; refined when fps is known
         var chosen: ?VideoFrame = null;
 
@@ -468,13 +484,14 @@ pub const PlaybackController = struct {
         }
 
         if (chosen) |ch| self.position_ = ch.pts_seconds;
+        return chosen;
+    }
 
-        // End-of-playback: video EOS (atEnd() is worker-reported) and audio drained.
+    // End-of-playback: video EOS (atEnd() is worker-reported) and audio drained.
+    fn checkEndOfPlayback(self: *PlaybackController, sched: *DecodeScheduler) void {
         if (sched.atEnd(self.stream_.?) and self.audioExhausted()) {
             self.playing_ = false;
         }
-
-        return chosen;
     }
 
     // ------------------------------------------------------------------
@@ -552,9 +569,7 @@ pub const PlaybackController = struct {
             const sc = chunk.channel_count;
             const dc = self.canonical_channels_;
             const needed: usize = @as(usize, @intCast(nf)) * @as(usize, @intCast(dc));
-            if (self.mix_scratch_.items.len < needed) {
-                self.mix_scratch_.resize(self.allocator, needed) catch return;
-            }
+            if (!self.ensureScratchCapacity(&self.mix_scratch_, needed)) return;
             channel_mixer.mixChannels(chunk.samples, sc, self.mix_scratch_.items[0..needed], dc, nf);
             _ = ring.write(self.mix_scratch_.items[0..needed], @intCast(nf));
         }
@@ -575,9 +590,7 @@ pub const PlaybackController = struct {
         const request: i32 = @intCast(@min(request_base, @as(usize, @intCast(kMaxMixFramesPerTick))));
 
         const needed: usize = @as(usize, @intCast(request)) * @as(usize, @intCast(ch));
-        if (self.drive_scratch_.items.len < needed) {
-            self.drive_scratch_.resize(self.allocator, needed) catch return false;
-        }
+        if (!self.ensureScratchCapacity(&self.drive_scratch_, needed)) return false;
 
         // Drain decoded PCM (or silence on underrun) into the staging buffer.
         const real_frames = ring.readFrames(self.drive_scratch_.items[0..needed], @intCast(request));
@@ -591,6 +604,16 @@ pub const PlaybackController = struct {
         const advance = @min(accepted, @as(i32, @intCast(real_frames)));
         if (advance > 0) self.clock_.?.onAudioMixed(advance);
         return advance > 0;
+    }
+
+    // Grow `scratch` to at least `needed` elements if it isn't already — the
+    // "grow scratch buffer" idiom shared by fillAudioClosure() and
+    // driveAudio(). Returns false (buffer left as-is) on allocation failure.
+    fn ensureScratchCapacity(self: *PlaybackController, scratch: *std.ArrayList(f32), needed: usize) bool {
+        if (scratch.items.len < needed) {
+            scratch.resize(self.allocator, needed) catch return false;
+        }
+        return true;
     }
 
     fn applyScrubResolve(self: *PlaybackController, resolve: ScrubResolve) void {
