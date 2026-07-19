@@ -8,7 +8,7 @@ const default_godot = "/Users/clay/.gdvm/installs/registry.gdvm.io-7999f4302078c
 
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
     const env_godot = b.graph.environ_map.get("GODOT_PATH");
     const godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot orelse default_godot;
 
@@ -60,6 +60,11 @@ pub fn build(b: *Build) !void {
         .target = target,
         .optimize = optimize,
     }) orelse return;
+
+    if (optimize != .Debug) {
+        extension.compile.root_module.strip = true;
+        extension.compile.link_gc_sections = true;
+    }
 
     // AVFoundation ObjC shim + frameworks (macOS only).
     if (target.result.os.tag == .macos) {

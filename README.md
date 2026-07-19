@@ -104,6 +104,10 @@ track with a differing rate is refused.
    No SCons, no godot-cpp submodule, no Python tooling — `build.zig` is the
    entire build.
 
+   Builds default to a stripped `ReleaseFast` binary (~380 KB). Pass
+   `-Doptimize=Debug` for a debug build, or `-Doptimize=ReleaseSmall` to
+   trade some speed for an even smaller library.
+
 3. Run the core unit tests (no Godot needed):
 
    ```bash
