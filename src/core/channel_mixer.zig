@@ -65,6 +65,7 @@ pub fn mixChannels(
     frame_count: i32,
 ) void {
     if (frame_count <= 0 or src_channels <= 0 or dst_channels <= 0) {
+        @branchHint(.unlikely);
         return;
     }
 
@@ -486,6 +487,45 @@ test "mix_channels 3ch to 3ch uses the memcpy fast path" {
     var out = [_]f32{-999.0} ** 6;
     mixChannels(&in, 3, &out, 3, 2);
     try std.testing.expect(approxEq(&in, &out, 1e-6));
+}
+
+// -----------------------------------------------------------------------
+// Fuzz: the total contract under arbitrary channel counts, frame counts,
+// and sample bits (including NaN/inf). mixChannels must write exactly
+// frame_count * dst_channels floats — never past them — and write nothing
+// at all for degenerate arguments. Run with `zig build test --fuzz` for
+// real fuzzing; a normal test run does one smoke pass.
+// -----------------------------------------------------------------------
+
+test "fuzz: mix_channels writes exactly the contract region" {
+    try std.testing.fuzz({}, fuzzMixChannels, .{});
+}
+
+fn fuzzMixChannels(_: void, smith: *std.testing.Smith) anyerror!void {
+    const max_channels = 9; // beyond every known layout, exercises the fallback
+    const max_frames = 32;
+
+    const src_channels = smith.valueRangeAtMost(i32, 0, max_channels);
+    const dst_channels = smith.valueRangeAtMost(i32, 0, max_channels);
+    const frame_count = smith.valueRangeAtMost(i32, 0, max_frames);
+
+    // Arbitrary bit patterns: NaN and inf must not break the write contract.
+    var src: [max_frames * max_channels]f32 = undefined;
+    for (&src) |*v| v.* = @bitCast(smith.value(u32));
+
+    const canary: f32 = 12345.5;
+    var dst: [max_frames * max_channels + 8]f32 = @splat(canary);
+
+    const src_len: usize = @intCast(@max(src_channels, 0) * @max(frame_count, 0));
+    const dst_len: usize = @intCast(@max(dst_channels, 0) * @max(frame_count, 0));
+    mixChannels(src[0..src_len], src_channels, dst[0..dst_len], dst_channels, frame_count);
+
+    // Nothing past the contract region is ever touched.
+    for (dst[dst_len..]) |v| try std.testing.expectEqual(canary, v);
+    // Degenerate arguments write nothing at all.
+    if (frame_count <= 0 or src_channels <= 0 or dst_channels <= 0) {
+        for (dst) |v| try std.testing.expectEqual(canary, v);
+    }
 }
 
 test "mix_channels degenerate frame_count and src_channels write nothing (canary check)" {

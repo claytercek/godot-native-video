@@ -55,7 +55,9 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
             const next = nextIndex(tail);
 
             if (next == self.head.load(.acquire)) {
-                // Queue is full.
+                // Queue is full — rare in practice: the sole producer checks
+                // full() before each push, so this is only a race window.
+                @branchHint(.unlikely);
                 return false;
             }
 

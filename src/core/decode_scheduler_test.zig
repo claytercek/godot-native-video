@@ -253,10 +253,19 @@ test "multi-stream stress: per-stream order preserved, no corruption" {
         }
 
         // Every stream delivered exactly its frames, in order.
-        var s: usize = 0;
-        while (s < kStreams) : (s += 1) {
-            try std.testing.expectEqual(kFramesPerStream, next_expected[s]);
-            try std.testing.expect(sched.atEnd(streams.items[s]));
+        //
+        // atEnd() is EVENTUALLY true, not immediately: eos is worker-reported,
+        // and when the queue was full at the moment the last frame decoded,
+        // the slice ends without observing EOS — the final pop's notify
+        // schedules the slice that does. Production polls atEnd() per tick,
+        // so mirror that here instead of racing the worker.
+        for (streams.items, 0..) |st, idx| {
+            try std.testing.expectEqual(kFramesPerStream, next_expected[idx]);
+            const eos_deadline = sys_clock.milliTimestamp() + 5_000;
+            while (!sched.atEnd(st)) {
+                try std.testing.expect(sys_clock.milliTimestamp() < eos_deadline);
+                sys_clock.sleep(50 * std.time.ns_per_us);
+            }
         }
 
         for (streams.items) |st| sched.unregisterStream(st);

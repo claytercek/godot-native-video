@@ -193,6 +193,64 @@ test "AudioRing clear discards buffered audio" {
     try std.testing.expectEqual(0, r.availableFrames());
 }
 
+// -----------------------------------------------------------------------
+// Fuzz: arbitrary write/read/clear sequences against a simple frame-count
+// oracle. Pins the whole behaviour contract: stored == min(requested, free),
+// real == min(requested, available), real frames come back as written,
+// the underrun tail is silence, and accounting never drifts. Run with
+// `zig build test --fuzz` for real fuzzing; a normal run does a smoke pass.
+// -----------------------------------------------------------------------
+
+test "fuzz: AudioRing accounting matches a frame-count oracle" {
+    try std.testing.fuzz({}, fuzzAudioRing, .{});
+}
+
+fn fuzzAudioRing(_: void, smith: *std.testing.Smith) anyerror!void {
+    const max_op_frames = 64;
+    const max_channels = 8;
+
+    const channels = smith.valueRangeAtMost(i32, 1, max_channels);
+    const frame_capacity = @as(usize, smith.valueRangeAtMost(u8, 0, 200));
+    var ring = try AudioRing.init(std.testing.allocator, channels, frame_capacity);
+    defer ring.deinit();
+
+    const ch: usize = @intCast(channels);
+    const in: [max_op_frames * max_channels]f32 = @splat(1.0); // real == 1.0, silence == 0.0
+    var out: [max_op_frames * max_channels]f32 = undefined;
+
+    const Action = enum { write, read, clear };
+    var model_frames: usize = 0; // oracle: frames the ring must be holding
+
+    while (!smith.eosWeightedSimple(15, 1)) {
+        switch (smith.value(Action)) {
+            .write => {
+                const n = @as(usize, smith.valueRangeAtMost(u8, 0, max_op_frames));
+                const free = ring.freeFrames();
+                const stored = ring.write(in[0 .. n * ch], n);
+                try std.testing.expectEqual(@min(n, free), stored);
+                model_frames += stored;
+            },
+            .read => {
+                const n = @as(usize, smith.valueRangeAtMost(u8, 0, max_op_frames));
+                @memset(out[0 .. n * ch], -1.0);
+                const real = ring.readFrames(out[0 .. n * ch], n);
+                try std.testing.expectEqual(@min(n, model_frames), real);
+                model_frames -= real;
+                // Real frames come back exactly as written...
+                for (out[0 .. real * ch]) |v| try std.testing.expectEqual(1.0, v);
+                // ...and the underrun tail is silence, never stale data.
+                for (out[real * ch .. n * ch]) |v| try std.testing.expectEqual(0.0, v);
+            },
+            .clear => {
+                ring.clear();
+                model_frames = 0;
+            },
+        }
+        try std.testing.expectEqual(model_frames, ring.availableFrames());
+        try std.testing.expectEqual(model_frames == 0, ring.empty());
+    }
+}
+
 test "AudioRing wraps around correctly" {
     var r = try AudioRing.init(std.testing.allocator, 1, 8);
     defer r.deinit();
