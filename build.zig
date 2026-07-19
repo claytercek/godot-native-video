@@ -1,17 +1,16 @@
 const std = @import("std");
 const Build = std.Build;
-const Io = std.Io;
-const Dir = Io.Dir;
 const gdzig = @import("gdzig");
 
 // Machine-specific default so `zig build run` works with zero args; override
-// with -Dgodot-path.
+// with -Dgodot-path or the GODOT_PATH env var.
 const default_godot = "/Users/clay/.gdvm/installs/registry.gdvm.io-7999f4302078c203/default/4.6.3-stable/Godot.app/Contents/MacOS/Godot";
 
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse default_godot;
+    const env_godot = b.graph.environ_map.get("GODOT_PATH");
+    const godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot orelse default_godot;
 
     // --- Core: pure Zig, no Godot dependency. Mirrors src/core/ in C++. ---
     const core_mod = b.createModule(.{
@@ -62,15 +61,12 @@ pub fn build(b: *Build) !void {
         .optimize = optimize,
     }) orelse return;
 
-    // AVFoundation ObjC shim + frameworks (macOS only). The shim file check
-    // lets the skeleton build before the backend port lands.
+    // AVFoundation ObjC shim + frameworks (macOS only).
     if (target.result.os.tag == .macos) {
-        if (Dir.cwd().access(b.graph.io, "src/avf/avf_shim.m", .{})) |_| {
-            extension.compile.root_module.addCSourceFile(.{
-                .file = b.path("src/avf/avf_shim.m"),
-                .flags = &.{"-fobjc-arc"},
-            });
-        } else |_| {}
+        extension.compile.root_module.addCSourceFile(.{
+            .file = b.path("src/avf/avf_shim.m"),
+            .flags = &.{"-fobjc-arc"},
+        });
         extension.compile.root_module.linkFramework("Foundation", .{});
         extension.compile.root_module.linkFramework("AVFoundation", .{});
         extension.compile.root_module.linkFramework("CoreMedia", .{});

@@ -39,7 +39,7 @@ const PackedFloat32Array = godot.builtin.PackedFloat32Array;
 const avf = @import("avf");
 
 // Core types come through the "core" named module (build.zig-wired) so they
-// match the PlaybackController's module instance. Zig 0.15 forbids cross-dir
+// match the PlaybackController's module instance. A module's root restricts
 // @import, so path imports into ../core are not an option.
 const core = @import("core");
 const backend_mod = core.backend;

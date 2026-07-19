@@ -11,10 +11,10 @@
 //! the Godot present pipeline imports the two preprocessed variants for
 //! compilation.
 //!
-//! NOTE: this file is deliberately NOT wired into core.zig — it has no place in
-//! the pure-math test surface run by `zig build test`. It is reached directly
-//! by @import from both color_matrix_test.zig (sibling) and the Godot
-//! present_pipeline.zig (cross-dir path import).
+//! NOTE: this file IS wired into core.zig (`pub const shaders = @import(...)`),
+//! reached directly by @import from color_matrix_test.zig (sibling), and
+//! reached by the Godot present pipeline through the "core" module (see
+//! src/godot/present_pipeline.zig).
 
 const std = @import("std");
 

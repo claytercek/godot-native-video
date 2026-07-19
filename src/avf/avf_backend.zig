@@ -16,10 +16,10 @@
 //!    freed at close; slices stay valid until close().
 
 const std = @import("std");
-// Reach core through the build.zig-wired "core" named module: Zig 0.15 forbids
-// cross-directory @import ("../core/backend.zig" is outside this module's root),
-// and routing through the shared module makes core.Backend one identity across
-// the avf backend, the engine core, and the Godot glue.
+// Reach core through the build.zig-wired "core" named module: a module's root
+// forbids cross-directory @import ("../core/backend.zig" is outside this
+// module's root), and routing through the shared module makes core.Backend
+// one identity across the avf backend, the engine core, and the Godot glue.
 const core = @import("core").backend;
 
 // -----------------------------------------------------------------------

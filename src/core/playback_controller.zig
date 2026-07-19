@@ -53,7 +53,7 @@ const StreamHandle = decode_scheduler.StreamHandle;
 pub const kScrubMaxYieldSpins: i32 = 100;
 pub const kScrubMaxSleepSpins: i32 = 1000;
 // 0.1 ms per sleep iteration — responsive without burning a core.
-pub const kScrubSpinSleepMs: f64 = 100.0;
+pub const kScrubSpinSleepMs: f64 = 0.1;
 
 // -----------------------------------------------------------------------
 // MixSink — the one Godot-touching seam the controller calls through.

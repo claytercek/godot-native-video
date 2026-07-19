@@ -23,7 +23,6 @@ const godot = @import("godot");
 const RenderingServer = godot.class.RenderingServer;
 const RenderingDevice = godot.class.RenderingDevice;
 const RdShaderSource = godot.class.RdShaderSource;
-const RdShaderSpirv = godot.class.RdShaderSpirv;
 const RdSamplerState = godot.class.RdSamplerState;
 const RdTextureFormat = godot.class.RdTextureFormat;
 const RdTextureView = godot.class.RdTextureView;
@@ -38,19 +37,15 @@ const PackedByteArray = godot.builtin.PackedByteArray;
 const log = std.log.scoped(.native_video_present);
 
 // Core types come through the "core" named module (build.zig-wired) so they
-// match the module instance the PlaybackController hands us. Zig 0.15 forbids
-// cross-directory @import, so path imports into ../core are not an option.
+// match the module instance the PlaybackController hands us. A module's root
+// restricts @import to its own subtree, so path imports into ../core are not
+// an option.
 const core = @import("core");
 const backend = core.backend;
 const VideoFrame = backend.VideoFrame;
 const push_constants = core.push_constants;
 const retire_ring = core.retire_ring;
-// shaders.zig is intentionally NOT wired into core.zig (it has no place in the
-// pure-math test surface), so it is unreachable via the "core" module and Zig
-// forbids importing it cross-directory. The glue keeps its own copy under
-// src/godot/shaders/ (see shaders.zig here); core/shaders.zig + the copies in
-// core/shaders/ stay for the standalone color_matrix_test.zig.
-const shaders = @import("shaders.zig");
+const shaders = core.shaders;
 
 const si = @import("surface_importer.zig");
 const SurfaceImporter = si.SurfaceImporter;

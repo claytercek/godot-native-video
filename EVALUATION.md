@@ -4,8 +4,9 @@
 
 The macOS/AVFoundation path only: full core (decode, A/V sync, color math),
 Godot glue (VideoStreamPlayer plumbing, Texture2DRD/RD resource glue), and an
-end-to-end smoke test, built with [gdzig](https://github.com/gdzig/gdzig) at commit
-`ba4ef25` (pre-1.0), Zig 0.15.2, against Godot 4.6.3-stable. The Windows /
+end-to-end smoke test, built with [gdzig](https://github.com/gdzig/gdzig) —
+now our own fork, which carries the upstream Zig 0.16 port — Zig 0.16.0,
+against Godot 4.6.3-stable. The Windows /
 Media Foundation backend was **not** ported; this evaluation covers macOS
 only.
 
@@ -113,7 +114,7 @@ Measured wall / user / sys via `/usr/bin/time -l`. C++: `scons
 target=template_release platform=macos -j8`, cold run with `SCONS_CACHE`
 bypassed (the environment has a global `SCONS_CACHE` that would otherwise
 replay objects — the first "cold" attempt was a 0.76s replay and had to be
-discarded). Zig: `zig build`, zig 0.15.2, cold run means `rm -rf
+discarded). Zig: `zig build`, zig 0.16.0, cold run means `rm -rf
 zig/.zig-cache`; the global `~/.cache/zig` package cache was **not**
 cleared, so this cold number is optimistic relative to a genuinely first-run
 machine. Zig's cold build also spawns Godot once to dump extension
@@ -246,12 +247,12 @@ correctness gate.
 ### Dominant risk
 
 Everything above is favorable to Zig on paper. The risk that overrides all
-of it: **gdzig is pre-1.0**. It has no tagged releases, this port is pinned
-to a single commit (`ba4ef25`), and it only works against Zig 0.15 —
-upgrading the system's Zig toolchain (already at 0.16) would break the
-build until gdzig catches up. Any maintainability argument for the Zig port
-has to be discounted by the fact that the binding layer underneath it can
-change out from under the project with no compatibility guarantee, and the
+of it: **gdzig is pre-1.0**. It has no tagged releases, and this project now
+builds against its own fork (a local path dependency carrying the upstream
+Zig 0.16 port) rather than a single pinned upstream commit. Any
+maintainability argument for the Zig port has to be discounted by the fact
+that the binding layer underneath it can change out from under the project
+with no compatibility guarantee, and the
 8-item bug ledger above is exactly the kind of thing that surfaces when a
 generator like this is still moving.
 

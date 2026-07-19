@@ -41,7 +41,7 @@ Highlights:
 - **Godot 4.6+**, **Forward+ or Mobile renderer** (the RenderingDevice
   renderers). The Compatibility/OpenGL renderer is not supported — there is
   no CPU present path.
-- **Zig 0.15.2** to build from source (see [mise.toml](mise.toml)). Other
+- **Zig 0.16.0** to build from source (see [mise.toml](mise.toml)). Other
   Zig versions are not supported: the extension is built against
   [gdzig](https://github.com/gdzig/gdzig), a pre-1.0 binding generator
   pinned to a specific commit and Zig version.
@@ -90,7 +90,7 @@ track with a differing rate is refused.
 
 ## Building from source
 
-1. Install Zig 0.15.2 (`mise install` picks it up from
+1. Install Zig 0.16.0 (`mise install` picks it up from
    [mise.toml](mise.toml), or install it directly — the system Zig on most
    machines will be a newer, incompatible version).
 2. Build the extension:
