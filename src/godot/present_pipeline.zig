@@ -56,51 +56,6 @@ const si = @import("surface_importer.zig");
 const SurfaceImporter = si.SurfaceImporter;
 const PlaneTextures = si.PlaneTextures;
 
-const StringName = godot.builtin.StringName;
-const c = godot.c;
-const raw = &godot.raw;
-
-// RenderingDevice.SHADER_STAGE_COMPUTE. The generated RenderingDevice.ShaderStage
-// enum is malformed in this gdzig build (it merges the stage and stage-bit
-// values, producing duplicate tag values 1/2/4), so the type cannot be
-// referenced at all. We call set_stage_source / get_stage_compile_error via raw
-// method binds, passing the stage as a plain int64 — Godot's ptrcall reads 8
-// bytes for an enum argument, so the value MUST be a full i64 (a pointer to an
-// i32 would leave the high word to adjacent stack garbage).
-const shader_stage_compute: i64 = 4;
-
-/// set_stage_source(SHADER_STAGE_COMPUTE, source) via a raw method bind,
-/// bypassing the unusable ShaderStage enum. Mirrors RdShaderSource.setStageSource.
-fn setStageSourceCompute(src: *RdShaderSource, source: String) void {
-    var stage: i64 = shader_stage_compute;
-    var src_copy = source;
-    var args: [2]c.GDExtensionConstTypePtr = undefined;
-    args[0] = @ptrCast(&stage);
-    args[1] = @ptrCast(&src_copy);
-    const bind = raw.classdbGetMethodBind(
-        @ptrCast(&StringName.fromComptimeLatin1("RDShaderSource")),
-        @ptrCast(&StringName.fromComptimeLatin1("set_stage_source")),
-        620821314,
-    );
-    raw.objectMethodBindPtrcall(bind, @ptrCast(src), @ptrCast(&args), null);
-}
-
-/// get_stage_compile_error(SHADER_STAGE_COMPUTE) via a raw method bind.
-/// Mirrors RdShaderSpirv.getStageCompileError.
-fn getStageCompileErrorCompute(spirv: *RdShaderSpirv) String {
-    var stage: i64 = shader_stage_compute;
-    var args: [1]c.GDExtensionConstTypePtr = undefined;
-    args[0] = @ptrCast(&stage);
-    var result: String = .init();
-    const bind = raw.classdbGetMethodBind(
-        @ptrCast(&StringName.fromComptimeLatin1("RDShaderSPIRV")),
-        @ptrCast(&StringName.fromComptimeLatin1("get_stage_compile_error")),
-        3354920045,
-    );
-    raw.objectMethodBindPtrcall(bind, @ptrCast(spirv), @ptrCast(&args), @ptrCast(&result));
-    return result;
-}
-
 /// Present-pipeline output format.
 pub const OutputMode = enum(u8) {
     sdr = 0, // RGBA8, non-linear (tone-mapped / clamped), Godot's standard 2D
@@ -211,10 +166,6 @@ pub const PresentPipeline = struct {
     pub fn getTexture(self: *PresentPipeline) *Texture2drd {
         if (self.current_texture == null) {
             const tex = Texture2drd.init();
-            // Own one reference (the C++ held a Ref<Texture2DRD> member). The
-            // engine takes and drops its own refs as _get_texture hands it out;
-            // without ours, the engine's drop frees it under us.
-            _ = tex.reference();
             self.current_texture = tex;
         }
         return self.current_texture.?;
@@ -272,34 +223,18 @@ pub const PresentPipeline = struct {
         const source_text = if (want_hdr) shaders.nv12_to_rgb_hdr_compute else shaders.nv12_to_rgb_compute;
 
         const src = RdShaderSource.init();
-        // Establish the owning reference. gdzig's `init()` is classdb-construct
-        // only; unlike C++ Ref<T>::instantiate() it does NOT consume the
-        // refcount_init placeholder, so the object sits at refcount 1 with the
-        // "first reference pending" flag still set. The first RD method we pass
-        // it to (shader_compile_spirv_from_source) references then unreferences
-        // it internally — that internal reference consumes the pending flag
-        // WITHOUT incrementing, so the trailing unreference drops the count to 0
-        // and the engine frees the object out from under us. Our own
-        // `defer unreference()` then double-frees it, corrupting the heap (which
-        // later surfaces as the decode worker's IOSurface crash). reference()
-        // here consumes the pending flag ourselves, mirroring instantiate(), so
-        // the object is a normal refcount-1 owned reference we release below.
-        _ = src.reference();
         defer if (src.unreference()) src.destroy();
         src.setLanguage(.shader_language_glsl);
         var source_str = String.fromLatin1(source_text);
         defer source_str.deinit();
-        setStageSourceCompute(src, source_str);
+        src.setStageSource(.shader_stage_compute, source_str);
 
         const spirv = rd.shaderCompileSpirvFromSource(src, .{}) orelse {
             log.err("{s} shader compile returned null.", .{label});
             return false;
         };
-        // Engine-returned RefCounted: unreference-then-destroy crashes here
-        // (gdzig ref-transfer semantics for ptrcall returns appear off);
-        // unreference alone lets the engine reap it. TODO(gdzig): revisit.
-        defer _ = spirv.unreference();
-        var compile_err = getStageCompileErrorCompute(spirv);
+        defer if (spirv.unreference()) spirv.destroy();
+        var compile_err = spirv.getStageCompileError(.shader_stage_compute);
         defer compile_err.deinit();
         if (compile_err.length() != 0) {
             log.err("{s} shader compile error.", .{label});
@@ -314,11 +249,7 @@ pub const PresentPipeline = struct {
             return false;
         }
 
-        // gdzig bug: a null optional Array is passed as zeroed bytes the engine
-        // dereferences — always hand over a real empty Array.
-        var no_constants = Array.init();
-        defer no_constants.deinit();
-        self.pipeline = rd.computePipelineCreate(self.shader, .{ .specialization_constants = no_constants });
+        self.pipeline = rd.computePipelineCreate(self.shader, .{});
         if (!self.pipeline.isValid()) {
             log.err("{s} compute_pipeline_create failed.", .{label});
             return false;
@@ -326,7 +257,6 @@ pub const PresentPipeline = struct {
 
         // Bilinear sampler so the half-res chroma plane upsamples smoothly.
         const ss = RdSamplerState.init();
-        _ = ss.reference(); // own the reference (see the RdShaderSource note above)
         defer if (ss.unreference()) ss.destroy();
         ss.setMagFilter(.sampler_filter_linear);
         ss.setMinFilter(.sampler_filter_linear);
@@ -344,7 +274,6 @@ pub const PresentPipeline = struct {
 
         for (0..ring_depth) |i| {
             const tf = RdTextureFormat.init();
-            _ = tf.reference(); // own the reference (see the RdShaderSource note above)
             defer if (tf.unreference()) tf.destroy();
             tf.setFormat(tex_fmt);
             tf.setWidth(@intCast(width));
@@ -353,22 +282,16 @@ pub const PresentPipeline = struct {
             tf.setArrayLayers(1);
             tf.setMipmaps(1);
             tf.setTextureType(.texture_type_2d);
-            // gdzig bindgen bug: TextureUsageBits packed-struct positions are
-            // shifted for every flag declared after DEPTH_RESOLVE (4096), so
-            // .texture_usage_storage_bit lands on 8192 instead of 8. Build the
-            // mask from the real engine values: SAMPLING(1)|STORAGE(8)|
-            // CAN_COPY_FROM(128).
-            tf.setUsageBits(@bitCast(@as(u32, 1 | 8 | 128)));
+            tf.setUsageBits(.{
+                .texture_usage_sampling_bit = true,
+                .texture_usage_storage_bit = true,
+                .texture_usage_can_copy_from_bit = true,
+            });
 
             const view = RdTextureView.init();
-            _ = view.reference(); // own the reference (see the RdShaderSource note above)
             defer if (view.unreference()) view.destroy();
 
-            // gdzig gotcha: omitting the optional `data` arg passes a zeroed
-            // Array the engine dereferences (segfault). Pass a real empty Array.
-            var no_data = Array.init();
-            defer no_data.deinit();
-            const rgba = rd.textureCreate(tf, view, .{ .data = no_data });
+            const rgba = rd.textureCreate(tf, view, .{});
             if (!rgba.isValid()) {
                 log.err("RGBA output texture_create failed.", .{});
                 return false;

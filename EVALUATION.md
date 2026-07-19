@@ -148,6 +148,16 @@ development.
 
 ### Cost: the gdzig bug ledger
 
+> **Status update:** every numbered bug below has since been fixed at the
+> source in our gdzig fork (branch `media-streams-fixes`, with regression
+> tests per fix), and the corresponding workarounds were removed from
+> `src/godot/`. Two things survived the sweep by design, not as bugs:
+> `_getTexture` keeps one `reference()` because gdzig virtual returns use
+> transfer semantics (the engine consumes a ref), and the output-mode
+> property accessors stay `i64` because Variant-dispatched integers are
+> i64-only. Item 8 (casing) is deliberate gdzig house style, not fixed.
+> The ledger below is preserved as the historical record of the port.
+
 Every one of these was hit during the port, root-caused, and worked around.
 This is the real cost of building against a pre-1.0 binding generator, and
 it consumed most of the port's debugging time.
@@ -170,11 +180,11 @@ it consumed most of the port's debugging time.
 7. Broken `String.fromUtf8`.
 8. Assorted mechanical casing quirks in generated names.
 
-On top of the numbered bugs: gdzig has no releases and is pinned to commit
-`ba4ef25`; it only works with Zig 0.15 (the system's Zig 0.16 is
-incompatible); and generated bindings under `.zig-cache/o/*/gdzig/class/*.zig`
-had to be eyeballed before relying on any nontrivial call, because the
-generator's output isn't trustworthy by default.
+On top of the numbered bugs: gdzig has no releases (we now build against
+our fork, which also carries the upstream Zig 0.16 port); and generated
+bindings under `.zig-cache/o/*/gdzig/class/*.zig` had to be eyeballed
+before relying on any nontrivial call, because the generator's output
+wasn't trustworthy by default.
 
 ### Benefit: what worked well
 

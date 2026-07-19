@@ -13,6 +13,7 @@ const channel_mixer = @import("channel_mixer.zig");
 const canonical_mix_format = @import("canonical_mix_format.zig");
 const wall_clock_mod = @import("wall_clock.zig");
 const pc = @import("playback_controller.zig");
+const sys_clock = @import("sys_clock.zig");
 
 const Backend = backend_mod.Backend;
 const VideoFrame = backend_mod.VideoFrame;
@@ -996,9 +997,9 @@ test "seek() past end-of-stream terminates the exact-resolve spin instead of han
     // Lone seek -> Exact. Target far beyond the clip's duration, so the backend
     // reports EOS immediately after the reseek and the forward-decode spin must
     // give up via atEnd() rather than hang.
-    const start = std.time.milliTimestamp();
+    const start = sys_clock.milliTimestamp();
     controller.seek(@as(f64, @floatFromInt(kScrubTotalFrames)) / @as(f64, @floatFromInt(kScrubFps)) + 1000.0, WallClockMs.init(0.0));
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = sys_clock.milliTimestamp() - start;
 
     try std.testing.expect(elapsed < 5_000); // bounded, not hung
 

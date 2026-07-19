@@ -216,11 +216,7 @@ fn setDictBool(dict: *Dictionary, comptime key: [:0]const u8, value: bool) void 
 fn setDictString(dict: *Dictionary, comptime key: [:0]const u8, value: []const u8) void {
     var k = String.fromLatin1(key);
     defer k.deinit();
-    // String.fromUtf8 is unusable in this gdzig build (its underlying raw
-    // constructor pointer is optional/unbound and fails to compile), so we use
-    // Latin1 here. Language tags (BCP 47) and track names are effectively ASCII
-    // in practice; non-Latin1 names degrade to mojibake rather than crashing.
-    var v = String.fromLatin1(value);
+    var v = String.fromUtf8(value) catch String.fromLatin1(value);
     defer v.deinit();
     _ = dict.set(Variant.init(String, k), Variant.init(String, v));
 }

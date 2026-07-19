@@ -62,6 +62,7 @@ const builtin = @import("builtin");
 
 const backend_mod = @import("backend.zig");
 const frame_queue = @import("frame_queue.zig");
+const sys_clock = @import("sys_clock.zig");
 
 pub const Backend = backend_mod.Backend;
 pub const VideoFrame = backend_mod.VideoFrame;
@@ -150,8 +151,8 @@ pub const DecodeScheduler = struct {
 
     // Work queue of streams that need decode-ahead. Guarded by mu; workers wait
     // on cv. A stream is in the queue at most once (enforced via its queued flag).
-    mu: std.Thread.Mutex = .{},
-    cv: std.Thread.Condition = .{},
+    mu: sys_clock.Mutex = .{},
+    cv: sys_clock.Condition = .{},
     ready: std.ArrayList(StreamHandle) = .empty,
     shutting_down: bool = false,
 
@@ -617,7 +618,7 @@ fn removeHandle(list: *std.ArrayList(StreamHandle), stream: StreamHandle) void {
 // the process lifetime, matching the C++ static's join-at-exit behavior in all
 // respects except the final join, which the OS performs on exit).
 var g_instance: ?*DecodeScheduler = null;
-var g_instance_mu: std.Thread.Mutex = .{};
+var g_instance_mu: sys_clock.Mutex = .{};
 
 test {
     _ = @import("decode_scheduler_test.zig");

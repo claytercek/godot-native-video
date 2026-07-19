@@ -3,14 +3,13 @@
 const std = @import("std");
 const avf = @import("avf_backend.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var args = std.process.args();
-    _ = args.next();
-    const path = args.next() orelse return error.MissingPath;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const path = if (args.len >= 2) args[1] else return error.MissingPath;
 
     const backend = try avf.create(allocator);
     defer backend.deinit();

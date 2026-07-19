@@ -12,9 +12,13 @@
 //! any) BY VALUE; this class performs the GPU present via PresentPipeline and
 //! owns the frame's release() from there via the retire ring.
 //!
-//! Virtual int params/returns are i64 and floats f64: gdzig's vtable wrapper
-//! writes the raw Zig value into Godot's 8-byte ptrcall slot with no
-//! conversion (see zig-port-prototype Verdict).
+//! Virtual method int params/returns use their natural width (i32 for
+//! index/channels/mix-rate): gdzig's vtable ptrcall marshalling reads/writes
+//! the full 8-byte engine slot regardless of the declared Zig width. Floats
+//! stay f64 — that IS the natural Godot width. The output_mode property
+//! accessors below are NOT virtuals — they're addProperty-registered methods
+//! dispatched through Variant, which only supports i64 for integers — so
+//! they stay i64.
 
 const NativeVideoStreamPlayback = @This();
 
@@ -131,7 +135,7 @@ fn mixSinkMix(ptr: *anyopaque, interleaved: []const f32, frame_count: i32, chann
 /// Monotonic wall clock for the Scrubber's velocity/debounce timing
 /// (independent of media time, which jumps around during a scrub). Never jumps.
 fn nowMs() WallClockMs {
-    const ns: i128 = std.time.nanoTimestamp();
+    const ns: i128 = core.sys_clock.nanoTimestamp();
     const ms: f64 = @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
     return WallClockMs.init(ms);
 }
@@ -228,29 +232,19 @@ pub fn _seek(self: *NativeVideoStreamPlayback, time: f64) void {
     self.flushWarnings();
 }
 
-pub fn _setAudioTrack(self: *NativeVideoStreamPlayback, idx: i64) void {
-    self.controller.requestAudioTrack(@intCast(idx));
+pub fn _setAudioTrack(self: *NativeVideoStreamPlayback, idx: i32) void {
+    self.controller.requestAudioTrack(idx);
     self.flushWarnings();
 }
 
 pub fn _getTexture(self: *NativeVideoStreamPlayback) ?*Texture2d {
     // The engine-owned RGBA Texture2DRD. Godot samples ONLY this — never the
-    // decoder surface.
-    //
-    // Hand the engine its OWN reference. gdzig's virtual-return marshalling
-    // writes the raw RefCounted pointer into the engine's return slot WITHOUT
-    // incrementing (see gdzig class/vtable.zig: `ret.* = result`), and the
-    // engine ADOPTS that reference (it will release it once, exactly as it does
-    // for the fresh object _instantiate_playback hands back). But unlike the
-    // playback — which we keep no reference to — we keep a strong reference to
-    // this texture in the present pipeline (current_texture) and re-point it
-    // every frame. Without our own +1 per call, the engine and the present
-    // pipeline share a single reference: when the engine drops its adopted
-    // reference the texture is freed while present() still holds it, and the
-    // next set_texture_rd_rid() is a use-after-free (which also corrupts the
-    // heap, surfacing intermittently as the decode worker's IOSurface crash).
-    // C++ returns Ref<Texture2D> by value — a +1 copy the engine adopts — so
-    // this reference() is exactly what restores that behavior.
+    // decoder surface. The present pipeline (current_texture) holds its own
+    // owning reference for the pipeline's lifetime; this virtual return needs
+    // a SEPARATE +1 for the engine to adopt — confirmed empirically, since
+    // omitting it leaves the displayed texture readable via get_video_texture()
+    // but breaks RenderingServer's CPU image readback (Image.get_image()
+    // returns null) partway through playback.
     const tex = self.present.getTexture();
     _ = tex.reference();
     return .upcast(tex);
@@ -265,14 +259,14 @@ pub fn _update(self: *NativeVideoStreamPlayback, delta: f64) void {
     }
 }
 
-pub fn _getChannels(self: *NativeVideoStreamPlayback) i64 {
+pub fn _getChannels(self: *NativeVideoStreamPlayback) i32 {
     // Canonical Mix Format channel count (maximum across all audio tracks,
     // computed at load). Godot sizes its mix buffer from this and queries it
     // once at play start, so it is stable for the playback's lifetime.
     return self.controller.canonicalChannels();
 }
 
-pub fn _getMixRate(self: *NativeVideoStreamPlayback) i64 {
+pub fn _getMixRate(self: *NativeVideoStreamPlayback) i32 {
     // Canonical Mix Format sample rate: the FIRST audio-bearing track's rate.
     return self.controller.canonicalSampleRate();
 }

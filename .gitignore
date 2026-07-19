@@ -2,6 +2,9 @@
 *.gen.*
 .godot/
 !project/.godot/
+
+# Zig 0.16 project-local dependency store
+zig-pkg/
 project/.godot/*
 !project/.godot/extension_list.cfg
 

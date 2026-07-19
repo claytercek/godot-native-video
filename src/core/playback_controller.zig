@@ -23,6 +23,7 @@ const audio_ring_mod = @import("audio_ring.zig");
 const scrubber_mod = @import("scrubber.zig");
 const wall_clock_mod = @import("wall_clock.zig");
 const decode_scheduler = @import("decode_scheduler.zig");
+const sys_clock = @import("sys_clock.zig");
 const canonical_mix_format = @import("canonical_mix_format.zig");
 const channel_mixer = @import("channel_mixer.zig");
 const present_selector = @import("present_selector.zig");
@@ -624,7 +625,7 @@ pub const PlaybackController = struct {
                         std.Thread.yield() catch {};
                         yield_spins += 1;
                     } else if (sleep_spins < kScrubMaxSleepSpins) {
-                        std.Thread.sleep(sleep_ns);
+                        sys_clock.sleep(sleep_ns);
                         sleep_spins += 1;
                     } else {
                         break; // worker stalled — give up, let present step converge.

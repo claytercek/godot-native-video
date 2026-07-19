@@ -86,14 +86,12 @@ pub fn _getResourceType(self: *NativeVideoResourceFormatLoader, path: String) St
 }
 
 /// Record the path; the playback opens the backend lazily on instantiate.
-/// gdzig marshals int virtual params through 8-byte ptrcall slots, so
-/// cache_mode is i64 (see zig-port-prototype Verdict).
 pub fn _load(
     self: *NativeVideoResourceFormatLoader,
     path: String,
     original_path: String,
     use_sub_threads: bool,
-    cache_mode: i64,
+    cache_mode: i32,
 ) Variant {
     _ = original_path;
     _ = use_sub_threads;

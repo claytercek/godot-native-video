@@ -88,7 +88,7 @@ test "A/V drift stays within budget under induced decode jitter" {
     var clock = clock_mod.AudioMasterClock.init(kSampleRate, latency);
     clock.setPaused(false);
 
-    var buf = std.ArrayList(f64){}; // decode-ahead PTS buffer (PTS-ordered)
+    var buf = std.ArrayList(f64).empty; // decode-ahead PTS buffer (PTS-ordered)
     defer buf.deinit(allocator);
 
     var prng = std.Random.DefaultPrng.init(1234567);
@@ -123,7 +123,7 @@ test "A/V drift stays within budget under induced decode jitter" {
     const spike_begin_wall: f64 = @as(f64, @floatFromInt(kSpikeStart)) * kTickSeconds;
     const spike_end_wall: f64 = @as(f64, @floatFromInt(kSpikeEnd)) * kTickSeconds;
 
-    var steady_drift = std.ArrayList(f64){};
+    var steady_drift = std.ArrayList(f64).empty;
     defer steady_drift.deinit(allocator);
     var peak_post_spike: f64 = 0.0;
     var during_spike_peak: f64 = 0.0;

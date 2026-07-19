@@ -21,9 +21,6 @@ const std = @import("std");
 const godot = @import("godot");
 const RenderingDevice = godot.class.RenderingDevice;
 const Rid = godot.builtin.Rid;
-const StringName = godot.builtin.StringName;
-const c = godot.c;
-const raw = &godot.raw;
 
 const si = @import("surface_importer.zig");
 const SurfaceImporter = si.SurfaceImporter;
@@ -95,36 +92,6 @@ const mtl_pixel_format_rg8_unorm: usize = 30;
 const mtl_pixel_format_r16_unorm: usize = 20;
 const mtl_pixel_format_rg16_unorm: usize = 60;
 const mtl_texture_usage_shader_read: usize = 1;
-
-/// getDriverResource(DRIVER_RESOURCE_LOGICAL_DEVICE) via a raw method bind.
-/// The generated RenderingDevice.DriverResource enum is malformed in this gdzig
-/// build (duplicate tag value 1 for physical_device / vulkan_physical_device),
-/// so its typed wrapper cannot be referenced. We pass the resource as a plain
-/// int32 (0 == LOGICAL_DEVICE) — the exact bytes the typed ptrcall would write.
-/// Mirrors present_pipeline.zig's ShaderStage workaround.
-fn getLogicalDevice(rd: *RenderingDevice) u64 {
-    // The resource enum MUST be an i64: Godot's ptrcall reads 8 bytes for an
-    // enum argument. Passing a pointer to an i32 makes it read 4 bytes of
-    // adjacent stack garbage as the high word, so it intermittently resolves to
-    // the wrong DriverResource (or none) — a bogus/mismatched MTLDevice for the
-    // CVMetalTextureCache, which then aliases decoder IOSurfaces onto a device
-    // Godot's RD doesn't share, corrupting them.
-    var resource: i64 = 0; // DRIVER_RESOURCE_LOGICAL_DEVICE
-    var rid: Rid = si.rid_invalid;
-    var index: u64 = 0;
-    var args: [3]c.GDExtensionConstTypePtr = undefined;
-    args[0] = @ptrCast(&resource);
-    args[1] = @ptrCast(&rid);
-    args[2] = @ptrCast(&index);
-    var result: u64 = 0;
-    const bind = raw.classdbGetMethodBind(
-        @ptrCast(&StringName.fromComptimeLatin1("RenderingDevice")),
-        @ptrCast(&StringName.fromComptimeLatin1("get_driver_resource")),
-        501815484,
-    );
-    raw.objectMethodBindPtrcall(bind, @ptrCast(rd), @ptrCast(&args), @ptrCast(&result));
-    return result;
-}
 
 /// FourCC OSType, packed MSB-first exactly as CoreVideo defines its pixel
 /// format constants.
@@ -276,7 +243,7 @@ const MetalSurfaceImporter = struct {
         // the Metal RD backend. On a non-Metal backend this is not a valid
         // MTLDevice and CVMetalTextureCacheCreate will fail, reported as "not
         // initialised".
-        const device_handle = getLogicalDevice(rd);
+        const device_handle = rd.getDriverResource(.driver_resource_logical_device, si.rid_invalid, 0);
         if (device_handle == 0) return false;
         const device: ?*anyopaque = @ptrFromInt(device_handle);
 

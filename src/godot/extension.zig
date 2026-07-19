@@ -59,10 +59,6 @@ const LoaderLifecycle = struct {
     pub fn enter(self: *LoaderLifecycle, level: InitializationLevel) void {
         if (level != .scene) return;
         const loader = NativeVideoResourceFormatLoader.create(&self.allocator) catch return;
-        // Own one reference (the C++ held a Ref<> singleton member). The
-        // engine's add/remove pair nets zero; without ours, remove frees the
-        // loader and the exit-path unreference below acts on freed memory.
-        _ = loader.base.reference();
         self.loader = loader;
         ResourceLoader.addResourceFormatLoader(loader.base, .{});
     }

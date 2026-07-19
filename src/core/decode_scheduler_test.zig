@@ -4,6 +4,7 @@ const std = @import("std");
 
 const backend_mod = @import("backend.zig");
 const ds = @import("decode_scheduler.zig");
+const sys_clock = @import("sys_clock.zig");
 
 const Backend = backend_mod.Backend;
 const VideoFrame = backend_mod.VideoFrame;
@@ -113,7 +114,7 @@ const FakeBackend = struct {
         const self: *FakeBackend = @ptrCast(@alignCast(p));
         if (self.next_index >= self.frame_count) return null; // EOS
         if (self.decode_micros > 0) {
-            std.Thread.sleep(@as(u64, @intCast(self.decode_micros)) * std.time.ns_per_us);
+            sys_clock.sleep(@as(u64, @intCast(self.decode_micros)) * std.time.ns_per_us);
         }
         const idx = self.next_index;
         self.next_index += 1;
@@ -225,7 +226,7 @@ test "multi-stream stress: per-stream order preserved, no corruption" {
         var total_consumed: i32 = 0;
         const total_expected: i32 = kStreams * kFramesPerStream;
 
-        const deadline = std.time.milliTimestamp() + 20_000;
+        const deadline = sys_clock.milliTimestamp() + 20_000;
 
         while (total_consumed < total_expected) {
             var progressed = false;
@@ -247,8 +248,8 @@ test "multi-stream stress: per-stream order preserved, no corruption" {
                 // Mimic the present path: release the surface back to the pool.
                 f.release();
             }
-            if (!progressed) std.Thread.sleep(50 * std.time.ns_per_us);
-            try std.testing.expect(std.time.milliTimestamp() < deadline);
+            if (!progressed) sys_clock.sleep(50 * std.time.ns_per_us);
+            try std.testing.expect(sys_clock.milliTimestamp() < deadline);
         }
 
         // Every stream delivered exactly its frames, in order.
@@ -286,7 +287,7 @@ test "unregister mid-decode releases buffered surfaces, no leak" {
     }
 
     // Let workers get busy decoding ahead.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    sys_clock.sleep(5 * std.time.ns_per_ms);
 
     // Pop a few frames from some streams, then tear everything down mid-flight.
     i = 0;
@@ -319,7 +320,7 @@ test "request_seek flushes and resumes decode-ahead at the target" {
     while (k < 5) : (k += 1) {
         var f = sched.nextFrame(s);
         while (f == null) {
-            std.Thread.sleep(50 * std.time.ns_per_us);
+            sys_clock.sleep(50 * std.time.ns_per_us);
             f = sched.nextFrame(s);
         }
         f.?.release();
@@ -330,11 +331,11 @@ test "request_seek flushes and resumes decode-ahead at the target" {
 
     // The next frame delivered must be frame 150 (FakeBackend's exact seek).
     var f = sched.nextFrame(s);
-    const deadline = std.time.milliTimestamp() + 5_000;
+    const deadline = sys_clock.milliTimestamp() + 5_000;
     while (f == null) {
-        std.Thread.sleep(50 * std.time.ns_per_us);
+        sys_clock.sleep(50 * std.time.ns_per_us);
         f = sched.nextFrame(s);
-        try std.testing.expect(std.time.milliTimestamp() < deadline);
+        try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
     try std.testing.expectEqual(@as(i32, 150), f.?.height);
     f.?.release();
@@ -578,15 +579,15 @@ test "reselect_audio_track switches audio and preserves video flow" {
     const s = try sched.registerStream(ReselectFakeBackend.create(alloc, 0, 200, &live, &released).backend());
 
     // Let video decode-ahead start filling the queue.
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    sys_clock.sleep(20 * std.time.ns_per_ms);
 
     // Verify video frames flow.
     var vf = sched.nextFrame(s);
-    const deadline = std.time.milliTimestamp() + 5_000;
+    const deadline = sys_clock.milliTimestamp() + 5_000;
     while (vf == null) {
-        std.Thread.sleep(50 * std.time.ns_per_us);
+        sys_clock.sleep(50 * std.time.ns_per_us);
         vf = sched.nextFrame(s);
-        try std.testing.expect(std.time.milliTimestamp() < deadline);
+        try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
     try std.testing.expectEqual(@as(i32, 0), vf.?.width); // stream 0
     vf.?.release();
@@ -605,9 +606,9 @@ test "reselect_audio_track switches audio and preserves video flow" {
     // Verify video still flows post-reselect.
     vf = sched.nextFrame(s);
     while (vf == null) {
-        std.Thread.sleep(50 * std.time.ns_per_us);
+        sys_clock.sleep(50 * std.time.ns_per_us);
         vf = sched.nextFrame(s);
-        try std.testing.expect(std.time.milliTimestamp() < deadline);
+        try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
     try std.testing.expectEqual(@as(i32, 0), vf.?.width);
     vf.?.release();
@@ -632,7 +633,7 @@ test "with_backend is serialized against worker decode during reselect" {
     const s = try sched.registerStream(ReselectFakeBackend.create(alloc, 0, 100, &live, &released).backend());
 
     // Let the worker start decoding ahead.
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    sys_clock.sleep(10 * std.time.ns_per_ms);
 
     // Call withBackend while the worker may be decoding. Passes if the reselect
     // succeeds and video still flows afterwards (no deadlock).
@@ -640,16 +641,16 @@ test "with_backend is serialized against worker decode during reselect" {
     sched.withBackend(s, &resel, ReselectProbe.run);
     try std.testing.expect(resel.ok);
 
-    const deadline = std.time.milliTimestamp() + 5_000;
+    const deadline = sys_clock.milliTimestamp() + 5_000;
     var consumed: i32 = 0;
     while (consumed < 3) {
         if (sched.nextFrame(s)) |vf| {
             vf.release();
             consumed += 1;
         } else {
-            std.Thread.sleep(50 * std.time.ns_per_us);
+            sys_clock.sleep(50 * std.time.ns_per_us);
         }
-        try std.testing.expect(std.time.milliTimestamp() < deadline);
+        try std.testing.expect(sys_clock.milliTimestamp() < deadline);
     }
     try std.testing.expectEqual(@as(i32, 3), consumed);
 

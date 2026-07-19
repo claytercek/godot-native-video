@@ -14,6 +14,7 @@ const std = @import("std");
 const backend_mod = @import("backend.zig");
 const scrubber_mod = @import("scrubber.zig");
 const ds = @import("decode_scheduler.zig");
+const sys_clock = @import("sys_clock.zig");
 
 const Backend = backend_mod.Backend;
 const VideoFrame = backend_mod.VideoFrame;
@@ -150,11 +151,11 @@ const KeyframeBackend = struct {
 // while the worker pumps. Releases nothing — caller owns the returned frame.
 fn waitFirstFrame(sched: *DecodeScheduler, s: StreamHandle) VideoFrame {
     var f = sched.nextFrame(s);
-    const deadline = std.time.milliTimestamp() + 5_000;
+    const deadline = sys_clock.milliTimestamp() + 5_000;
     while (f == null) {
-        std.Thread.sleep(50 * std.time.ns_per_us);
+        sys_clock.sleep(50 * std.time.ns_per_us);
         f = sched.nextFrame(s);
-        std.debug.assert(std.time.milliTimestamp() < deadline);
+        std.debug.assert(sys_clock.milliTimestamp() < deadline);
     }
     return f.?;
 }

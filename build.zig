@@ -1,5 +1,7 @@
 const std = @import("std");
 const Build = std.Build;
+const Io = std.Io;
+const Dir = Io.Dir;
 const gdzig = @import("gdzig");
 
 // Machine-specific default so `zig build run` works with zero args; override
@@ -55,6 +57,7 @@ pub fn build(b: *Build) !void {
         .name = "native_video_zig",
         .root_module = ext_mod,
         .entry_symbol = "native_video_init",
+        .minimum_initialization_level = .scene,
         .target = target,
         .optimize = optimize,
     }) orelse return;
@@ -62,7 +65,7 @@ pub fn build(b: *Build) !void {
     // AVFoundation ObjC shim + frameworks (macOS only). The shim file check
     // lets the skeleton build before the backend port lands.
     if (target.result.os.tag == .macos) {
-        if (std.fs.cwd().access("src/avf/avf_shim.m", .{})) |_| {
+        if (Dir.cwd().access(b.graph.io, "src/avf/avf_shim.m", .{})) |_| {
             extension.compile.root_module.addCSourceFile(.{
                 .file = b.path("src/avf/avf_shim.m"),
                 .flags = &.{"-fobjc-arc"},
