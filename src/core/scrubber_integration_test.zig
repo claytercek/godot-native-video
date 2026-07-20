@@ -15,26 +15,18 @@ const backend_mod = @import("backend.zig");
 const scrubber_mod = @import("scrubber.zig");
 const ds = @import("decode_scheduler.zig");
 const sys_clock = @import("sys_clock.zig");
+const ts = @import("test_support.zig");
 
 const Backend = backend_mod.Backend;
 const VideoFrame = backend_mod.VideoFrame;
-const AudioChunk = backend_mod.AudioChunk;
 const Scrubber = scrubber_mod.Scrubber;
-const ScrubConfig = scrubber_mod.ScrubConfig;
 const ScrubResolve = scrubber_mod.ScrubResolve;
 const ResolveMode = scrubber_mod.ResolveMode;
 const DecodeScheduler = ds.DecodeScheduler;
 const StreamHandle = ds.StreamHandle;
+const Surface = ts.Surface;
 
 const alloc = std.testing.allocator;
-
-fn makeConfig() ScrubConfig {
-    return .{
-        .settle_debounce_ms = 100.0, // ~80-120ms band per the issue
-        .burst_window_ms = 120.0, // two seeks within this gap can form a burst
-        .velocity_threshold = 2.0, // media-seconds per wall-second to count as a fast drag
-    };
-}
 
 // Keyframe grid: a keyframe every kGopFrames frames. A Keyframe resolve snaps to
 // the keyframe at/before the target; an Exact resolve seeks that keyframe then
@@ -51,19 +43,6 @@ fn keyframeAtOrBefore(frame: i32) i32 {
     return @divTrunc(frame, kGopFrames) * kGopFrames;
 }
 
-// Per-frame release state: decrements the shared live counter exactly once.
-const Surface = struct {
-    released: std.atomic.Value(bool) = .init(false),
-    live: *std.atomic.Value(i32),
-
-    fn releaseImpl(p: ?*anyopaque) void {
-        const s: *Surface = @ptrCast(@alignCast(p.?));
-        if (!s.released.swap(true, .acq_rel)) {
-            _ = s.live.fetchSub(1, .monotonic);
-        }
-    }
-};
-
 // A backend whose seek() snaps to the preceding keyframe. Each decoded frame
 // carries its frame index in `height` so a test can assert which frame a resolve
 // lands on and measure the consumer-side cost of reaching it.
@@ -79,36 +58,26 @@ const KeyframeBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *KeyframeBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *KeyframeBackend) void {
         for (self.surfaces.items) |s| self.allocator.destroy(s);
         self.surfaces.deinit(self.allocator);
         self.allocator.destroy(self);
     }
-    fn durFn(_: *anyopaque) f64 {
+    pub fn durationSeconds(_: *KeyframeBackend) f64 {
         return @as(f64, @floatFromInt(kTotalFrames)) / @as(f64, @floatFromInt(kFps));
     }
-    fn wFn(_: *anyopaque) i32 {
+    pub fn videoWidth(_: *KeyframeBackend) i32 {
         return 0;
     }
-    fn hFn(_: *anyopaque) i32 {
+    pub fn videoHeight(_: *KeyframeBackend) i32 {
         return 1;
     }
-    fn zeroFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn seekFn(p: *anyopaque, pts_seconds: f64) bool {
-        const self: *KeyframeBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *KeyframeBackend, pts_seconds: f64) bool {
         const target = frameOfPts(pts_seconds);
         self.next_index = keyframeAtOrBefore(target);
         return true;
     }
-    fn nextVideoFrameFn(p: *anyopaque) ?VideoFrame {
-        const self: *KeyframeBackend = @ptrCast(@alignCast(p));
+    pub fn nextVideoFrame(self: *KeyframeBackend) ?VideoFrame {
         if (self.next_index >= kTotalFrames) return null;
         const idx = self.next_index;
         self.next_index += 1;
@@ -120,30 +89,12 @@ const KeyframeBackend = struct {
             .pts_seconds = @as(f64, @floatFromInt(idx)) / @as(f64, @floatFromInt(kFps)),
             .height = idx, // carry frame index for the marker assertion
             .pixel_format = .nv12,
-            .release_ctx = surf,
-            .release_fn = Surface.releaseImpl,
+            .release_hook = surf.hook(),
         };
     }
-    fn nextAudioChunkFn(_: *anyopaque) ?AudioChunk {
-        return null;
-    }
-
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = wFn,
-        .video_height = hFn,
-        .audio_channel_count = zeroFn,
-        .audio_sample_rate = zeroFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-    };
 
     fn backend(self: *KeyframeBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 
@@ -196,7 +147,7 @@ test "exact-frame-on-settle: settle resolves to the precise target frame" {
     defer sched.deinit();
     const s = try sched.registerStream(KeyframeBackend.create(alloc, &live).backend());
 
-    var scrub = Scrubber.init(makeConfig());
+    var scrub = Scrubber.init(ts.makeScrubConfig());
 
     // A fast drag burst: targets that do NOT sit on the keyframe grid, so a
     // keyframe scrub lands on a DIFFERENT frame than the exact target.

@@ -308,7 +308,8 @@ void nv_avf_destroy(nv_avf_backend *h) {
 
 nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *info) {
 	NvAvfState *s = state_of(h);
-	nv_avf_close(h);
+	// Resetting a previously-open handle is the caller's job (nv_avf_close);
+	// this only ever runs against a handle that's already closed.
 	if (info) {
 		memset(info, 0, sizeof(*info));
 	}

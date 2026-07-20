@@ -16,8 +16,8 @@
 //!
 //! Design rules:
 //!  - Pure logic. No Godot, RenderingDevice, Metal, or CoreVideo types. The
-//!    retained payload is an opaque ctx+fn release closure (std::function<void()>
-//!    equivalent), so this component is fully unit-testable headlessly.
+//!    retained payload is a type-erased release closure, so this component is
+//!    fully unit-testable headlessly.
 //!  - Holds a surface for EXACTLY N frames and releases it EXACTLY once.
 //!  - Fixed capacity N slots: a surface parked this frame is released on the
 //!    N-th advance() that follows (when the ring head cycles back to its
@@ -32,17 +32,9 @@
 
 const std = @import("std");
 
-/// C++ std::function<void()> release closure → ctx + fn pointer. An empty
-/// value (func == null) is the "no closure" state (C++'s nullptr
-/// std::function), accepted and ignored by retain().
-pub const ReleaseFn = struct {
-    ctx: ?*anyopaque = null,
-    func: ?*const fn (?*anyopaque) void = null,
-
-    pub fn call(self: ReleaseFn) void {
-        if (self.func) |f| f(self.ctx);
-    }
-};
+/// A parked surface-release closure. An empty value (func == null) is the
+/// "no closure" state, accepted and ignored by retain().
+pub const ReleaseFn = @import("backend.zig").VoidClosure;
 
 pub fn RetireRing(comptime N: usize) type {
     comptime {

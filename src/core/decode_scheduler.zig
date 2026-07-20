@@ -134,15 +134,20 @@ pub const DecodeStream = struct {
     eos: bool = false,
 
     // Set when unregisterStream begins teardown so a worker that wakes up does
-    // not start a new slice. Guarded by mu.
-    dead: bool = false,
+    // not start a new slice. Write-once (never cleared), so it is an atomic
+    // flag rather than a mu-guarded field: the hot decode-ahead loop reads it
+    // lock-free (acquire) instead of taking mu per frame. The teardown store is
+    // release; the mutex already orders every other (mu-held) read, so those
+    // use monotonic loads.
+    dead: std.atomic.Value(bool) = .init(false),
 };
 
 pub const StreamHandle = *DecodeStream;
 
 // -----------------------------------------------------------------------
-// DecodeScheduler — the shared pool. One instance is shared by all streams
-// (the binding uses a process-wide singleton via instance()).
+// DecodeScheduler — the shared pool. One instance serves many streams; the
+// caller owns its lifetime and injects it wherever decode is needed (the
+// binding shares one process-wide pool across all playbacks).
 // -----------------------------------------------------------------------
 pub const DecodeScheduler = struct {
     allocator: std.mem.Allocator,
@@ -236,18 +241,6 @@ pub const DecodeScheduler = struct {
         allocator.destroy(self);
     }
 
-    // Process-wide shared pool used by the Godot binding so that N
-    // VideoStreamPlayers share one bounded set of worker threads.
-    pub fn instance() *DecodeScheduler {
-        g_instance_mu.lock();
-        defer g_instance_mu.unlock();
-        if (g_instance) |p| return p;
-        const p = DecodeScheduler.init(std.heap.page_allocator, kDefaultWorkerCount, false) catch
-            @panic("DecodeScheduler singleton init failed");
-        g_instance = p;
-        return p;
-    }
-
     // Register a stream. The scheduler takes ownership of the Backend and decodes
     // ahead into the returned stream's queue. Auto-notified on registration to
     // start decode-ahead.
@@ -279,7 +272,7 @@ pub const DecodeScheduler = struct {
             // Mark dead so no worker starts a new slice, and wait until any
             // in-flight slice for THIS stream finishes (busy drops) — guarantees
             // no worker is touching the Backend/queue when we tear it down.
-            stream.dead = true;
+            stream.dead.store(true, .release);
             stream.wants_more = false;
             // In synchronous mode there are no workers, so busy can never be set
             // by anyone but the calling thread; the wait below returns
@@ -310,7 +303,7 @@ pub const DecodeScheduler = struct {
             // Popping freed a slot; ask the pool to top the queue back up.
             {
                 self.mu.lock();
-                if (!stream.dead) stream.wants_more = true;
+                if (!stream.dead.load(.monotonic)) stream.wants_more = true;
                 self.mu.unlock();
             }
             self.notify(stream);
@@ -335,7 +328,7 @@ pub const DecodeScheduler = struct {
             // Claim the per-stream guard so no worker pumps this Backend while we
             // use it. Wait out any in-flight slice first.
             while (stream.busy) self.cv.wait(&self.mu);
-            if (stream.dead or stream.backend == null) {
+            if (stream.dead.load(.monotonic) or stream.backend == null) {
                 self.mu.unlock();
                 return;
             }
@@ -386,7 +379,7 @@ pub const DecodeScheduler = struct {
             stream.seek_pending = true;
             stream.seek_target = @max(pts_seconds, 0.0);
             stream.eos = false;
-            if (stream.dead) {
+            if (stream.dead.load(.monotonic)) {
                 self.mu.unlock();
                 return; // torn down concurrently; nothing to flush/resume.
             }
@@ -404,6 +397,67 @@ pub const DecodeScheduler = struct {
         }
         self.cv.broadcast(); // release any unregister/withBackend waiters
         self.notify(stream);
+    }
+
+    // Resolve a seek to the exact target synchronously on the calling thread.
+    // Claims the same per-stream "busy" guard a decode slice uses, then, as
+    // the sole owner of the Backend and queue: flushes buffered frames, seeks
+    // the Backend to (the keyframe at/before) `target_seconds`, and decodes
+    // forward releasing every frame whose PTS is more than `eps_seconds`
+    // before the target. The first surviving frame is pushed into the queue,
+    // so afterwards the queue head is at/after target - eps. Stops at EOS
+    // when the clip ends before the target. Intended for the settle/resume
+    // scrub path, which values precision over latency and is not per-frame
+    // hot. No-op if the stream is dead.
+    pub fn seekExact(self: *DecodeScheduler, stream: StreamHandle, target_seconds: f64, eps_seconds: f64) void {
+        const target = @max(target_seconds, 0.0);
+        {
+            self.mu.lock();
+            while (stream.busy) self.cv.wait(&self.mu);
+            if (stream.dead.load(.monotonic) or stream.backend == null) {
+                self.mu.unlock();
+                return;
+            }
+            // We seek right here, so any older pending seek is superseded.
+            stream.seek_pending = false;
+            stream.eos = false;
+            self.claimLocked(stream); // exclude workers while we own the stream
+            stream.wants_more = true;
+            self.mu.unlock();
+        }
+        // Busy held: we are the sole producer for the queue and the sole
+        // toucher of the Backend until we drop it.
+        while (stream.queue.pop()) |f| f.release();
+        const backend_ptr = &stream.backend.?;
+        _ = backend_ptr.seek(target);
+        // Safety valve: bound the synchronous decode-forward loop so a
+        // misbehaving backend whose PTS never advances past `target` and never
+        // signals EOS cannot spin the calling (main) thread forever. Large
+        // enough that real GOP-bounded scrub-settle never trips it.
+        const max_scrub_decode_frames = 4096;
+        var scrub_decoded: usize = 0;
+        while (backend_ptr.nextVideoFrame()) |f| {
+            if (f.pts_seconds + eps_seconds >= target) {
+                // The frame at/just before the target: keep it for present.
+                const pushed = stream.queue.push(f);
+                std.debug.assert(pushed); // queue was flushed above
+                break;
+            }
+            f.release();
+            scrub_decoded += 1;
+            if (scrub_decoded >= max_scrub_decode_frames) break; // non-advancing backend; bail without eos
+        } else {
+            self.mu.lock();
+            stream.eos = true; // clip ended before the target — clamp.
+            self.mu.unlock();
+        }
+        {
+            self.mu.lock();
+            stream.busy = false;
+            self.mu.unlock();
+        }
+        self.cv.broadcast(); // release unregister/withBackend waiters
+        self.notify(stream); // resume decode-ahead behind the surviving frame
     }
 
     // True end-of-stream: the Backend reported EOS and the queue is drained.
@@ -459,7 +513,7 @@ pub const DecodeScheduler = struct {
             // correctly.
             {
                 self.mu.lock();
-                if (stream.dead or stream.busy or !stream.wants_more) {
+                if (stream.dead.load(.monotonic) or stream.busy or !stream.wants_more) {
                     self.mu.unlock();
                     return;
                 }
@@ -493,7 +547,7 @@ pub const DecodeScheduler = struct {
     // demand when it enqueues. Returns true if the stream was enqueued (the
     // caller wakes a worker outside the lock). Requires mu held.
     fn enqueueLocked(self: *DecodeScheduler, stream: StreamHandle) bool {
-        if (stream.dead or stream.queued or stream.busy or !stream.wants_more) return false;
+        if (stream.dead.load(.monotonic) or stream.queued or stream.busy or !stream.wants_more) return false;
         stream.wants_more = false;
         stream.queued = true;
         self.ready.append(self.allocator, stream) catch @panic("DecodeScheduler OOM");
@@ -512,7 +566,7 @@ pub const DecodeScheduler = struct {
             if (self.shutting_down and self.ready.items.len == 0) return null;
             const stream = self.ready.orderedRemove(0);
             stream.queued = false;
-            if (stream.dead) continue;
+            if (stream.dead.load(.monotonic)) continue;
             stream.busy = true;
             return stream;
         }
@@ -568,12 +622,9 @@ pub const DecodeScheduler = struct {
         // Decode-ahead: fill the queue until full or EOS. We re-check dead each
         // iteration so a concurrent unregister cuts the slice short promptly.
         while (!stream.queue.full()) {
-            {
-                self.mu.lock();
-                const dead = stream.dead;
-                self.mu.unlock();
-                if (dead) return;
-            }
+            // Lock-free hot-path read of the write-once dead flag (acquire pairs
+            // with the release store in unregisterStream). No mu per frame.
+            if (stream.dead.load(.acquire)) return;
             const f = backend_ptr.nextVideoFrame();
             if (f == null) {
                 self.mu.lock();
@@ -599,14 +650,6 @@ fn removeHandle(list: *std.ArrayList(StreamHandle), stream: StreamHandle) void {
         }
     }
 }
-
-// Process-wide singleton state. The C++ uses a function-local static; Zig has
-// no lazy-static-with-destructor, so we guard a nullable pointer with a mutex.
-// The singleton is intentionally never torn down (its worker threads live for
-// the process lifetime, matching the C++ static's join-at-exit behavior in all
-// respects except the final join, which the OS performs on exit).
-var g_instance: ?*DecodeScheduler = null;
-var g_instance_mu: sys_clock.Mutex = .{};
 
 test {
     _ = @import("decode_scheduler_test.zig");

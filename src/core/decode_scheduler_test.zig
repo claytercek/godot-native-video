@@ -5,6 +5,7 @@ const std = @import("std");
 const backend_mod = @import("backend.zig");
 const ds = @import("decode_scheduler.zig");
 const sys_clock = @import("sys_clock.zig");
+const ts = @import("test_support.zig");
 
 const Backend = backend_mod.Backend;
 const VideoFrame = backend_mod.VideoFrame;
@@ -12,31 +13,9 @@ const AudioChunk = backend_mod.AudioChunk;
 const AudioTrackInfo = backend_mod.AudioTrackInfo;
 const DecodeScheduler = ds.DecodeScheduler;
 const StreamHandle = ds.StreamHandle;
-
-// -----------------------------------------------------------------------
-// Per-surface release state.
-//
-// The C++ captures a shared_ptr<atomic<bool>> per frame so a leak /
-// double-release / use-after-recycle is detectable. Zig has no shared_ptr, so
-// each frame carries a heap-allocated Surface whose release closure marks it
-// released exactly once (guarded by an atomic exchange), decrements a shared
-// live-surface counter and bumps a shared total-released counter. The backend
-// keeps every Surface it hands out and frees them all in deinit(), so nothing
-// leaks whether or not each frame's release() was run.
-// -----------------------------------------------------------------------
-const Surface = struct {
-    released: std.atomic.Value(bool) = .init(false),
-    live: ?*std.atomic.Value(i32) = null,
-    total: ?*std.atomic.Value(i64) = null,
-
-    fn releaseImpl(p: ?*anyopaque) void {
-        const s: *Surface = @ptrCast(@alignCast(p.?));
-        const was = s.released.swap(true, .acq_rel);
-        std.debug.assert(!was); // exactly-once release
-        if (s.live) |l| _ = l.fetchSub(1, .monotonic);
-        if (s.total) |t| _ = t.fetchAdd(1, .monotonic);
-    }
-};
+// Each decoded frame carries a heap-allocated release tracker so a leak /
+// double-release / use-after-recycle is detectable per surface.
+const Surface = ts.Surface;
 
 // -----------------------------------------------------------------------
 // FakeBackend — a deterministic, Godot-free decoder mock.
@@ -76,42 +55,27 @@ const FakeBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *FakeBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *FakeBackend) void {
         for (self.surfaces.items) |s| self.allocator.destroy(s);
         self.surfaces.deinit(self.allocator);
         self.allocator.destroy(self);
     }
-    fn durFn(p: *anyopaque) f64 {
-        const self: *FakeBackend = @ptrCast(@alignCast(p));
+    pub fn durationSeconds(self: *FakeBackend) f64 {
         return @as(f64, @floatFromInt(self.frame_count)) / 30.0;
     }
-    fn widthFn(p: *anyopaque) i32 {
-        const self: *FakeBackend = @ptrCast(@alignCast(p));
+    pub fn videoWidth(self: *FakeBackend) i32 {
         return self.stream_id;
     }
-    fn heightFn(_: *anyopaque) i32 {
+    pub fn videoHeight(_: *FakeBackend) i32 {
         return 1;
     }
-    fn chFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn rateFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn seekFn(p: *anyopaque, pts_seconds: f64) bool {
-        const self: *FakeBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *FakeBackend, pts_seconds: f64) bool {
         var idx: i32 = @intFromFloat(pts_seconds * 30.0);
         if (idx < 0) idx = 0;
         self.next_index = idx;
         return true;
     }
-    fn nextVideoFrameFn(p: *anyopaque) ?VideoFrame {
-        const self: *FakeBackend = @ptrCast(@alignCast(p));
+    pub fn nextVideoFrame(self: *FakeBackend) ?VideoFrame {
         if (self.next_index >= self.frame_count) return null; // EOS
         if (self.decode_micros > 0) {
             sys_clock.sleep(@as(u64, @intCast(self.decode_micros)) * std.time.ns_per_us);
@@ -127,30 +91,12 @@ const FakeBackend = struct {
             .width = self.stream_id, // carry the stream id for corruption checks
             .height = idx, // carry the frame index for order checks
             .pixel_format = .nv12,
-            .release_ctx = surf,
-            .release_fn = Surface.releaseImpl,
+            .release_hook = surf.hook(),
         };
     }
-    fn nextAudioChunkFn(_: *anyopaque) ?AudioChunk {
-        return null;
-    }
-
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = widthFn,
-        .video_height = heightFn,
-        .audio_channel_count = chFn,
-        .audio_sample_rate = rateFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-    };
 
     fn backend(self: *FakeBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 
@@ -442,60 +388,43 @@ const ReselectFakeBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *ReselectFakeBackend) void {
         for (self.surfaces.items) |s| self.allocator.destroy(s);
         self.surfaces.deinit(self.allocator);
         if (self.audio_scratch.len > 0) self.allocator.free(self.audio_scratch);
         self.allocator.destroy(self);
     }
-    fn durFn(p: *anyopaque) f64 {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn durationSeconds(self: *ReselectFakeBackend) f64 {
         return @as(f64, @floatFromInt(self.frame_count)) / 30.0;
     }
-    fn widthFn(p: *anyopaque) i32 {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn videoWidth(self: *ReselectFakeBackend) i32 {
         return self.stream_id;
     }
-    fn heightFn(_: *anyopaque) i32 {
+    pub fn videoHeight(_: *ReselectFakeBackend) i32 {
         return 1;
     }
-    fn chFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn rateFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn trackCountFn(_: *anyopaque) i32 {
+    pub fn audioTrackCount(_: *ReselectFakeBackend) i32 {
         return 2;
     }
-    fn trackInfoFn(_: *anyopaque, index: i32) AudioTrackInfo {
+    pub fn audioTrackInfo(_: *ReselectFakeBackend, index: i32) AudioTrackInfo {
         return .{ .channels = 2, .sample_rate = 48000, .is_default = index == 0 };
     }
-    fn selectTrackFn(p: *anyopaque, index: i32) void {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn selectAudioTrack(self: *ReselectFakeBackend, index: i32) void {
         if (index >= 0 and index < 2) self.active_track = index;
     }
-    fn reselectTrackFn(p: *anyopaque, index: i32, _: f64) bool {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn reselectAudioTrack(self: *ReselectFakeBackend, index: i32, _: f64) bool {
         if (index < 0 or index >= 2) return false;
         self.active_track = index;
         self.reselect_count += 1;
         return true;
     }
-    fn seekFn(p: *anyopaque, pts_seconds: f64) bool {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *ReselectFakeBackend, pts_seconds: f64) bool {
         var idx: i32 = @intFromFloat(pts_seconds * 30.0);
         if (idx < 0) idx = 0;
         self.next_index = idx;
         return true;
     }
-    fn nextVideoFrameFn(p: *anyopaque) ?VideoFrame {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn nextVideoFrame(self: *ReselectFakeBackend) ?VideoFrame {
         if (self.next_index >= self.frame_count) return null;
         const idx = self.next_index;
         self.next_index += 1;
@@ -508,12 +437,10 @@ const ReselectFakeBackend = struct {
             .width = self.stream_id,
             .height = idx,
             .pixel_format = .nv12,
-            .release_ctx = surf,
-            .release_fn = Surface.releaseImpl,
+            .release_hook = surf.hook(),
         };
     }
-    fn nextAudioChunkFn(p: *anyopaque) ?AudioChunk {
-        const self: *ReselectFakeBackend = @ptrCast(@alignCast(p));
+    pub fn nextAudioChunk(self: *ReselectFakeBackend) ?AudioChunk {
         // Track 0 -> 512-frame chunks; track 1 -> 256-frame chunks.
         const frames_per_chunk: i32 = if (self.active_track == 0) 512 else 256;
         const channels: i32 = 2;
@@ -533,26 +460,8 @@ const ReselectFakeBackend = struct {
         };
     }
 
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = widthFn,
-        .video_height = heightFn,
-        .audio_channel_count = chFn,
-        .audio_sample_rate = rateFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-        .audio_track_count = trackCountFn,
-        .audio_track_info = trackInfoFn,
-        .select_audio_track = selectTrackFn,
-        .reselect_audio_track = reselectTrackFn,
-    };
-
     fn backend(self: *ReselectFakeBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 

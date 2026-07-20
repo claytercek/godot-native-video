@@ -205,15 +205,9 @@ pub const AvfBackend = struct {
 
     opened: bool = false,
 
-    // True if the most recent decode pump hit an error (as opposed to a clean
-    // end-of-stream). Mirrors the C++ AvfBackend::had_error() flag; exposed via
-    // hadError() (not part of the vtable) for the integration test.
-    err: bool = false,
-
     duration: f64 = 0.0,
     width: i32 = 0,
     height: i32 = 0,
-    has_video: bool = false,
 
     // Negotiated colorimetry parsed at open; defaults to BT.709 video range.
     color: core.Colorimetry = core.Colorimetry.bt709_defaults,
@@ -251,33 +245,11 @@ pub const AvfBackend = struct {
         return @ptrCast(@alignCast(p));
     }
 
-    /// Drop the cached track table. The language strings it points into are
-    /// shim-owned and freed by nv_avf_close, not here.
-    fn clearTracks(self: *AvfBackend) void {
-        self.audio_tracks.clearRetainingCapacity();
-    }
-
-    /// Shared shim-result mapping: .fail latches the error flag, .ok/.none
-    /// don't touch it. Returns whether the call site should treat this as
-    /// success. Callers own resetting `err` at entry where that applies
-    /// (open/seek/reselect) — this only ever sets it, never clears it.
-    fn applyResult(self: *AvfBackend, rc: Result) bool {
-        switch (rc) {
-            .ok => return true,
-            .none => return false,
-            .fail => {
-                self.err = true;
-                return false;
-            },
-        }
-    }
-
     // ---- lifecycle ----
     // The vtable contract is bool, so openImpl translates the error union at
-    // the boundary: any failure marks err and tears back down to closed.
+    // the boundary: any failure tears back down to closed.
     fn openImpl(self: *AvfBackend, url_or_path: []const u8) bool {
         self.openInner(url_or_path) catch {
-            self.err = true;
             self.closeImpl();
             return false;
         };
@@ -285,21 +257,22 @@ pub const AvfBackend = struct {
     }
 
     fn openInner(self: *AvfBackend, url_or_path: []const u8) !void {
+        // The sole reset-to-closed point before opening: nv_avf_open assumes
+        // an already-closed handle, so this is the only close call on the
+        // reopen path.
         self.closeImpl();
-        self.err = false;
 
         // NUL-terminate the path for the C boundary.
         const path_z = try self.allocator.dupeZ(u8, url_or_path);
         defer self.allocator.free(path_z);
 
         var info: c_open_info = undefined;
-        if (!self.applyResult(nv_avf_open(self.shim, path_z.ptr, &info))) return error.OpenFailed;
+        if (nv_avf_open(self.shim, path_z.ptr, &info) != .ok) return error.OpenFailed;
 
         self.opened = true;
         self.duration = info.duration_seconds;
         self.width = @intCast(info.width);
         self.height = @intCast(info.height);
-        self.has_video = info.has_video != 0;
         self.color = toColorimetry(info.color);
 
         // Cache per-track audio metadata. `language` borrows the shim's own
@@ -336,19 +309,20 @@ pub const AvfBackend = struct {
             self.selected_audio_index
         else
             -1;
-        if (!self.applyResult(nv_avf_build_reader(self.shim, 0.0, audio_idx))) return error.BuildReaderFailed;
+        if (nv_avf_build_reader(self.shim, 0.0, audio_idx) != .ok) return error.BuildReaderFailed;
     }
 
     fn closeImpl(self: *AvfBackend) void {
         if (self.opened) {
             nv_avf_close(self.shim);
         }
-        self.clearTracks();
+        // Drop the cached track table. The language strings it points into
+        // are shim-owned and freed by nv_avf_close, not here.
+        self.audio_tracks.clearRetainingCapacity();
         self.opened = false;
         self.duration = 0.0;
         self.width = 0;
         self.height = 0;
-        self.has_video = false;
         self.audio_channels = 0;
         self.audio_rate = 0;
         self.selected_audio_index = 0;
@@ -370,12 +344,11 @@ pub const AvfBackend = struct {
         // Tear down any dedicated audio-only reader so seek builds a fresh
         // combined reader with both video and the selected audio track.
         nv_avf_teardown_audio_reader(self.shim);
-        self.err = false;
         const audio_idx: c_int = if (self.audio_tracks.items.len > 0)
             self.selected_audio_index
         else
             -1;
-        if (!self.applyResult(nv_avf_build_reader(self.shim, target, audio_idx))) return false;
+        if (nv_avf_build_reader(self.shim, target, audio_idx) != .ok) return false;
         return true;
     }
 
@@ -393,21 +366,17 @@ pub const AvfBackend = struct {
         const clamped = std.math.clamp(index, 0, count - 1);
         const target = @max(pts_seconds, 0.0);
 
-        // Clears the error flag at entry; a hard reader failure latches it
-        // back via applyResult, a soft failure leaves it clear.
-        self.err = false;
-
         // The shim builds the dedicated audio-only reader and rebuilds the
         // combined reader as video-only in one atomic step, rolling back on
         // partial failure — the reader lifecycle stays shim-side.
-        if (!self.applyResult(nv_avf_reselect_audio_track(self.shim, clamped, target))) return false;
+        if (nv_avf_reselect_audio_track(self.shim, clamped, target) != .ok) return false;
         _ = self.applyTrackSelection(clamped);
         return true;
     }
 
     fn nextVideoFrameImpl(self: *AvfBackend) ?core.VideoFrame {
         var cf: c_video_frame = undefined;
-        if (!self.applyResult(nv_avf_next_video_frame(self.shim, &cf))) return null;
+        if (nv_avf_next_video_frame(self.shim, &cf) != .ok) return null;
         return .{
             .pts_seconds = cf.pts_seconds,
             .native_handle = cf.pixel_buffer,
@@ -417,8 +386,7 @@ pub const AvfBackend = struct {
             .pixel_format = @enumFromInt(@as(u8, @intCast(cf.pixel_format))),
             .color = toColorimetry(cf.color),
             // The CVPixelBufferRef carries a +1 retain; release drops it once.
-            .release_ctx = cf.pixel_buffer,
-            .release_fn = frameRelease,
+            .release_hook = .{ .ctx = cf.pixel_buffer, .func = frameRelease },
         };
     }
 
@@ -428,7 +396,7 @@ pub const AvfBackend = struct {
 
     fn nextAudioChunkImpl(self: *AvfBackend) ?core.AudioChunk {
         var cc: c_audio_chunk = undefined;
-        if (!self.applyResult(nv_avf_next_audio_chunk(self.shim, &cc))) return null;
+        if (nv_avf_next_audio_chunk(self.shim, &cc) != .ok) return null;
         const float_count: usize = @intCast(cc.float_count);
         const samples: []const f32 = if (cc.samples) |p| p[0..float_count] else &.{};
         // channel_count mirrors C++: the selected track's channel count, min 1.
@@ -440,12 +408,6 @@ pub const AvfBackend = struct {
             .channel_count = channels,
             .sample_rate = self.audio_rate,
         };
-    }
-
-    /// True if the most recent pump hit a decode error rather than clean EOS.
-    /// Not part of the Backend vtable; used by the integration test.
-    pub fn hadError(self: *const AvfBackend) bool {
-        return self.err;
     }
 
     // ---- vtable thunks ----

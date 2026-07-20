@@ -23,9 +23,35 @@ const Registry = godot.extension.Registry;
 const InitializationLevel = godot.extension.InitializationLevel;
 const ResourceLoader = godot.class.ResourceLoader;
 
+const core = @import("core");
+const DecodeScheduler = core.decode_scheduler.DecodeScheduler;
+
 const NativeVideoStream = @import("native_video_stream.zig");
 const NativeVideoStreamPlayback = @import("native_video_stream_playback.zig");
 const NativeVideoResourceFormatLoader = @import("native_video_resource_format_loader.zig");
+
+// -----------------------------------------------------------------------
+// Process-wide decode pool. Every playback instance registers with this one
+// scheduler so N VideoStreamPlayers share a single bounded set of worker
+// threads. Lazily created under a mutex on first use; intentionally never
+// torn down — its worker threads live for the process lifetime and the OS
+// reclaims them at exit.
+// -----------------------------------------------------------------------
+var g_scheduler: ?*DecodeScheduler = null;
+var g_scheduler_mu: core.sys_clock.Mutex = .{};
+
+pub fn sharedScheduler() *DecodeScheduler {
+    g_scheduler_mu.lock();
+    defer g_scheduler_mu.unlock();
+    if (g_scheduler) |p| return p;
+    const p = DecodeScheduler.init(
+        std.heap.page_allocator,
+        core.decode_scheduler.kDefaultWorkerCount,
+        false,
+    ) catch @panic("DecodeScheduler init failed");
+    g_scheduler = p;
+    return p;
+}
 
 pub fn register(r: *Registry) void {
     // Register playback before stream (C++ registers the playback class first

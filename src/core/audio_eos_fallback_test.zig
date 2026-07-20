@@ -25,12 +25,10 @@
 const std = @import("std");
 
 const clock_mod = @import("clock.zig");
-const present_selector = @import("present_selector.zig");
+const ts = @import("test_support.zig");
 
 const AudioMasterClock = clock_mod.AudioMasterClock;
 const MonotonicClock = clock_mod.MonotonicClock;
-const PresentAction = present_selector.PresentAction;
-const selectPresentAction = present_selector.selectPresentAction;
 
 const kSampleRate: i32 = 48000;
 const kFps: f64 = 30.0;
@@ -42,54 +40,13 @@ const kTotalFrames: i32 = 300; // 10s @ 30fps
 // audio — the exact seam a double-advance bug would show up on.
 const kAudioEndSeconds: f64 = 2.63;
 
-// A tiny FIFO of decode-ahead frame PTS values.
-const Buf = struct {
-    list: std.ArrayList(f64) = .empty,
-
-    fn deinit(self: *Buf, a: std.mem.Allocator) void {
-        self.list.deinit(a);
-    }
-    fn pushBack(self: *Buf, a: std.mem.Allocator, v: f64) void {
-        self.list.append(a, v) catch @panic("oom");
-    }
-    fn popFront(self: *Buf) void {
-        _ = self.list.orderedRemove(0);
-    }
-    fn head(self: *const Buf) ?f64 {
-        return if (self.list.items.len == 0) null else self.list.items[0];
-    }
-    fn next(self: *const Buf) ?f64 {
-        return if (self.list.items.len >= 2) self.list.items[1] else null;
-    }
-    fn empty(self: *const Buf) bool {
-        return self.list.items.len == 0;
-    }
-};
-
 // Deliver every video frame whose PTS has already passed into the decode-ahead
 // buffer (no jitter — this test is about the clock, not drift).
-fn fillReadyFrames(a: std.mem.Allocator, buf: *Buf, next_frame: *i32, now: f64) void {
+fn fillReadyFrames(a: std.mem.Allocator, buf: *std.ArrayList(f64), next_frame: *i32, now: f64) void {
     while (next_frame.* < kTotalFrames and @as(f64, @floatFromInt(next_frame.*)) * kFrameInterval <= now) {
-        buf.pushBack(a, @as(f64, @floatFromInt(next_frame.*)) * kFrameInterval);
+        buf.append(a, @as(f64, @floatFromInt(next_frame.*)) * kFrameInterval) catch @panic("oom");
         next_frame.* += 1;
     }
-}
-
-fn runPresent(buf: *Buf, now: f64, held_pts: f64) f64 {
-    var shown = held_pts;
-    while (true) {
-        const a = selectPresentAction(buf.head(), buf.next(), now, kFrameInterval);
-        if (a == .drop) {
-            buf.popFront();
-            continue;
-        }
-        if (a == .show) {
-            shown = buf.head().?;
-            buf.popFront();
-        }
-        break;
-    }
-    return shown;
 }
 
 const SimResult = struct {
@@ -101,7 +58,7 @@ const SimResult = struct {
 fn simulate(a: std.mem.Allocator, apply_fallback: bool) SimResult {
     var result: SimResult = .{};
     var clock = AudioMasterClock.init(kSampleRate, 0.0);
-    var buf: Buf = .{};
+    var buf: std.ArrayList(f64) = .empty;
     defer buf.deinit(a);
     var next_frame: i32 = 0;
     const total_real_frames: i64 = @intFromFloat(kAudioEndSeconds * @as(f64, @floatFromInt(kSampleRate)));
@@ -132,7 +89,7 @@ fn simulate(a: std.mem.Allocator, apply_fallback: bool) SimResult {
         prev_now = now;
 
         fillReadyFrames(a, &buf, &next_frame, now);
-        result.shown_pts = runPresent(&buf, now, result.shown_pts);
+        result.shown_pts = ts.runPresent(&buf, now, result.shown_pts, kFrameInterval);
 
         if (result.shown_pts >= @as(f64, @floatFromInt(kTotalFrames - 1)) * kFrameInterval) {
             break; // last frame presented — playback reached the end
@@ -171,7 +128,7 @@ test "mid-stream underrun without audio EOS freezes the clock until audio resume
     // and the wall-clock fallback must NOT fire.
     const a = std.testing.allocator;
     var clock = AudioMasterClock.init(kSampleRate, 0.0);
-    var buf: Buf = .{};
+    var buf: std.ArrayList(f64) = .empty;
     defer buf.deinit(a);
     var next_frame: i32 = 0;
     var shown_pts: f64 = -1.0;
@@ -203,7 +160,7 @@ test "mid-stream underrun without audio EOS freezes the clock until audio resume
 
         const now = clock.mediaTime();
         fillReadyFrames(a, &buf, &next_frame, now);
-        shown_pts = runPresent(&buf, now, shown_pts);
+        shown_pts = ts.runPresent(&buf, now, shown_pts, kFrameInterval);
 
         if (tick == kGapStart) {
             time_at_gap_start = now;
@@ -234,7 +191,7 @@ test "silent clip advances by exactly delta per tick under the unified rule" {
     // equivalent to advance(delta).
     const a = std.testing.allocator;
     var clock = MonotonicClock.init(0.0);
-    var buf: Buf = .{};
+    var buf: std.ArrayList(f64) = .empty;
     defer buf.deinit(a);
     var next_frame: i32 = 0;
     var shown_pts: f64 = -1.0;
@@ -253,7 +210,7 @@ test "silent clip advances by exactly delta per tick under the unified rule" {
 
         const now = clock.mediaTime();
         fillReadyFrames(a, &buf, &next_frame, now);
-        shown_pts = runPresent(&buf, now, shown_pts);
+        shown_pts = ts.runPresent(&buf, now, shown_pts, kFrameInterval);
 
         if (shown_pts >= @as(f64, @floatFromInt(kTotalFrames - 1)) * kFrameInterval) {
             break; // last frame presented — the silent clip played to the end

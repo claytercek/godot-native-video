@@ -12,9 +12,9 @@ const std = @import("std");
 
 const backend_mod = @import("backend.zig");
 const channel_mixer = @import("channel_mixer.zig");
+const ts = @import("test_support.zig");
 
 const Backend = backend_mod.Backend;
-const VideoFrame = backend_mod.VideoFrame;
 const AudioChunk = backend_mod.AudioChunk;
 const AudioTrackInfo = backend_mod.AudioTrackInfo;
 
@@ -38,38 +38,27 @@ const MarkerClipBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *MarkerClipBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *MarkerClipBackend) void {
         if (self.scratch.len > 0) self.allocator.free(self.scratch);
         self.allocator.destroy(self);
     }
-    fn durFn(_: *anyopaque) f64 {
-        return 10.0;
-    }
-    fn wFn(_: *anyopaque) i32 {
+    pub fn videoWidth(_: *MarkerClipBackend) i32 {
         return 1920;
     }
-    fn hFn(_: *anyopaque) i32 {
+    pub fn videoHeight(_: *MarkerClipBackend) i32 {
         return 1080;
     }
-    // Legacy single-track fields return track 0 (stereo).
-    fn chFn(p: *anyopaque) i32 {
-        const self: *MarkerClipBackend = @ptrCast(@alignCast(p));
+    // Single-track compat fields return track 0 (stereo).
+    pub fn audioChannelCount(self: *MarkerClipBackend) i32 {
         return self.tracks[0].channels;
     }
-    fn rateFn(p: *anyopaque) i32 {
-        const self: *MarkerClipBackend = @ptrCast(@alignCast(p));
+    pub fn audioSampleRate(self: *MarkerClipBackend) i32 {
         return self.tracks[0].sample_rate;
     }
-    fn trackCountFn(_: *anyopaque) i32 {
+    pub fn audioTrackCount(_: *MarkerClipBackend) i32 {
         return kTrackCount;
     }
-    fn trackInfoFn(p: *anyopaque, index: i32) AudioTrackInfo {
-        const self: *MarkerClipBackend = @ptrCast(@alignCast(p));
+    pub fn audioTrackInfo(self: *MarkerClipBackend, index: i32) AudioTrackInfo {
         if (index < 0 or index >= kTrackCount) return .{};
         return .{
             .channels = self.tracks[@intCast(index)].channels,
@@ -79,20 +68,14 @@ const MarkerClipBackend = struct {
             .is_default = index == 0,
         };
     }
-    fn selectTrackFn(p: *anyopaque, index: i32) void {
-        const self: *MarkerClipBackend = @ptrCast(@alignCast(p));
+    pub fn selectAudioTrack(self: *MarkerClipBackend, index: i32) void {
         self.selected = index;
     }
-    fn seekFn(p: *anyopaque, _: f64) bool {
-        const self: *MarkerClipBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *MarkerClipBackend, _: f64) bool {
         self.chunks_pumped = 0;
         return true;
     }
-    fn nextVideoFrameFn(_: *anyopaque) ?VideoFrame {
-        return null; // video not needed for this test
-    }
-    fn nextAudioChunkFn(p: *anyopaque) ?AudioChunk {
-        const self: *MarkerClipBackend = @ptrCast(@alignCast(p));
+    pub fn nextAudioChunk(self: *MarkerClipBackend) ?AudioChunk {
         const track = self.selected;
         if (track < 0 or track >= kTrackCount) return null;
         const ch = self.tracks[@intCast(track)].channels;
@@ -126,25 +109,8 @@ const MarkerClipBackend = struct {
         };
     }
 
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = wFn,
-        .video_height = hFn,
-        .audio_channel_count = chFn,
-        .audio_sample_rate = rateFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-        .audio_track_count = trackCountFn,
-        .audio_track_info = trackInfoFn,
-        .select_audio_track = selectTrackFn,
-    };
-
     fn backend(self: *MarkerClipBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 

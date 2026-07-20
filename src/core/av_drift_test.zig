@@ -42,7 +42,7 @@
 
 const std = @import("std");
 const clock_mod = @import("clock.zig");
-const present_selector = @import("present_selector.zig");
+const ts = @import("test_support.zig");
 
 const kSampleRate: i32 = 48000;
 const kFps: f64 = 30.0;
@@ -56,29 +56,6 @@ const kBlockSeconds: f64 = @as(f64, @floatFromInt(kMixBlock)) / @as(f64, @floatF
 // real rate (2 blocks @ ~10.7 ms ~= 21.3 ms ~ slightly under one 30fps frame;
 // close enough that the decoder must keep up).
 const kBlocksPerTick: i32 = 2;
-
-// Apply the selector to the decode buffer for the current clock time and return
-// the PTS now on screen (or the held value if nothing new is due).
-fn runPresent(buf: *std.ArrayList(f64), now: f64, held_pts: f64) f64 {
-    var shown = held_pts;
-    while (true) {
-        const head: ?f64 = if (buf.items.len == 0) null else buf.items[0];
-        const next: ?f64 = if (buf.items.len >= 2) buf.items[1] else null;
-
-        const a = present_selector.selectPresentAction(head, next, now, kFrameInterval);
-        if (a == .drop) {
-            _ = buf.orderedRemove(0); // discard stale head, re-evaluate
-            continue;
-        }
-        if (a == .show) {
-            shown = buf.items[0];
-            _ = buf.orderedRemove(0);
-        }
-        // Hold or Show both terminate the tick.
-        break;
-    }
-    return shown;
-}
 
 test "A/V drift stays within budget under induced decode jitter" {
     const allocator = std.testing.allocator;
@@ -159,7 +136,7 @@ test "A/V drift stays within budget under induced decode jitter" {
         }
 
         // --- present (drop-late / hold-early) ---
-        shown_pts = runPresent(&buf, now, shown_pts);
+        shown_pts = ts.runPresent(&buf, now, shown_pts, kFrameInterval);
 
         // --- record drift ---
         if (shown_pts >= 0.0) {

@@ -53,6 +53,7 @@ const WallClockMs = core.wall_clock.WallClockMs;
 const present_pipeline = @import("present_pipeline.zig");
 const PresentPipeline = present_pipeline.PresentPipeline;
 const OutputMode = present_pipeline.OutputMode;
+const extension = @import("extension.zig");
 
 const log = std.log.scoped(.native_video);
 
@@ -174,7 +175,7 @@ pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
     // the audio buffer. Resolved once here and handed to the controller.
     const latency: f64 = AudioServer.getOutputLatency();
 
-    self.controller.load(self.allocator, backend, latency) catch {
+    self.controller.load(self.allocator, extension.sharedScheduler(), backend, latency) catch {
         backend.deinit();
         return false;
     };

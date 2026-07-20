@@ -94,60 +94,16 @@ pub fn deriveCanonicalMixFormat(allocator: std.mem.Allocator, backend: Backend) 
 const FakeBackend = struct {
     tracks: []const AudioTrackInfo,
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(_: *anyopaque) void {}
-    fn durFn(_: *anyopaque) f64 {
-        return 0;
-    }
-    fn dimFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn chFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn rateFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn seekFn(_: *anyopaque, _: f64) bool {
-        return true;
-    }
-    fn nvfFn(_: *anyopaque) ?backend_mod.VideoFrame {
-        return null;
-    }
-    fn nacFn(_: *anyopaque) ?backend_mod.AudioChunk {
-        return null;
-    }
-    fn trackCountFn(p: *anyopaque) i32 {
-        const self: *FakeBackend = @ptrCast(@alignCast(p));
+    pub fn audioTrackCount(self: *FakeBackend) i32 {
         return @intCast(self.tracks.len);
     }
-    fn trackInfoFn(p: *anyopaque, index: i32) AudioTrackInfo {
-        const self: *FakeBackend = @ptrCast(@alignCast(p));
+    pub fn audioTrackInfo(self: *FakeBackend, index: i32) AudioTrackInfo {
         if (index < 0 or index >= @as(i32, @intCast(self.tracks.len))) return .{};
         return self.tracks[@intCast(index)];
     }
 
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = dimFn,
-        .video_height = dimFn,
-        .audio_channel_count = chFn,
-        .audio_sample_rate = rateFn,
-        .seek = seekFn,
-        .next_video_frame = nvfFn,
-        .next_audio_chunk = nacFn,
-        .audio_track_count = trackCountFn,
-        .audio_track_info = trackInfoFn,
-    };
-
     fn backend(self: *FakeBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return @import("test_support.zig").backend(self);
     }
 };
 

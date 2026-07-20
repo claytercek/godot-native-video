@@ -1,10 +1,9 @@
-//! playback_controller_test.zig — port of tests/core/test_playback_controller.cpp.
-//!
-//! No Godot, no GPU. The controller registers with the process-wide
-//! DecodeScheduler.instance() singleton (async worker pool), same as the
-//! Binding does, so the deterministic (scheduler-timing-independent) branches
-//! are what these cases pin. The scrub-resolve cases drive the real scheduler
-//! seam through seek()/tick().
+//! PlaybackController tests. No Godot, no GPU. Each case constructs its own
+//! DecodeScheduler and injects it at load(), requesting force-synchronous
+//! mode so decode runs inline on the test thread where the build supports it
+//! (release builds fall back to a single async worker; the cases hold in
+//! both modes). The scrub-resolve cases drive the real scheduler seam
+//! through seek()/tick().
 
 const std = @import("std");
 
@@ -13,7 +12,9 @@ const channel_mixer = @import("channel_mixer.zig");
 const canonical_mix_format = @import("canonical_mix_format.zig");
 const wall_clock_mod = @import("wall_clock.zig");
 const pc = @import("playback_controller.zig");
+const ds = @import("decode_scheduler.zig");
 const sys_clock = @import("sys_clock.zig");
+const ts = @import("test_support.zig");
 
 const Backend = backend_mod.Backend;
 const VideoFrame = backend_mod.VideoFrame;
@@ -22,8 +23,15 @@ const AudioTrackInfo = backend_mod.AudioTrackInfo;
 const WallClockMs = wall_clock_mod.WallClockMs;
 const PlaybackController = pc.PlaybackController;
 const MixSink = pc.MixSink;
+const DecodeScheduler = ds.DecodeScheduler;
 
 const alloc = std.testing.allocator;
+
+// Per-test decode pool: one worker, force-synchronous where available for
+// deterministic inline decode.
+fn makeSched() *DecodeScheduler {
+    return DecodeScheduler.init(alloc, 1, true) catch @panic("sched init failed");
+}
 
 // Free every warning string and the list (transfers back ownership).
 fn drainWarnings(controller: *PlaybackController) void {
@@ -62,39 +70,21 @@ const MultiTrackFakeBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *MultiTrackFakeBackend) void {
         self.allocator.free(self.tracks);
         if (self.samples.len > 0) self.allocator.free(self.samples);
         self.allocator.destroy(self);
     }
-    fn durFn(_: *anyopaque) f64 {
-        return 10.0;
-    }
-    fn wFn(_: *anyopaque) i32 {
-        return 640;
-    }
-    fn hFn(_: *anyopaque) i32 {
-        return 360;
-    }
-    fn chFn(p: *anyopaque) i32 {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn audioChannelCount(self: *MultiTrackFakeBackend) i32 {
         return if (self.tracks.len == 0) 0 else self.tracks[0].channels;
     }
-    fn rateFn(p: *anyopaque) i32 {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn audioSampleRate(self: *MultiTrackFakeBackend) i32 {
         return if (self.tracks.len == 0) 0 else self.tracks[0].sample_rate;
     }
-    fn trackCountFn(p: *anyopaque) i32 {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn audioTrackCount(self: *MultiTrackFakeBackend) i32 {
         return @intCast(self.tracks.len);
     }
-    fn trackInfoFn(p: *anyopaque, index: i32) AudioTrackInfo {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn audioTrackInfo(self: *MultiTrackFakeBackend, index: i32) AudioTrackInfo {
         var info: AudioTrackInfo = .{};
         if (index >= 0 and @as(usize, @intCast(index)) < self.tracks.len) {
             info.channels = self.tracks[@intCast(index)].channels;
@@ -103,34 +93,29 @@ const MultiTrackFakeBackend = struct {
         }
         return info;
     }
-    fn selectTrackFn(p: *anyopaque, index: i32) void {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn selectAudioTrack(self: *MultiTrackFakeBackend, index: i32) void {
         self.live_track = index;
         self.select_calls += 1;
     }
-    fn reselectTrackFn(p: *anyopaque, index: i32, _: f64) bool {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn reselectAudioTrack(self: *MultiTrackFakeBackend, index: i32, _: f64) bool {
         self.reselect_calls += 1;
         if (!self.reselect_should_succeed) return false;
         self.live_track = index;
         return true;
     }
-    fn seekFn(p: *anyopaque, pts_seconds: f64) bool {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *MultiTrackFakeBackend, pts_seconds: f64) bool {
         var idx: i32 = @intFromFloat(pts_seconds * 30.0);
         if (idx < 0) idx = 0;
         self.next_index = idx;
         return true;
     }
-    fn nextVideoFrameFn(p: *anyopaque) ?VideoFrame {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn nextVideoFrame(self: *MultiTrackFakeBackend) ?VideoFrame {
         if (self.next_index >= 300) return null;
         const f: VideoFrame = .{ .pts_seconds = @as(f64, @floatFromInt(self.next_index)) / 30.0 };
         self.next_index += 1;
         return f;
     }
-    fn nextAudioChunkFn(p: *anyopaque) ?AudioChunk {
-        const self: *MultiTrackFakeBackend = @ptrCast(@alignCast(p));
+    pub fn nextAudioChunk(self: *MultiTrackFakeBackend) ?AudioChunk {
         if (self.tracks.len == 0 or self.live_track < 0 or
             @as(usize, @intCast(self.live_track)) >= self.tracks.len) return null;
         const t = self.tracks[@intCast(self.live_track)];
@@ -148,26 +133,8 @@ const MultiTrackFakeBackend = struct {
         };
     }
 
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = wFn,
-        .video_height = hFn,
-        .audio_channel_count = chFn,
-        .audio_sample_rate = rateFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-        .audio_track_count = trackCountFn,
-        .audio_track_info = trackInfoFn,
-        .select_audio_track = selectTrackFn,
-        .reselect_audio_track = reselectTrackFn,
-    };
-
     fn backend(self: *MultiTrackFakeBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 
@@ -192,46 +159,29 @@ const ShortAudioBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *ShortAudioBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *ShortAudioBackend) void {
         if (self.samples.len > 0) self.allocator.free(self.samples);
         self.allocator.destroy(self);
     }
-    fn durFn(_: *anyopaque) f64 {
-        return 10.0;
-    }
-    fn wFn(_: *anyopaque) i32 {
-        return 640;
-    }
-    fn hFn(_: *anyopaque) i32 {
-        return 360;
-    }
-    fn chFn(_: *anyopaque) i32 {
+    pub fn audioChannelCount(_: *ShortAudioBackend) i32 {
         return 2;
     }
-    fn rateFn(_: *anyopaque) i32 {
+    pub fn audioSampleRate(_: *ShortAudioBackend) i32 {
         return 48000;
     }
-    fn seekFn(p: *anyopaque, pts_seconds: f64) bool {
-        const self: *ShortAudioBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *ShortAudioBackend, pts_seconds: f64) bool {
         var idx: i32 = @intFromFloat(pts_seconds * 30.0);
         if (idx < 0) idx = 0;
         self.next_index = idx;
         return true;
     }
-    fn nextVideoFrameFn(p: *anyopaque) ?VideoFrame {
-        const self: *ShortAudioBackend = @ptrCast(@alignCast(p));
+    pub fn nextVideoFrame(self: *ShortAudioBackend) ?VideoFrame {
         if (self.next_index >= 300) return null;
         const f: VideoFrame = .{ .pts_seconds = @as(f64, @floatFromInt(self.next_index)) / 30.0 };
         self.next_index += 1;
         return f;
     }
-    fn nextAudioChunkFn(p: *anyopaque) ?AudioChunk {
-        const self: *ShortAudioBackend = @ptrCast(@alignCast(p));
+    pub fn nextAudioChunk(self: *ShortAudioBackend) ?AudioChunk {
         if (self.delivered) return null; // permanent EOS after the one real chunk
         self.delivered = true;
         const n: usize = @as(usize, @intCast(self.total_frames)) * 2;
@@ -248,22 +198,8 @@ const ShortAudioBackend = struct {
         };
     }
 
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = wFn,
-        .video_height = hFn,
-        .audio_channel_count = chFn,
-        .audio_sample_rate = rateFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-    };
-
     fn backend(self: *ShortAudioBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 
@@ -281,12 +217,6 @@ fn scrubKeyframeAtOrBefore(frame: i32) i32 {
     return @divTrunc(frame, kScrubGopFrames) * kScrubGopFrames;
 }
 
-// A release closure that bumps a drop counter (models a released surface).
-fn dropRelease(p: ?*anyopaque) void {
-    const counter: *std.atomic.Value(i32) = @ptrCast(@alignCast(p.?));
-    _ = counter.fetchAdd(1, .monotonic);
-}
-
 const ScrubGridBackend = struct {
     allocator: std.mem.Allocator,
     drop_counter: *std.atomic.Value(i32),
@@ -298,63 +228,36 @@ const ScrubGridBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *ScrubGridBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *ScrubGridBackend) void {
         self.allocator.destroy(self);
     }
-    fn durFn(_: *anyopaque) f64 {
+    pub fn durationSeconds(_: *ScrubGridBackend) f64 {
         return @as(f64, @floatFromInt(kScrubTotalFrames)) / @as(f64, @floatFromInt(kScrubFps));
     }
-    fn wFn(_: *anyopaque) i32 {
+    pub fn videoWidth(_: *ScrubGridBackend) i32 {
         return 0;
     }
-    fn hFn(_: *anyopaque) i32 {
+    pub fn videoHeight(_: *ScrubGridBackend) i32 {
         return 1;
     }
-    fn zeroFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn seekFn(p: *anyopaque, pts_seconds: f64) bool {
-        const self: *ScrubGridBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *ScrubGridBackend, pts_seconds: f64) bool {
         const target = scrubFrameOfPts(pts_seconds);
         self.next_index = scrubKeyframeAtOrBefore(target);
         return true;
     }
-    fn nextVideoFrameFn(p: *anyopaque) ?VideoFrame {
-        const self: *ScrubGridBackend = @ptrCast(@alignCast(p));
+    pub fn nextVideoFrame(self: *ScrubGridBackend) ?VideoFrame {
         if (self.next_index >= kScrubTotalFrames) return null;
         const idx = self.next_index;
         self.next_index += 1;
         return .{
             .pts_seconds = @as(f64, @floatFromInt(idx)) / @as(f64, @floatFromInt(kScrubFps)),
-            .release_ctx = self.drop_counter,
-            .release_fn = dropRelease,
+            // A released frame bumps the drop counter.
+            .release_hook = ts.countingRelease(self.drop_counter),
         };
     }
-    fn nextAudioChunkFn(_: *anyopaque) ?AudioChunk {
-        return null;
-    }
-
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = wFn,
-        .video_height = hFn,
-        .audio_channel_count = zeroFn,
-        .audio_sample_rate = zeroFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-    };
 
     fn backend(self: *ScrubGridBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 
@@ -378,64 +281,36 @@ const ExactPtsBackend = struct {
         return self;
     }
 
-    fn openFn(_: *anyopaque, _: []const u8) bool {
-        return true;
-    }
-    fn closeFn(_: *anyopaque) void {}
-    fn deinitFn(p: *anyopaque) void {
-        const self: *ExactPtsBackend = @ptrCast(@alignCast(p));
+    pub fn deinit(self: *ExactPtsBackend) void {
         self.allocator.free(self.pts_sequence);
         self.allocator.destroy(self);
     }
-    fn durFn(_: *anyopaque) f64 {
+    pub fn durationSeconds(_: *ExactPtsBackend) f64 {
         return 100.0;
     }
-    fn wFn(_: *anyopaque) i32 {
+    pub fn videoWidth(_: *ExactPtsBackend) i32 {
         return 0;
     }
-    fn hFn(_: *anyopaque) i32 {
+    pub fn videoHeight(_: *ExactPtsBackend) i32 {
         return 1;
     }
-    fn zeroFn(_: *anyopaque) i32 {
-        return 0;
-    }
-    fn seekFn(p: *anyopaque, _: f64) bool {
-        const self: *ExactPtsBackend = @ptrCast(@alignCast(p));
+    pub fn seek(self: *ExactPtsBackend, _: f64) bool {
         self.armed = true;
         self.idx = 0;
         return true;
     }
-    fn nextVideoFrameFn(p: *anyopaque) ?VideoFrame {
-        const self: *ExactPtsBackend = @ptrCast(@alignCast(p));
+    pub fn nextVideoFrame(self: *ExactPtsBackend) ?VideoFrame {
         if (!self.armed or self.idx >= self.pts_sequence.len) return null;
         const pts = self.pts_sequence[self.idx];
         self.idx += 1;
         return .{
             .pts_seconds = pts,
-            .release_ctx = self.drop_counter,
-            .release_fn = dropRelease,
+            .release_hook = ts.countingRelease(self.drop_counter),
         };
     }
-    fn nextAudioChunkFn(_: *anyopaque) ?AudioChunk {
-        return null;
-    }
-
-    const vtable: Backend.VTable = .{
-        .open = openFn,
-        .close = closeFn,
-        .deinit = deinitFn,
-        .duration_seconds = durFn,
-        .video_width = wFn,
-        .video_height = hFn,
-        .audio_channel_count = zeroFn,
-        .audio_sample_rate = zeroFn,
-        .seek = seekFn,
-        .next_video_frame = nextVideoFrameFn,
-        .next_audio_chunk = nextAudioChunkFn,
-    };
 
     fn backend(self: *ExactPtsBackend) Backend {
-        return .{ .ptr = self, .vtable = &vtable };
+        return ts.backend(self);
     }
 };
 
@@ -488,9 +363,11 @@ test "WallClockMs holds its value and supports comparison/arithmetic via .ms" {
 // =======================================================================
 
 test "load() derives the Canonical Mix Format and warns once on a mixed sample rate" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{
         .{ .channels = 1, .sample_rate = 44100 }, // track 0: default -> canonical rate
         .{ .channels = 2, .sample_rate = 48000 }, // track 1: differing rate -> one warning
         .{ .channels = 6, .sample_rate = 44100 }, // track 2: matches canonical rate -> no warning
@@ -512,9 +389,11 @@ test "load() derives the Canonical Mix Format and warns once on a mixed sample r
 }
 
 test "a silent clip (no audio tracks) reports zero channels and no warnings" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
 
     try std.testing.expect(controller.loaded);
     try std.testing.expectEqual(0, controller.canonical_channels);
@@ -527,6 +406,8 @@ test "a silent clip (no audio tracks) reports zero channels and no warnings" {
 }
 
 test "an out-of-range pre-load track selection is validated and reset once load() runs" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
     // Pre-load selection: no stream yet, so this just records desired_track_.
@@ -537,7 +418,7 @@ test "an out-of-range pre-load track selection is validated and reset once load(
         try std.testing.expect(w.items.len == 0); // no validation possible yet
     }
 
-    try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 2, .sample_rate = 48000 }}, 4096).backend(), 0.0);
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 2, .sample_rate = 48000 }}, 4096).backend(), 0.0);
 
     try std.testing.expectEqual(0, controller.desired_track); // out of range -> fell back to 0
     var warnings = controller.takeWarnings();
@@ -552,9 +433,11 @@ test "an out-of-range pre-load track selection is validated and reset once load(
 }
 
 test "drive_audio advances the clock by only the accepted-and-real frame count" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, makeStereoBackend(), 0.0);
+    try controller.load(alloc, sched, makeStereoBackend(), 0.0);
     controller.play(WallClockMs.init(0.0));
 
     // The sink accepts far fewer frames than fillAudio() will have topped the
@@ -570,11 +453,13 @@ test "drive_audio advances the clock by only the accepted-and-real frame count" 
 }
 
 test "a mid-stream reselect the backend refuses rolls the desired track back" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
     be.reselect_should_succeed = false;
-    try controller.load(alloc, be.backend(), 0.0);
+    try controller.load(alloc, sched, be.backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
@@ -597,12 +482,14 @@ test "a mid-stream reselect the backend refuses rolls the desired track back" {
 }
 
 test "stop() resets transport state and tick() is a no-op before load()" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
     var sink = CappedMixSink{ .accept_cap = 4096 };
     try std.testing.expect(controller.tick(1.0 / 60.0, WallClockMs.init(0.0), sink.sink()) == null);
 
-    try controller.load(alloc, makeStereoBackend(), 0.0);
+    try controller.load(alloc, sched, makeStereoBackend(), 0.0);
     controller.play(WallClockMs.init(0.0));
     try std.testing.expect(controller.playing);
 
@@ -618,10 +505,12 @@ test "stop() resets transport state and tick() is a no-op before load()" {
 // =======================================================================
 
 test "request_audio_track while stopped applies immediately via select_audio_track (cheap apply)" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
-    try controller.load(alloc, be.backend(), 0.0);
+    try controller.load(alloc, sched, be.backend(), 0.0);
     try std.testing.expect(!controller.playing);
 
     controller.requestAudioTrack(1);
@@ -638,10 +527,12 @@ test "request_audio_track while stopped applies immediately via select_audio_tra
 }
 
 test "a live reselect success converges desired/live, and a converged reconcile is a no-op" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
-    try controller.load(alloc, be.backend(), 0.0);
+    try controller.load(alloc, sched, be.backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
@@ -668,10 +559,12 @@ test "a live reselect success converges desired/live, and a converged reconcile 
 }
 
 test "requesting the already-desired track is a no-op and never touches the backend" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
-    try controller.load(alloc, be.backend(), 0.0);
+    try controller.load(alloc, sched, be.backend(), 0.0);
     try std.testing.expectEqual(0, be.select_calls); // load() had no pending switch to apply
 
     controller.requestAudioTrack(0); // already desired -> short-circuits
@@ -690,9 +583,11 @@ test "requesting the already-desired track is a no-op and never touches the back
 // =======================================================================
 
 test "one-clock rule: audio-master tick() never adds the render delta on top of accepted audio frames" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, makeStereoBackend(), 0.0);
+    try controller.load(alloc, sched, makeStereoBackend(), 0.0);
     controller.play(WallClockMs.init(0.0));
 
     var sink = CappedMixSink{ .accept_cap = 480 }; // 480 frames @ 48kHz = 10ms of real audio
@@ -707,9 +602,11 @@ test "one-clock rule: audio-master tick() never adds the render delta on top of 
 }
 
 test "one-clock rule: a silent clip advances the clock by exactly the render delta, once per tick" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
 
     var sink = CappedMixSink{ .accept_cap = 4096 }; // never invoked: no audio track
@@ -723,9 +620,11 @@ test "one-clock rule: a silent clip advances the clock by exactly the render del
 }
 
 test "one-clock rule: audio exhaustion falls back to the render delta exactly once per tick" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
+    try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
     var sink = AcceptAllMixSink{};
 
@@ -746,9 +645,11 @@ test "one-clock rule: audio exhaustion falls back to the render delta exactly on
 }
 
 test "one-clock rule: the transition tick (drained AND exhausted) advances by real frames only, not real+delta" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
+    try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
     var sink = AcceptAllMixSink{};
 
@@ -762,9 +663,11 @@ test "one-clock rule: the transition tick (drained AND exhausted) advances by re
 }
 
 test "one-clock rule: a partial drain that leaves audio remaining does NOT trigger the delta fallback" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, ShortAudioBackend.create(alloc, 1000).backend(), 0.0);
+    try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 1000).backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
     // Accept far fewer than the 1000-frame chunk so the ring is NOT empty after.
     var sink = CappedMixSink{ .accept_cap = 100 };
@@ -778,9 +681,11 @@ test "one-clock rule: a partial drain that leaves audio remaining does NOT trigg
 }
 
 test "accepted-vs-real: silence offered during underrun is never counted as real audio" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
+    try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
     var sink = AcceptAllMixSink{}; // accepts every frame offered, including silence
 
@@ -871,9 +776,11 @@ test "derive_canonical_mix_format: track metadata without sample-rate audio is s
 }
 
 test "load() clamps a track's channel count to kMaxMixSourceChannels" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 8, .sample_rate = 48000 }}, 4096).backend(), 0.0);
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 8, .sample_rate = 48000 }}, 4096).backend(), 0.0);
 
     try std.testing.expectEqual(channel_mixer.max_mix_source_channels, controller.canonical_channels);
 
@@ -881,9 +788,11 @@ test "load() clamps a track's channel count to kMaxMixSourceChannels" {
 }
 
 test "a mid-stream switch to a differing sample-rate track is refused while playing" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 44100 } }, 4096).backend(), 0.0);
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 44100 } }, 4096).backend(), 0.0);
     drainWarnings(&controller); // drain load()'s own mixed-sample-rate warning
     controller.play(WallClockMs.init(0.0));
 
@@ -902,9 +811,11 @@ test "a mid-stream switch to a differing sample-rate track is refused while play
 }
 
 test "a switch to a differing sample-rate track is allowed while stopped" {
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 44100 } }, 4096).backend(), 0.0);
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 44100 } }, 4096).backend(), 0.0);
     drainWarnings(&controller); // drain load()'s own mixed-sample-rate warning
     try std.testing.expect(!controller.playing);
 
@@ -932,9 +843,11 @@ test "seek(): a fast burst resolves Keyframe with no forward-decode drops; a lon
     // --- Exact: a lone seek (no prior scrub history) always resolves Exact. ---
     var exact_drops = std.atomic.Value(i32).init(0);
     {
+        const sched = makeSched();
+        defer sched.deinit();
         var controller = PlaybackController.init();
         defer controller.deinit();
-        try controller.load(alloc, ScrubGridBackend.create(alloc, &exact_drops).backend(), 0.0);
+        try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &exact_drops).backend(), 0.0);
         controller.seek(target, WallClockMs.init(0.0));
         controller.shutdown();
     }
@@ -943,32 +856,35 @@ test "seek(): a fast burst resolves Keyframe with no forward-decode drops; a lon
     // --- Keyframe: priming, then a fast in-burst follow-up seek. ---
     var kf_drops = std.atomic.Value(i32).init(0);
     {
+        const sched = makeSched();
+        defer sched.deinit();
         var controller = PlaybackController.init();
         defer controller.deinit();
-        try controller.load(alloc, ScrubGridBackend.create(alloc, &kf_drops).backend(), 0.0);
+        try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &kf_drops).backend(), 0.0);
         controller.seek(1.0, WallClockMs.init(0.0)); // prime (Exact, trivial forward decode)
         kf_drops.store(0, .monotonic); // isolate the SECOND (Keyframe) resolve only
         controller.seek(target, WallClockMs.init(20.0)); // 20ms later, huge jump -> fast drag -> Keyframe
         // Check BEFORE shutdown: request_seek() flushes the queue; the count here
         // is purely the flush (shutdown adds worker-pushed post-seek frames).
-        try std.testing.expect(kf_drops.load(.monotonic) <= @as(i32, @intCast(decode_scheduler_kDecodeAheadCapacity)));
+        try std.testing.expect(kf_drops.load(.monotonic) <= @as(i32, @intCast(ds.kDecodeAheadCapacity)));
         controller.shutdown();
     }
 }
 
-const decode_scheduler_kDecodeAheadCapacity = @import("decode_scheduler.zig").kDecodeAheadCapacity;
 
-test "the exact-resolve spin treats a frame within epsilon of the target as arrived" {
-    const kSpinEps = 1.0 / 120.0; // mirrors applyScrubResolve()'s tolerance
+test "an exact resolve treats a frame within epsilon of the target as arrived" {
+    const kEps = 1.0 / 120.0; // mirrors applyScrubResolve()'s tolerance
     const target = 10.0;
 
-    // A frame within epsilon of the target is NOT dropped — the spin stops
-    // immediately and leaves it for the present step.
+    // A frame within epsilon of the target is NOT dropped — the forward
+    // decode stops there and leaves it for the present step.
     var drops_in_tolerance = std.atomic.Value(i32).init(0);
     {
+        const sched = makeSched();
+        defer sched.deinit();
         var controller = PlaybackController.init();
         defer controller.deinit();
-        try controller.load(alloc, ExactPtsBackend.create(alloc, &.{target - kSpinEps * 0.5}, &drops_in_tolerance).backend(), 0.0);
+        try controller.load(alloc, sched, ExactPtsBackend.create(alloc, &.{target - kEps * 0.5}, &drops_in_tolerance).backend(), 0.0);
         controller.seek(target, WallClockMs.init(0.0));
         // Check before shutdown(): unregister releases the in-tolerance survivor,
         // which would otherwise inflate this count by one.
@@ -976,28 +892,32 @@ test "the exact-resolve spin treats a frame within epsilon of the target as arri
         controller.shutdown();
     }
 
-    // A frame outside epsilon IS dropped; the spin then stops at the next frame,
-    // which is within tolerance.
+    // A frame outside epsilon IS dropped; the forward decode then stops at
+    // the next frame, which is within tolerance.
     var drops_out_of_tolerance = std.atomic.Value(i32).init(0);
     {
+        const sched = makeSched();
+        defer sched.deinit();
         var controller = PlaybackController.init();
         defer controller.deinit();
-        try controller.load(alloc, ExactPtsBackend.create(alloc, &.{ target - kSpinEps * 2.0, target - kSpinEps * 0.5 }, &drops_out_of_tolerance).backend(), 0.0);
+        try controller.load(alloc, sched, ExactPtsBackend.create(alloc, &.{ target - kEps * 2.0, target - kEps * 0.5 }, &drops_out_of_tolerance).backend(), 0.0);
         controller.seek(target, WallClockMs.init(0.0));
         try std.testing.expectEqual(1, drops_out_of_tolerance.load(.monotonic));
         controller.shutdown();
     }
 }
 
-test "seek() past end-of-stream terminates the exact-resolve spin instead of hanging (bounded spin)" {
+test "seek() past end-of-stream clamps at EOS instead of hanging" {
     var drops = std.atomic.Value(i32).init(0);
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, ScrubGridBackend.create(alloc, &drops).backend(), 0.0);
+    try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &drops).backend(), 0.0);
 
-    // Lone seek -> Exact. Target far beyond the clip's duration, so the backend
-    // reports EOS immediately after the reseek and the forward-decode spin must
-    // give up via atEnd() rather than hang.
+    // Lone seek -> Exact. Target far beyond the clip's duration, so the
+    // backend reports EOS before reaching the target and the exact resolve
+    // must clamp there rather than decode forever.
     const start = sys_clock.milliTimestamp();
     controller.seek(@as(f64, @floatFromInt(kScrubTotalFrames)) / @as(f64, @floatFromInt(kScrubFps)) + 1000.0, WallClockMs.init(0.0));
     const elapsed = sys_clock.milliTimestamp() - start;
@@ -1007,21 +927,13 @@ test "seek() past end-of-stream terminates the exact-resolve spin instead of han
     controller.shutdown();
 }
 
-test "the exact-resolve spin backoff is bounded far below the old kMaxSpins=100000" {
-    // Regression guard for the busy-wait replacement: the spin's total iteration
-    // ceiling (yield + sleep phases) must be far smaller than the old
-    // 100000-yield hot-loop.
-    try std.testing.expect(pc.kScrubMaxYieldSpins + pc.kScrubMaxSleepSpins < 10000);
-    try std.testing.expect(pc.kScrubMaxYieldSpins > 0);
-    try std.testing.expect(pc.kScrubMaxSleepSpins > 0);
-    try std.testing.expect(pc.kScrubSpinSleepMs > 0.0);
-}
-
 test "after a drag burst settles, the next tick presents the exact settled target frame" {
     var drops = std.atomic.Value(i32).init(0);
+    const sched = makeSched();
+    defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    try controller.load(alloc, ScrubGridBackend.create(alloc, &drops).backend(), 0.0);
+    try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &drops).backend(), 0.0);
     controller.play(WallClockMs.init(0.0));
 
     // Frame-aligned targets sidestep the present-selector's own half-frame

@@ -162,17 +162,9 @@ fn at(ms: f64) WallClockMs {
     return .{ .ms = ms };
 }
 
-// Default-ish config used across the cases: a seek is "fast" (a drag burst)
-// when successive _seek calls arrive within the burst window AND move the
-// target by at least the velocity threshold; the scrub is "settled" once
-// `settle_debounce_ms` elapse with no new seek.
-fn makeConfig() ScrubConfig {
-    return .{
-        .settle_debounce_ms = 100.0, // ~80-120ms band per the issue
-        .burst_window_ms = 120.0, // two seeks within this gap can form a burst
-        .velocity_threshold = 2.0, // media-seconds per wall-second to count as a fast drag
-    };
-}
+// Shared scrub thresholds used across the cases here and in the integration
+// tests.
+const makeConfig = @import("test_support.zig").makeScrubConfig;
 
 test "first seek with no prior history resolves exactly (no burst yet)" {
     var s = Scrubber.init(makeConfig());

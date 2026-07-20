@@ -20,6 +20,7 @@ pub const sys_clock = @import("sys_clock.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("test_support.zig");
     _ = @import("av_drift_test.zig");
     _ = @import("colorimetry_test.zig");
     _ = @import("audio_eos_fallback_test.zig");

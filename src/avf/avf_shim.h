@@ -148,9 +148,11 @@ void nv_avf_destroy(nv_avf_backend *h);
 // Open the asset, resolve tracks, parse negotiated colorimetry, and
 // enumerate audio tracks. Does NOT build a reader — the caller drives that
 // with nv_avf_build_reader so track selection stays a Zig-side decision.
-// Returns NV_AVF_OK (info filled) or NV_AVF_NONE (info zeroed) — never
-// NV_AVF_FAIL. A media with neither a video nor any audio track counts as
-// NV_AVF_NONE.
+// Assumes `h` is already closed (a fresh handle, or one that's been through
+// nv_avf_close); calling this on an already-open handle leaks the prior
+// asset's track table instead of replacing it. Returns NV_AVF_OK (info
+// filled) or NV_AVF_NONE (info zeroed) — never NV_AVF_FAIL. A media with
+// neither a video nor any audio track counts as NV_AVF_NONE.
 nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *info);
 
 // Release all reader/asset/track state and free shim-owned strings + scratch.

@@ -12,7 +12,7 @@
 //! ALLOCATOR: load() takes and stores a std.mem.Allocator. It owns the
 //! controller's audio ring buffer, mix/drive scratch buffers, the per-track
 //! metadata cache, and the warning strings. deinit() frees all of them.
-//! (The DecodeStream and its Backend are owned by the process-wide
+//! (The DecodeStream and its Backend are owned by the injected
 //! DecodeScheduler, which uses its own allocator; see decode_scheduler.zig.)
 
 const std = @import("std");
@@ -23,7 +23,6 @@ const audio_ring_mod = @import("audio_ring.zig");
 const scrubber_mod = @import("scrubber.zig");
 const wall_clock_mod = @import("wall_clock.zig");
 const decode_scheduler = @import("decode_scheduler.zig");
-const sys_clock = @import("sys_clock.zig");
 const canonical_mix_format = @import("canonical_mix_format.zig");
 const channel_mixer = @import("channel_mixer.zig");
 const present_selector = @import("present_selector.zig");
@@ -42,18 +41,6 @@ const ResolveMode = scrubber_mod.ResolveMode;
 const WallClockMs = wall_clock_mod.WallClockMs;
 const DecodeScheduler = decode_scheduler.DecodeScheduler;
 const StreamHandle = decode_scheduler.StreamHandle;
-
-// Bounded backoff for the Exact-resolve forward-decode spin in
-// applyScrubResolve(). The spin waits for the decode pool worker to top the
-// queue up to the exact scrub target. A pure yield loop can hot-loop on a
-// loaded machine; instead we yield a bounded number of times (cheap, sub-ms
-// latency), then sleep in small increments (bounded CPU), then give up and let
-// the present step converge on the next ticks. Total wall-clock ceiling is
-// roughly kScrubMaxYieldSpins yields + kScrubMaxSleepSpins * kScrubSpinSleep.
-pub const kScrubMaxYieldSpins: i32 = 100;
-pub const kScrubMaxSleepSpins: i32 = 1000;
-// 0.1 ms per sleep iteration — responsive without burning a core.
-pub const kScrubSpinSleepMs: f64 = 0.1;
 
 // -----------------------------------------------------------------------
 // MixSink — the one Godot-touching seam the controller calls through.
@@ -86,11 +73,75 @@ pub const MixSink = struct {
 };
 
 // -----------------------------------------------------------------------
+// AudioTrackSwitch — the clock-mastership half of a mid-stream audio-track
+// switch, as an explicit little state machine.
+//
+// A switch runs idle -> handing-off -> live (with a recovering-on-failure
+// edge back to live). The transitions that used to be smeared across load(),
+// stop(), reconcileAudioTrack() and the audio-decode inner loop live here.
+//
+// This struct owns exactly ONE piece of state: `in_progress` — true from the
+// moment a live reselect puts the ClockBridge into monotonic-master (so video
+// keeps advancing while the new track is still silent) until the first chunk
+// of the NEW track flows and re-anchors the clock back to audio-master. The
+// caller keeps `desired_track`/`live_track` (which track is wanted vs. live)
+// as its own caller-readable state; every clock handoff/re-anchor tied to a
+// switch runs through the methods below so the mastership timing is defined in
+// one place, not four.
+// -----------------------------------------------------------------------
+const AudioTrackSwitch = struct {
+    in_progress: bool = false,
+
+    /// A live reselect is starting: hand the clock to monotonic-master so
+    /// video keeps advancing through the coming audio silence, and mark the
+    /// switch in progress. handoffToMonotonic() is a no-op if already
+    /// monotonic (e.g. a second request arrives mid-handoff).
+    fn begin(self: *AudioTrackSwitch, clock: *ClockBridge) void {
+        clock.handoffToMonotonic();
+        self.in_progress = true;
+    }
+
+    /// The completing edge, called from the audio-decode loop for every chunk.
+    /// reconcile cleared the ring before handing off, so the FIRST chunk to
+    /// reach the decode loop (genuinely decoded, not merely attempted) is from
+    /// the new track: re-anchor the audio clock to the current monotonic
+    /// position so mediaTime() stays continuous, and end the handoff. A no-op
+    /// once the switch has completed — the common per-chunk case.
+    fn onFirstChunk(self: *AudioTrackSwitch, clock: *ClockBridge) void {
+        if (!self.in_progress) return;
+        clock.reanchorToAudio();
+        self.in_progress = false;
+    }
+
+    /// The reselect failed: the Backend leaves the audio decode path undefined,
+    /// so end the handoff and re-anchor to audio. The caller rolls its own
+    /// desired track back to what is still live and seeks to recover.
+    fn rollback(self: *AudioTrackSwitch, clock: *ClockBridge) void {
+        self.in_progress = false;
+        clock.reanchorToAudio();
+    }
+
+    /// Cancel a possibly half-complete switch (stop): end the handoff and make
+    /// sure the bridge is audio-master again so it does not stay
+    /// monotonic-master forever with no fillAudio() left to re-anchor it.
+    /// `clock` is optional (unloaded controller) and reanchorToAudio() is
+    /// itself a no-op on a silent clip's null audio clock, so this is safe to
+    /// call unconditionally.
+    fn cancel(self: *AudioTrackSwitch, clock: ?*ClockBridge) void {
+        self.in_progress = false;
+        if (clock) |c| c.reanchorToAudio();
+    }
+};
+
+// -----------------------------------------------------------------------
 // PlaybackController — Godot-free per-stream playback state machine.
 // -----------------------------------------------------------------------
 pub const PlaybackController = struct {
     allocator: std.mem.Allocator = undefined,
 
+    // The decode pool this controller registers its stream with. Injected at
+    // load(); valid whenever `stream` is non-null.
+    sched: *DecodeScheduler = undefined,
     stream: ?StreamHandle = null,
     scrubber: Scrubber = .{},
     clock: ?ClockBridge = null,
@@ -132,10 +183,11 @@ pub const PlaybackController = struct {
     desired_track: i32 = 0,
     live_track: i32 = 0,
 
-    // True between a mid-stream reselect and the first audio chunk from the new
-    // track. During this window the ClockBridge is in monotonic-master mode so
-    // video keeps advancing while audio is silent.
-    switch_in_progress: bool = false,
+    // The clock-mastership half of a switch (the monotonic-master handoff
+    // window and its re-anchor timing). Owns `in_progress`; the controller
+    // drives it via begin/onFirstChunk/rollback/cancel rather than poking a
+    // bare bool from four different methods.
+    track_switch: AudioTrackSwitch = .{},
 
     // Per-track audio metadata cached at load time for sample-rate validation
     // during mid-stream track switches.
@@ -183,22 +235,24 @@ pub const PlaybackController = struct {
     /// completes (no use-after-free). Safe to call multiple times.
     pub fn shutdown(self: *PlaybackController) void {
         if (self.stream) |s| {
-            DecodeScheduler.instance().unregisterStream(s);
+            self.sched.unregisterStream(s);
             self.stream = null;
         }
     }
 
     /// Takes ownership of an already-open()'d backend, derives the Canonical Mix
-    /// Format, builds the master clock, and registers with the shared
+    /// Format, builds the master clock, and registers with the given
     /// DecodeScheduler. A pre-load requestAudioTrack() selection is validated and
     /// applied here.
     pub fn load(
         self: *PlaybackController,
         allocator: std.mem.Allocator,
+        sched: *DecodeScheduler,
         backend: Backend,
         audio_output_latency_seconds: f64,
     ) !void {
         self.allocator = allocator;
+        self.sched = sched;
 
         // Cached at open time from the track's format descriptions; per-frame CV
         // attachments may carry more accurate metadata at decode time.
@@ -223,11 +277,11 @@ pub const PlaybackController = struct {
         for (fmt.warnings.items) |w| self.warn(w);
         fmt.warnings.deinit(allocator); // strings transferred; free the outer array only
 
-        // Hand the Backend to the process-wide shared decode pool. From here a
-        // pool worker decodes video ahead into stream's queue; this object
-        // never touches the Backend directly except via the scheduler
-        // (nextFrame / withBackend).
-        self.stream = try DecodeScheduler.instance().registerStream(backend);
+        // Hand the Backend to the shared decode pool. From here a pool worker
+        // decodes video ahead into stream's queue; this object never touches
+        // the Backend directly except via the scheduler (nextFrame /
+        // withBackend).
+        self.stream = try sched.registerStream(backend);
 
         if (self.has_audio) {
             // Audio-master: latency-compensated so mediaTime() reflects what the
@@ -248,19 +302,11 @@ pub const PlaybackController = struct {
         self.loaded = true;
         self.position = 0.0;
         self.audio_eos = false;
-        self.switch_in_progress = false;
+        self.track_switch = .{};
 
         // A pre-load requestAudioTrack() selection must survive, not be
         // clobbered; validate it now that audio_track_count is known.
-        if (self.audio_track_count > 0 and
-            (self.desired_track < 0 or self.desired_track >= self.audio_track_count))
-        {
-            self.warnFmt(
-                "Audio track index {d} is out of range. Clip has {d} track(s). Falling back to default (0).",
-                .{ self.desired_track, self.audio_track_count },
-            );
-            self.desired_track = 0;
-        }
+        self.desired_track = self.clampTrackIndex(self.desired_track);
         self.live_track = 0;
         // Cheap-applies any pre-load selection (we are not yet playing).
         self.reconcileAudioTrack();
@@ -293,16 +339,13 @@ pub const PlaybackController = struct {
         if (self.master()) |c| c.setTime(0.0);
         if (self.audio_ring) |*r| r.clear();
         // Flush + reseek to start (serialized against the worker).
-        if (self.stream) |s| DecodeScheduler.instance().requestSeek(s, 0.0);
+        if (self.stream) |s| self.sched.requestSeek(s, 0.0);
         self.scrubber = Scrubber.init(self.scrubber.config); // no stale velocity/settle
-        self.switch_in_progress = false;
         // Track selection persists across stop (desired_/live_track are NOT
-        // reset here). If the caller stopped mid-switch, re-anchor so the bridge
-        // does not stay monotonic-master forever with no fill_audio() to
-        // re-anchor it.
-        if (self.has_audio) {
-            if (self.clock) |*c| c.reanchorToAudio();
-        }
+        // reset here). Cancel any half-complete switch: end the handoff and
+        // re-anchor so the bridge does not stay monotonic-master forever with no
+        // fillAudio() left to re-anchor it.
+        self.track_switch.cancel(self.master());
     }
 
     pub fn setPaused(self: *PlaybackController, paused: bool) void {
@@ -329,15 +372,7 @@ pub const PlaybackController = struct {
     // canonical rate (the mix format is fixed for the lifetime); applies
     // immediately when stopped/pre-load, otherwise defers to the next tick().
     pub fn requestAudioTrack(self: *PlaybackController, idx_in: i32) void {
-        var idx = idx_in;
-        if (self.audio_track_count > 0 and (idx < 0 or idx >= self.audio_track_count)) {
-            self.warnFmt(
-                "Audio track index {d} is out of range. Clip has {d} track(s). Falling back to default (0).",
-                .{ idx, self.audio_track_count },
-            );
-            idx = 0;
-        }
-
+        const idx = self.clampTrackIndex(idx_in);
         if (idx == self.desired_track) return;
 
         // The canonical mix format and AudioMasterClock are fixed to the clip's
@@ -379,7 +414,7 @@ pub const PlaybackController = struct {
         self.reconcileAudioTrack();
 
         if (!self.playing or self.paused) return null;
-        const sched = DecodeScheduler.instance();
+        const sched = self.sched;
 
         const media_now = self.advanceClock(delta_seconds, sink, c);
         const chosen = self.selectPresentFrame(sched, media_now);
@@ -431,7 +466,13 @@ pub const PlaybackController = struct {
     //   * Hold  — head in the future: present nothing new.
     // Updates self.position when a frame is chosen.
     fn selectPresentFrame(self: *PlaybackController, sched: *DecodeScheduler, media_now: f64) ?VideoFrame {
-        const frame_interval = 1.0 / 30.0; // nominal; refined when fps is known
+        // A deliberately fixed 30fps-nominal seconds-per-frame. The core tracks
+        // no fps, and this value is never used AS a frame rate: the present
+        // selector consumes it only as a half-interval "due" epsilon
+        // (eps = frame_interval * 0.5). 30fps is the loosest common cadence, so
+        // higher-fps content simply gets a slightly more generous tolerance —
+        // acceptable, and cheaper than plumbing real fps down here.
+        const frame_interval = 1.0 / 30.0;
         var chosen: ?VideoFrame = null;
 
         while (true) {
@@ -488,7 +529,7 @@ pub const PlaybackController = struct {
         if (self.stream == null or self.audio_ring == null or self.audio_eos) return;
         // Pump under the scheduler's per-stream exclusion so we never race the
         // worker decoding video ahead on the same Backend.
-        DecodeScheduler.instance().withBackend(self.stream.?, self, fillAudioClosure);
+        self.sched.withBackend(self.stream.?, self, fillAudioClosure);
     }
 
     fn fillAudioClosure(self: *PlaybackController, backend: *Backend) void {
@@ -505,17 +546,11 @@ pub const PlaybackController = struct {
                 break;
             };
             if (chunk.samples.len == 0 or chunk.frame_count <= 0) continue;
-            // --- Mid-stream track switch: re-anchor clock when new audio flows.
-            // During a switch the clock is in monotonic-master mode so video keeps
-            // advancing through the audio silence. reconcileAudioTrack() cleared
-            // the ring before this call, so the first chunk to reach this point
-            // (decoded, not merely attempted) is genuinely from the new track: the
-            // audio clock is repositioned to the current monotonic position so
-            // mediaTime() remains continuous.
-            if (self.switch_in_progress) {
-                self.clock.?.reanchorToAudio();
-                self.switch_in_progress = false;
-            }
+            // Mid-stream track switch: the FSM re-anchors the clock the first
+            // time a genuinely-new-track chunk reaches this point (a no-op on
+            // every other chunk). The "why the first chunk is genuinely new"
+            // reasoning lives in AudioTrackSwitch.onFirstChunk, not here.
+            self.track_switch.onFirstChunk(&self.clock.?);
             // Mix native layout -> canonical (no-op memcpy when counts match).
             const nf = chunk.frame_count;
             const sc = chunk.channel_count;
@@ -574,45 +609,19 @@ pub const PlaybackController = struct {
         const target = @max(resolve.target_seconds, 0.0);
 
         if (self.audio_ring) |*r| r.clear(); // stale audio must not play after a (re)seek
-        const sched = DecodeScheduler.instance();
-
-        // Both modes start by flushing the decode-ahead queue and reseeking the
-        // Backend to the preceding keyframe through the scheduler (serialized
-        // against the worker; no race / no UAF).
-        sched.requestSeek(self.stream.?, target);
+        const sched = self.sched;
 
         if (resolve.mode == .exact) {
-            // Decode forward past the keyframe to the exact target, dropping
-            // earlier frames; bounded by the clip (stops at EOS). Runs on the
-            // caller's thread only on settle/resume (not the hot per-frame path),
-            // so a brief wait for the worker is acceptable. The wait uses bounded
-            // backoff (kScrubMaxYieldSpins / kScrubMaxSleepSpins): a pure yield
-            // loop could hot-loop on a loaded machine.
+            // Settle/resume wants the precise frame: seek and decode forward
+            // to the target synchronously on this thread (serialized against
+            // the workers inside the scheduler). Precision over latency —
+            // this never runs on the hot per-frame path.
             const eps = 1.0 / 120.0; // ~half a frame at 60fps tolerance
-            var yield_spins: i32 = 0;
-            var sleep_spins: i32 = 0;
-            const sleep_ns: u64 = @intFromFloat(kScrubSpinSleepMs * 1000.0 * 1000.0);
-            while (true) {
-                const head = sched.peekHeadPts(self.stream.?);
-                if (head == null) {
-                    if (sched.atEnd(self.stream.?)) break; // EOS before the target — clamp.
-                    if (yield_spins < kScrubMaxYieldSpins) {
-                        std.Thread.yield() catch {};
-                        yield_spins += 1;
-                    } else if (sleep_spins < kScrubMaxSleepSpins) {
-                        sys_clock.sleep(sleep_ns);
-                        sleep_spins += 1;
-                    } else {
-                        break; // worker stalled — give up, let present step converge.
-                    }
-                    continue;
-                }
-                yield_spins = 0;
-                sleep_spins = 0;
-                if (head.? + eps >= target) break; // head is at/after the target
-                // Head is before the target: drop it and keep decoding forward.
-                if (sched.nextFrame(self.stream.?)) |stale| stale.release();
-            }
+            sched.seekExact(self.stream.?, target, eps);
+        } else {
+            // Keyframe scrub: flush and reseek to the preceding keyframe;
+            // whatever the backend yields first is the fast approximate frame.
+            sched.requestSeek(self.stream.?, target);
         }
 
         c.setTime(target); // re-anchor the master clock to the resolved target
@@ -624,9 +633,23 @@ pub const PlaybackController = struct {
         self.reconcileAudioTrack();
     }
 
+    // Range-check a requested audio-track index against the clip's track count,
+    // warning and falling back to the default track (0) when out of range.
+    // Shared by load() (validating a pre-load selection) and requestAudioTrack().
+    fn clampTrackIndex(self: *PlaybackController, idx: i32) i32 {
+        if (self.audio_track_count > 0 and (idx < 0 or idx >= self.audio_track_count)) {
+            self.warnFmt(
+                "Audio track index {d} is out of range. Clip has {d} track(s). Falling back to default (0).",
+                .{ idx, self.audio_track_count },
+            );
+            return 0;
+        }
+        return idx;
+    }
+
     fn reconcileAudioTrack(self: *PlaybackController) void {
         if (self.desired_track == self.live_track or self.stream == null) return;
-        const sched = DecodeScheduler.instance();
+        const sched = self.sched;
 
         if (!self.playing) {
             // Stopped / pre-play: cheap apply. Deferred in the backend until its
@@ -639,9 +662,9 @@ pub const PlaybackController = struct {
         // Playing (or paused — reselecting now primes the new reader at position
         // so resume is instant).
         if (self.clock == null or self.audio_ring == null) return;
+        const c = self.master().?;
 
-        self.clock.?.handoffToMonotonic(); // no-op if already monotonic
-        self.switch_in_progress = true;
+        self.track_switch.begin(c); // handoff to monotonic-master + in-progress
 
         const target = self.desired_track;
         const prime_seconds = self.position;
@@ -657,8 +680,7 @@ pub const PlaybackController = struct {
             // failure, so the old track is not safely playable. Roll desired back
             // to what is still live and force a seek to recover.
             self.desired_track = self.live_track;
-            self.switch_in_progress = false;
-            self.clock.?.reanchorToAudio();
+            self.track_switch.rollback(c);
             self.warnFmt("Audio track switch to {d} failed; recovering via seek.", .{target});
             sched.requestSeek(self.stream.?, self.position);
             return;
