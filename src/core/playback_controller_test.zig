@@ -2,18 +2,16 @@
 //! DecodeScheduler and injects it at load(), requesting force-synchronous
 //! mode so decode runs inline on the test thread where the build supports it
 //! (release builds fall back to a single async worker; the cases hold in
-//! both modes). The scrub-resolve cases drive the real scheduler seam
-//! through seek()/tick().
+//! both modes). The scrub-resolve cases that drive seek()/tick() against the
+//! real scheduler live in scrubber_integration_test.zig.
 
 const std = @import("std");
 
 const backend_mod = @import("backend.zig");
 const channel_mixer = @import("channel_mixer.zig");
-const canonical_mix_format = @import("canonical_mix_format.zig");
 const wall_clock_mod = @import("wall_clock.zig");
 const pc = @import("playback_controller.zig");
 const ds = @import("decode_scheduler.zig");
-const sys_clock = @import("sys_clock.zig");
 const ts = @import("test_support.zig");
 
 const Backend = backend_mod.Backend;
@@ -199,117 +197,6 @@ const ShortAudioBackend = struct {
     }
 
     fn backend(self: *ShortAudioBackend) Backend {
-        return ts.backend(self);
-    }
-};
-
-// -----------------------------------------------------------------------
-// Scrub-resolve fixtures.
-// -----------------------------------------------------------------------
-const kScrubFps: i32 = 30;
-const kScrubGopFrames: i32 = 30; // 1s GOP
-const kScrubTotalFrames: i32 = 1200; // 40s clip
-
-fn scrubFrameOfPts(pts: f64) i32 {
-    return @intFromFloat(@round(pts * @as(f64, @floatFromInt(kScrubFps))));
-}
-fn scrubKeyframeAtOrBefore(frame: i32) i32 {
-    return @divTrunc(frame, kScrubGopFrames) * kScrubGopFrames;
-}
-
-const ScrubGridBackend = struct {
-    allocator: std.mem.Allocator,
-    drop_counter: *std.atomic.Value(i32),
-    next_index: i32 = 0,
-
-    fn create(allocator: std.mem.Allocator, drop_counter: *std.atomic.Value(i32)) *ScrubGridBackend {
-        const self = allocator.create(ScrubGridBackend) catch @panic("oom");
-        self.* = .{ .allocator = allocator, .drop_counter = drop_counter };
-        return self;
-    }
-
-    pub fn deinit(self: *ScrubGridBackend) void {
-        self.allocator.destroy(self);
-    }
-    pub fn durationSeconds(_: *ScrubGridBackend) f64 {
-        return @as(f64, @floatFromInt(kScrubTotalFrames)) / @as(f64, @floatFromInt(kScrubFps));
-    }
-    pub fn videoWidth(_: *ScrubGridBackend) i32 {
-        return 0;
-    }
-    pub fn videoHeight(_: *ScrubGridBackend) i32 {
-        return 1;
-    }
-    pub fn seek(self: *ScrubGridBackend, pts_seconds: f64) bool {
-        const target = scrubFrameOfPts(pts_seconds);
-        self.next_index = scrubKeyframeAtOrBefore(target);
-        return true;
-    }
-    pub fn nextVideoFrame(self: *ScrubGridBackend) ?VideoFrame {
-        if (self.next_index >= kScrubTotalFrames) return null;
-        const idx = self.next_index;
-        self.next_index += 1;
-        return .{
-            .pts_seconds = @as(f64, @floatFromInt(idx)) / @as(f64, @floatFromInt(kScrubFps)),
-            // A released frame bumps the drop counter.
-            .release_hook = ts.countingRelease(self.drop_counter),
-        };
-    }
-
-    fn backend(self: *ScrubGridBackend) Backend {
-        return ts.backend(self);
-    }
-};
-
-// -----------------------------------------------------------------------
-// ExactPtsBackend — an explicit, hand-picked PTS sequence, used only to probe
-// applyScrubResolve()'s epsilon boundary. The sequence only "arms" once seek()
-// is called, so the initial register_stream decode-ahead does not race to
-// consume these hand-picked frames first.
-// -----------------------------------------------------------------------
-const ExactPtsBackend = struct {
-    allocator: std.mem.Allocator,
-    pts_sequence: []f64,
-    drop_counter: *std.atomic.Value(i32),
-    idx: usize = 0,
-    armed: bool = false,
-
-    fn create(allocator: std.mem.Allocator, pts_sequence: []const f64, drop_counter: *std.atomic.Value(i32)) *ExactPtsBackend {
-        const self = allocator.create(ExactPtsBackend) catch @panic("oom");
-        const owned = allocator.dupe(f64, pts_sequence) catch @panic("oom");
-        self.* = .{ .allocator = allocator, .pts_sequence = owned, .drop_counter = drop_counter };
-        return self;
-    }
-
-    pub fn deinit(self: *ExactPtsBackend) void {
-        self.allocator.free(self.pts_sequence);
-        self.allocator.destroy(self);
-    }
-    pub fn durationSeconds(_: *ExactPtsBackend) f64 {
-        return 100.0;
-    }
-    pub fn videoWidth(_: *ExactPtsBackend) i32 {
-        return 0;
-    }
-    pub fn videoHeight(_: *ExactPtsBackend) i32 {
-        return 1;
-    }
-    pub fn seek(self: *ExactPtsBackend, _: f64) bool {
-        self.armed = true;
-        self.idx = 0;
-        return true;
-    }
-    pub fn nextVideoFrame(self: *ExactPtsBackend) ?VideoFrame {
-        if (!self.armed or self.idx >= self.pts_sequence.len) return null;
-        const pts = self.pts_sequence[self.idx];
-        self.idx += 1;
-        return .{
-            .pts_seconds = pts,
-            .release_hook = ts.countingRelease(self.drop_counter),
-        };
-    }
-
-    fn backend(self: *ExactPtsBackend) Backend {
         return ts.backend(self);
     }
 };
@@ -703,78 +590,6 @@ test "accepted-vs-real: silence offered during underrun is never counted as real
     controller.shutdown();
 }
 
-// =======================================================================
-// derive_canonical_mix_format — the pure, scheduler-free half of load()
-// =======================================================================
-
-test "derive_canonical_mix_format: max channel count across tracks; first audio-bearing rate wins" {
-    const be = MultiTrackFakeBackend.create(alloc, &.{
-        .{ .channels = 1, .sample_rate = 44100 },
-        .{ .channels = 2, .sample_rate = 48000 },
-        .{ .channels = 6, .sample_rate = 44100 },
-    }, 4096);
-    defer be.backend().deinit();
-
-    var fmt = try canonical_mix_format.deriveCanonicalMixFormat(alloc, be.backend());
-    defer fmt.deinit(alloc);
-
-    try std.testing.expect(fmt.has_audio);
-    try std.testing.expectEqual(6, fmt.channels); // max across tracks
-    try std.testing.expectEqual(44100, fmt.sample_rate); // first audio-bearing track
-    try std.testing.expectEqual(3, fmt.track_infos.items.len);
-    try std.testing.expectEqual(44100, fmt.track_infos.items[2].sample_rate);
-}
-
-test "derive_canonical_mix_format: mixed sample rate warns exactly once, later matching tracks silent" {
-    const be = MultiTrackFakeBackend.create(alloc, &.{
-        .{ .channels = 1, .sample_rate = 44100 }, .{ .channels = 2, .sample_rate = 48000 },
-        .{ .channels = 6, .sample_rate = 44100 }, .{ .channels = 2, .sample_rate = 48000 },
-    }, 4096);
-    defer be.backend().deinit();
-
-    var fmt = try canonical_mix_format.deriveCanonicalMixFormat(alloc, be.backend());
-    defer fmt.deinit(alloc);
-
-    try std.testing.expectEqual(1, fmt.warnings.items.len);
-    try expectContains(fmt.warnings.items[0], "differs from the canonical rate");
-}
-
-test "derive_canonical_mix_format: a silent clip (no tracks) yields no audio and no warnings" {
-    const be = MultiTrackFakeBackend.create(alloc, &.{}, 4096);
-    defer be.backend().deinit();
-
-    var fmt = try canonical_mix_format.deriveCanonicalMixFormat(alloc, be.backend());
-    defer fmt.deinit(alloc);
-
-    try std.testing.expect(!fmt.has_audio);
-    try std.testing.expectEqual(0, fmt.channels);
-    try std.testing.expectEqual(0, fmt.sample_rate);
-    try std.testing.expect(fmt.warnings.items.len == 0);
-}
-
-test "derive_canonical_mix_format: channel count clamped to kMaxMixSourceChannels" {
-    const be = MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 8, .sample_rate = 48000 }}, 4096);
-    defer be.backend().deinit();
-
-    var fmt = try canonical_mix_format.deriveCanonicalMixFormat(alloc, be.backend());
-    defer fmt.deinit(alloc);
-
-    try std.testing.expectEqual(channel_mixer.max_mix_source_channels, fmt.channels);
-}
-
-test "derive_canonical_mix_format: track metadata without sample-rate audio is still collected" {
-    const be = MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 2, .sample_rate = 0 }}, 4096);
-    defer be.backend().deinit();
-
-    var fmt = try canonical_mix_format.deriveCanonicalMixFormat(alloc, be.backend());
-    defer fmt.deinit(alloc);
-
-    try std.testing.expect(!fmt.has_audio);
-    try std.testing.expectEqual(0, fmt.sample_rate);
-    try std.testing.expectEqual(2, fmt.channels); // channel count is still tracked
-    try std.testing.expectEqual(1, fmt.track_infos.items.len);
-}
-
 test "load() clamps a track's channel count to kMaxMixSourceChannels" {
     const sched = makeSched();
     defer sched.deinit();
@@ -810,6 +625,34 @@ test "a mid-stream switch to a differing sample-rate track is refused while play
     controller.shutdown();
 }
 
+test "canonical channel count stays at the cross-track max regardless of the selected track" {
+    // A stereo commentary track plus a 5.1 main track: the Canonical Mix
+    // Format is fixed at load() to the max across tracks (6ch), so switching
+    // between the tracks must never change it — the channel mixer converts
+    // whichever native format the live track emits.
+    const sched = makeSched();
+    defer sched.deinit();
+    var controller = PlaybackController.init();
+    defer controller.deinit();
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{
+        .{ .channels = 2, .sample_rate = 48000 }, // stereo commentary (default)
+        .{ .channels = 6, .sample_rate = 48000 }, // 5.1 main
+    }, 4096).backend(), 0.0);
+
+    try std.testing.expectEqual(6, controller.canonical_channels);
+    try std.testing.expectEqual(48000, controller.canonical_sample_rate);
+
+    controller.requestAudioTrack(1); // stopped: applies immediately
+    try std.testing.expectEqual(1, controller.live_track);
+    try std.testing.expectEqual(6, controller.canonical_channels); // unchanged
+
+    controller.requestAudioTrack(0);
+    try std.testing.expectEqual(0, controller.live_track);
+    try std.testing.expectEqual(6, controller.canonical_channels); // unchanged
+
+    controller.shutdown();
+}
+
 test "a switch to a differing sample-rate track is allowed while stopped" {
     const sched = makeSched();
     defer sched.deinit();
@@ -826,133 +669,6 @@ test "a switch to a differing sample-rate track is allowed while stopped" {
     var w = controller.takeWarnings();
     defer w.deinit(alloc);
     try std.testing.expect(w.items.len == 0);
-
-    controller.shutdown();
-}
-
-// =======================================================================
-// Scrub resolve
-// =======================================================================
-
-test "seek(): a fast burst resolves Keyframe with no forward-decode drops; a lone seek resolves Exact" {
-    // Target deliberately near the END of a GOP so an Exact resolve must decode
-    // nearly a full GOP forward, while a Keyframe resolve stops dead at the
-    // keyframe.
-    const target = @as(f64, @floatFromInt(kScrubGopFrames - 1)) / @as(f64, @floatFromInt(kScrubFps)) + 20.0;
-
-    // --- Exact: a lone seek (no prior scrub history) always resolves Exact. ---
-    var exact_drops = std.atomic.Value(i32).init(0);
-    {
-        const sched = makeSched();
-        defer sched.deinit();
-        var controller = PlaybackController.init();
-        defer controller.deinit();
-        try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &exact_drops).backend(), 0.0);
-        controller.seek(target, WallClockMs.init(0.0));
-        controller.shutdown();
-    }
-    try std.testing.expect(exact_drops.load(.monotonic) >= @divTrunc(kScrubGopFrames, 2)); // decoded across most of a GOP
-
-    // --- Keyframe: priming, then a fast in-burst follow-up seek. ---
-    var kf_drops = std.atomic.Value(i32).init(0);
-    {
-        const sched = makeSched();
-        defer sched.deinit();
-        var controller = PlaybackController.init();
-        defer controller.deinit();
-        try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &kf_drops).backend(), 0.0);
-        controller.seek(1.0, WallClockMs.init(0.0)); // prime (Exact, trivial forward decode)
-        kf_drops.store(0, .monotonic); // isolate the SECOND (Keyframe) resolve only
-        controller.seek(target, WallClockMs.init(20.0)); // 20ms later, huge jump -> fast drag -> Keyframe
-        // Check BEFORE shutdown: request_seek() flushes the queue; the count here
-        // is purely the flush (shutdown adds worker-pushed post-seek frames).
-        try std.testing.expect(kf_drops.load(.monotonic) <= @as(i32, @intCast(ds.kDecodeAheadCapacity)));
-        controller.shutdown();
-    }
-}
-
-
-test "an exact resolve treats a frame within epsilon of the target as arrived" {
-    const kEps = 1.0 / 120.0; // mirrors applyScrubResolve()'s tolerance
-    const target = 10.0;
-
-    // A frame within epsilon of the target is NOT dropped — the forward
-    // decode stops there and leaves it for the present step.
-    var drops_in_tolerance = std.atomic.Value(i32).init(0);
-    {
-        const sched = makeSched();
-        defer sched.deinit();
-        var controller = PlaybackController.init();
-        defer controller.deinit();
-        try controller.load(alloc, sched, ExactPtsBackend.create(alloc, &.{target - kEps * 0.5}, &drops_in_tolerance).backend(), 0.0);
-        controller.seek(target, WallClockMs.init(0.0));
-        // Check before shutdown(): unregister releases the in-tolerance survivor,
-        // which would otherwise inflate this count by one.
-        try std.testing.expectEqual(0, drops_in_tolerance.load(.monotonic));
-        controller.shutdown();
-    }
-
-    // A frame outside epsilon IS dropped; the forward decode then stops at
-    // the next frame, which is within tolerance.
-    var drops_out_of_tolerance = std.atomic.Value(i32).init(0);
-    {
-        const sched = makeSched();
-        defer sched.deinit();
-        var controller = PlaybackController.init();
-        defer controller.deinit();
-        try controller.load(alloc, sched, ExactPtsBackend.create(alloc, &.{ target - kEps * 2.0, target - kEps * 0.5 }, &drops_out_of_tolerance).backend(), 0.0);
-        controller.seek(target, WallClockMs.init(0.0));
-        try std.testing.expectEqual(1, drops_out_of_tolerance.load(.monotonic));
-        controller.shutdown();
-    }
-}
-
-test "seek() past end-of-stream clamps at EOS instead of hanging" {
-    var drops = std.atomic.Value(i32).init(0);
-    const sched = makeSched();
-    defer sched.deinit();
-    var controller = PlaybackController.init();
-    defer controller.deinit();
-    try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &drops).backend(), 0.0);
-
-    // Lone seek -> Exact. Target far beyond the clip's duration, so the
-    // backend reports EOS before reaching the target and the exact resolve
-    // must clamp there rather than decode forever.
-    const start = sys_clock.milliTimestamp();
-    controller.seek(@as(f64, @floatFromInt(kScrubTotalFrames)) / @as(f64, @floatFromInt(kScrubFps)) + 1000.0, WallClockMs.init(0.0));
-    const elapsed = sys_clock.milliTimestamp() - start;
-
-    try std.testing.expect(elapsed < 5_000); // bounded, not hung
-
-    controller.shutdown();
-}
-
-test "after a drag burst settles, the next tick presents the exact settled target frame" {
-    var drops = std.atomic.Value(i32).init(0);
-    const sched = makeSched();
-    defer sched.deinit();
-    var controller = PlaybackController.init();
-    defer controller.deinit();
-    try controller.load(alloc, sched, ScrubGridBackend.create(alloc, &drops).backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
-
-    // Frame-aligned targets sidestep the present-selector's own half-frame
-    // tolerance landing on a coin-flip between two adjacent frames.
-    const last_target = 400.0 / @as(f64, @floatFromInt(kScrubFps));
-    controller.seek(100.0 / @as(f64, @floatFromInt(kScrubFps)), WallClockMs.init(1000.0)); // prime -> Exact
-    controller.seek(300.0 / @as(f64, @floatFromInt(kScrubFps)), WallClockMs.init(1020.0)); // fast -> Keyframe
-    controller.seek(last_target, WallClockMs.init(1040.0)); // fast -> Keyframe (approximate frame on screen)
-
-    var sink = CappedMixSink{ .accept_cap = 0 }; // never invoked: no audio
-    // 150ms later (past the 100ms settle debounce): the pending settle fires
-    // inside this tick() and resolves Exact to the last drag target. delta_seconds
-    // is tiny so tick()'s post-settle clock advance does not push `now` into the
-    // present selector's half-frame tolerance of the NEXT frame.
-    const frame = controller.tick(0.001, WallClockMs.init(1190.0), sink.sink());
-
-    try std.testing.expect(frame != null);
-    try std.testing.expectApproxEqAbs(last_target, frame.?.pts_seconds, 1e-9);
-    if (frame) |f| f.release();
 
     controller.shutdown();
 }

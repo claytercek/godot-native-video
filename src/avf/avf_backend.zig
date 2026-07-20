@@ -8,8 +8,8 @@
 //!
 //! Ownership at the boundaries:
 //!  - Video frames: the shim hands out a CVPixelBufferRef carrying a +1
-//!    retain via native_handle; the frame's release_fn calls
-//!    nv_avf_frame_release exactly once (mirrors the C++ PixelBufferRef).
+//!    retain via native_handle; the frame's release hook calls
+//!    nv_avf_frame_release exactly once.
 //!  - Audio samples: shim-owned scratch, valid until the next
 //!    nextAudioChunk()/close() — the AudioChunk slice borrows it.
 //!  - AudioTrackInfo strings: duplicated into backend-owned storage at open,

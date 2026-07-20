@@ -142,3 +142,26 @@ test "derive_canonical_mix_format with no tracks has no audio" {
     try std.testing.expectEqual(0, fmt.sample_rate);
     try std.testing.expectEqual(0, fmt.warnings.items.len);
 }
+
+test "derive_canonical_mix_format warns exactly once on mixed sample rates; later matching tracks stay silent" {
+    var fake: FakeBackend = .{ .tracks = &.{
+        .{ .channels = 1, .sample_rate = 44100 }, .{ .channels = 2, .sample_rate = 48000 },
+        .{ .channels = 6, .sample_rate = 44100 }, .{ .channels = 2, .sample_rate = 48000 },
+    } };
+    var fmt = try deriveCanonicalMixFormat(std.testing.allocator, fake.backend());
+    defer fmt.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(1, fmt.warnings.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fmt.warnings.items[0], "differs from the canonical rate") != null);
+}
+
+test "derive_canonical_mix_format still collects track metadata without sample-rate audio" {
+    var fake: FakeBackend = .{ .tracks = &.{.{ .channels = 2, .sample_rate = 0 }} };
+    var fmt = try deriveCanonicalMixFormat(std.testing.allocator, fake.backend());
+    defer fmt.deinit(std.testing.allocator);
+
+    try std.testing.expect(!fmt.has_audio);
+    try std.testing.expectEqual(0, fmt.sample_rate);
+    try std.testing.expectEqual(2, fmt.channels); // channel count is still tracked
+    try std.testing.expectEqual(1, fmt.track_infos.items.len);
+}

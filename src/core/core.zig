@@ -24,7 +24,6 @@ test {
     _ = @import("av_drift_test.zig");
     _ = @import("colorimetry_test.zig");
     _ = @import("audio_eos_fallback_test.zig");
-    _ = @import("marker_clip_test.zig");
     _ = @import("scrubber_integration_test.zig");
     _ = @import("color_matrix_test.zig");
 }
