@@ -265,7 +265,7 @@ void nv_avf_destroy(nv_avf_backend *h) {
 	(void)s;
 }
 
-int nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *info) {
+nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *info) {
 	NvAvfState *s = state_of(h);
 	nv_avf_close(h);
 	if (info) {
@@ -282,12 +282,12 @@ int nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *in
 			url = [NSURL fileURLWithPath:str];
 		}
 		if (!url) {
-			return 0;
+			return NV_AVF_NONE;
 		}
 
 		AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
 		if (!asset) {
-			return 0;
+			return NV_AVF_NONE;
 		}
 		s->asset = asset;
 		s->duration = CMTimeGetSeconds(asset.duration);
@@ -394,7 +394,7 @@ int nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *in
 		}
 
 		if (!s->has_video && acount == 0) {
-			return 0;
+			return NV_AVF_NONE;
 		}
 
 		if (info) {
@@ -405,7 +405,7 @@ int nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *in
 			info->audio_track_count = s->track_count;
 			info->color = s->color;
 		}
-		return 1;
+		return NV_AVF_OK;
 	}
 }
 
@@ -425,7 +425,7 @@ int nv_avf_get_audio_track_info(nv_avf_backend *h, int index, nv_avf_audio_track
 // -----------------------------------------------------------------------
 // Reader construction.
 // -----------------------------------------------------------------------
-int nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_index) {
+nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_index) {
 	NvAvfState *s = state_of(h);
 	teardown_audio_reader(s);
 	teardown_combined(s);
@@ -440,7 +440,7 @@ int nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_in
 		NSError *err = nil;
 		AVAssetReader *r = [AVAssetReader assetReaderWithAsset:s->asset error:&err];
 		if (!r || err) {
-			return -1;
+			return NV_AVF_FAIL;
 		}
 
 		// Restrict to [start_time, duration] so seek resumes mid-clip at the
@@ -469,31 +469,31 @@ int nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_in
 		}
 
 		if (![r startReading]) {
-			return -1;
+			return NV_AVF_FAIL;
 		}
 		s->reader = r;
-		return 1;
+		return NV_AVF_OK;
 	}
 }
 
-int nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, double start_time) {
+nv_avf_result nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, double start_time) {
 	NvAvfState *s = state_of(h);
 	teardown_audio_reader(s);
 
 	if (track_index < 0 || !s->all_audio_tracks ||
 			track_index >= (int)s->all_audio_tracks.count) {
-		return 0;
+		return NV_AVF_NONE;
 	}
 	AVAssetTrack *use_audio = s->all_audio_tracks[track_index];
 	if (!use_audio) {
-		return 0;
+		return NV_AVF_NONE;
 	}
 
 	@autoreleasepool {
 		NSError *err = nil;
 		AVAssetReader *ar = [AVAssetReader assetReaderWithAsset:s->asset error:&err];
 		if (!ar || err) {
-			return -1;
+			return NV_AVF_FAIL;
 		}
 
 		// Same [start_time, +inf] windowing as build_reader on seek, so audio
@@ -504,33 +504,33 @@ int nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, double start_t
 		AVAssetReaderTrackOutput *ao = make_audio_output(use_audio);
 		ao.alwaysCopiesSampleData = NO;
 		if (![ar canAddOutput:ao]) {
-			return 0;
+			return NV_AVF_NONE;
 		}
 		[ar addOutput:ao];
 
 		if (![ar startReading]) {
-			return -1;
+			return NV_AVF_FAIL;
 		}
 		s->audio_reader = ar;
 		s->audio_only_out = ao;
-		return 1;
+		return NV_AVF_OK;
 	}
 }
 
-int nv_avf_build_video_reader(nv_avf_backend *h, double start_time) {
+nv_avf_result nv_avf_build_video_reader(nv_avf_backend *h, double start_time) {
 	NvAvfState *s = state_of(h);
 	// Tear down only the combined reader; leave the audio-only reader intact.
 	teardown_combined(s);
 
 	if (!s->video_track) {
-		return 0;
+		return NV_AVF_NONE;
 	}
 
 	@autoreleasepool {
 		NSError *err = nil;
 		AVAssetReader *r = [AVAssetReader assetReaderWithAsset:s->asset error:&err];
 		if (!r || err) {
-			return -1;
+			return NV_AVF_FAIL;
 		}
 		if (start_time > 0.0) {
 			CMTime start = CMTimeMakeWithSeconds(start_time, 600);
@@ -540,17 +540,17 @@ int nv_avf_build_video_reader(nv_avf_backend *h, double start_time) {
 		AVAssetReaderTrackOutput *vo = make_video_output(s->video_track, &s->color);
 		vo.alwaysCopiesSampleData = NO;
 		if (![r canAddOutput:vo]) {
-			return 0;
+			return NV_AVF_NONE;
 		}
 		[r addOutput:vo];
 
 		if (![r startReading]) {
-			return -1;
+			return NV_AVF_FAIL;
 		}
 		s->reader = r;
 		s->video_out = vo;
 		// audio_out stays nil — no audio output to back up and block video.
-		return 1;
+		return NV_AVF_OK;
 	}
 }
 
@@ -561,22 +561,22 @@ void nv_avf_teardown_audio_reader(nv_avf_backend *h) {
 // -----------------------------------------------------------------------
 // Decode pump.
 // -----------------------------------------------------------------------
-int nv_avf_next_video_frame(nv_avf_backend *h, nv_avf_video_frame *out) {
+nv_avf_result nv_avf_next_video_frame(nv_avf_backend *h, nv_avf_video_frame *out) {
 	NvAvfState *s = state_of(h);
 	if (!s->reader || !s->video_out) {
-		return 0;
+		return NV_AVF_NONE;
 	}
 	@autoreleasepool {
 		CMSampleBufferRef sample = [s->video_out copyNextSampleBuffer];
 		if (!sample) {
-			return (s->reader.status == AVAssetReaderStatusFailed) ? -1 : 0;
+			return (s->reader.status == AVAssetReaderStatusFailed) ? NV_AVF_FAIL : NV_AVF_NONE;
 		}
 
 		CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
 		CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample);
 		if (!image) {
 			CFRelease(sample);
-			return -1;
+			return NV_AVF_FAIL;
 		}
 
 		// Adopt a +1 retain on the pixel buffer for the caller; the sample
@@ -594,11 +594,11 @@ int nv_avf_next_video_frame(nv_avf_backend *h, nv_avf_video_frame *out) {
 		populate_frame_colorimetry(pb, &out->color);
 
 		CFRelease(sample);
-		return 1;
+		return NV_AVF_OK;
 	}
 }
 
-int nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out) {
+nv_avf_result nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out) {
 	NvAvfState *s = state_of(h);
 
 	// Prefer the dedicated audio-only reader when active (mid-decode reselect),
@@ -606,13 +606,13 @@ int nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out) {
 	AVAssetReader *active_reader = s->audio_reader ? s->audio_reader : s->reader;
 	AVAssetReaderTrackOutput *active_out = s->audio_reader ? s->audio_only_out : s->audio_out;
 	if (!active_reader || !active_out) {
-		return 0;
+		return NV_AVF_NONE;
 	}
 
 	@autoreleasepool {
 		CMSampleBufferRef sample = [active_out copyNextSampleBuffer];
 		if (!sample) {
-			return (active_reader.status == AVAssetReaderStatusFailed) ? -1 : 0;
+			return (active_reader.status == AVAssetReaderStatusFailed) ? NV_AVF_FAIL : NV_AVF_NONE;
 		}
 
 		CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
@@ -620,7 +620,7 @@ int nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out) {
 		CMItemCount num_frames = CMSampleBufferGetNumSamples(sample);
 		if (!block || num_frames <= 0) {
 			CFRelease(sample);
-			return -1;
+			return NV_AVF_FAIL;
 		}
 
 		size_t total_len = 0;
@@ -628,7 +628,7 @@ int nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out) {
 		OSStatus st = CMBlockBufferGetDataPointer(block, 0, NULL, &total_len, &data_ptr);
 		if (st != kCMBlockBufferNoErr || !data_ptr) {
 			CFRelease(sample);
-			return -1;
+			return NV_AVF_FAIL;
 		}
 
 		size_t float_count = total_len / sizeof(float);
@@ -639,7 +639,7 @@ int nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out) {
 			float *grown = (float *)realloc(s->audio_scratch, float_count * sizeof(float));
 			if (!grown) {
 				CFRelease(sample);
-				return -1;
+				return NV_AVF_FAIL;
 			}
 			s->audio_scratch = grown;
 			s->audio_scratch_cap = float_count;
@@ -654,7 +654,7 @@ int nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out) {
 		out->float_count = (int)float_count;
 
 		CFRelease(sample);
-		return 1;
+		return NV_AVF_OK;
 	}
 }
 

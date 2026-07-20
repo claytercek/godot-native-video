@@ -8,7 +8,6 @@ pub const audio_ring = @import("audio_ring.zig");
 pub const retire_ring = @import("retire_ring.zig");
 pub const channel_mixer = @import("channel_mixer.zig");
 pub const canonical_mix_format = @import("canonical_mix_format.zig");
-pub const media_source = @import("media_source.zig");
 pub const decode_scheduler = @import("decode_scheduler.zig");
 pub const playback_controller = @import("playback_controller.zig");
 pub const shaders = @import("shaders.zig");

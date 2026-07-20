@@ -15,11 +15,10 @@
 //! lives in exactly ONE place (make_surface_importer); nothing in the shared
 //! path knows which concrete importer is in use.
 //!
-//! SCOPE: this is the macOS-only Zig port. Only the Metal importer is wired
-//! (see metal_surface_importer.zig — currently a compiling stub). The Windows
-//! D3D11/D3D12/DXGI and the CPU-Copy importers are intentionally out of scope.
-//! The pure importer_selector logic is ported below for parity/testing even
-//! though makeSurfaceImporter() always returns the Metal importer here.
+//! SCOPE: this build is macOS-only. Only the Metal importer is wired (see
+//! metal_surface_importer.zig — currently a compiling stub). The Windows
+//! D3D11/D3D12/DXGI and CPU-Copy import paths are a non-goal; there is no
+//! importer selection logic here because there is nothing to select between.
 //!
 //! The C++ pure-virtual class becomes a ptr + vtable interface (composition,
 //! not inheritance), matching src/core/backend.zig's style. std::function
@@ -137,81 +136,10 @@ pub const SurfaceImporter = struct {
     }
 };
 
-/// Factory: returns the importer for the current platform. On this macOS-only
-/// port that is always the Metal importer (a compiling stub for now — the real
-/// Metal path is ported next). Returns null if the importer cannot be
-/// constructed. Mirrors C++ make_surface_importer().
+/// Factory: returns the importer for the current build. Metal is the only
+/// importer this codebase implements — other platforms' import paths are a
+/// non-goal, so there is no selection logic here. Returns null if the
+/// importer cannot be constructed.
 pub fn makeSurfaceImporter(allocator: std.mem.Allocator) ?SurfaceImporter {
     return metal.create(allocator);
-}
-
-// -----------------------------------------------------------------------
-// importer_selector — pure importer-selection logic (Windows).
-//
-// Port of src/common/importer_selector.h. Pure function of extracted scalars:
-// no singletons, no Godot API calls, no platform headers. Unused on macOS
-// (makeSurfaceImporter always returns Metal), but ported for parity and
-// headless testability, exactly as the C++ header intends.
-// -----------------------------------------------------------------------
-
-/// The three Windows import paths.
-pub const ImporterKind = enum(u8) {
-    /// D3D12 RD driver, Godot >= 4.5: the D3D12 zero-copy path.
-    d3d12,
-    /// Vulkan RD driver, zero-copy enabled: the DXGI shared-handle path.
-    /// Currently hard-disabled (see vulkan_zero_copy_enabled in the factory).
-    dxgi,
-    /// Fallback for everything else: a CPU readback into RD R8/RG8 textures.
-    cpu_copy,
-};
-
-/// Pure decision function. driver_name is the RenderingDevice driver name
-/// ("d3d12", "vulkan", or anything else); godot_major/minor the engine version;
-/// vulkan_zero_copy_enabled whether the Vulkan zero-copy path is available.
-pub fn selectImporter(
-    driver_name: []const u8,
-    godot_major: i32,
-    godot_minor: i32,
-    vulkan_zero_copy_enabled: bool,
-) ImporterKind {
-    if (std.mem.eql(u8, driver_name, "d3d12")) {
-        if (godot_major > 4 or (godot_major == 4 and godot_minor >= 5)) {
-            return .d3d12;
-        }
-        return .cpu_copy;
-    }
-    if (vulkan_zero_copy_enabled) {
-        return .dxgi;
-    }
-    return .cpu_copy;
-}
-
-// =========================================================================
-// Tests — ported from tests/core/test_surface_importer_factory.cpp
-// (the pure select_importer cases).
-// =========================================================================
-
-const testing = std.testing;
-
-test "selectImporter: d3d12 on Godot 4.5+ picks D3D12" {
-    try testing.expectEqual(ImporterKind.d3d12, selectImporter("d3d12", 4, 5, false));
-    try testing.expectEqual(ImporterKind.d3d12, selectImporter("d3d12", 4, 6, false));
-    try testing.expectEqual(ImporterKind.d3d12, selectImporter("d3d12", 5, 0, false));
-}
-
-test "selectImporter: d3d12 before 4.5 falls back to CPU copy" {
-    try testing.expectEqual(ImporterKind.cpu_copy, selectImporter("d3d12", 4, 4, false));
-    try testing.expectEqual(ImporterKind.cpu_copy, selectImporter("d3d12", 4, 3, false));
-}
-
-test "selectImporter: vulkan with zero-copy disabled falls back to CPU copy" {
-    try testing.expectEqual(ImporterKind.cpu_copy, selectImporter("vulkan", 4, 6, false));
-}
-
-test "selectImporter: vulkan with zero-copy enabled picks DXGI" {
-    try testing.expectEqual(ImporterKind.dxgi, selectImporter("vulkan", 4, 6, true));
-}
-
-test "selectImporter: unknown driver falls back to CPU copy" {
-    try testing.expectEqual(ImporterKind.cpu_copy, selectImporter("opengl3", 4, 6, false));
 }

@@ -73,7 +73,6 @@ pub const Scrubber = struct {
     prev_now_ms: f64 = 0.0,
 
     settle_pending: bool = false,
-    last_resolve_mode: ResolveMode = .exact,
 
     pub fn init(config: ScrubConfig) Scrubber {
         return .{ .config = config };
@@ -113,7 +112,6 @@ pub const Scrubber = struct {
         self.prev_target = target_seconds;
         self.prev_now_ms = now_ms;
         self.have_prev = true;
-        self.last_resolve_mode = out.mode;
         // A keyframe scrub leaves an approximate frame on screen, so it still
         // owes a precise resolve once motion settles. An exact resolve is
         // already precise.
@@ -148,7 +146,6 @@ pub const Scrubber = struct {
             .mode = .exact,
             .target_seconds = if (self.have_prev) self.prev_target else 0.0,
         };
-        self.last_resolve_mode = .exact;
         return out;
     }
 };

@@ -556,12 +556,11 @@ const ReselectFakeBackend = struct {
     }
 };
 
-// Closure helpers for withBackend (ctx + fn pointer).
+// Context helpers for withBackend.
 const AudioProbe = struct {
     frame_count: i32 = -1,
     tag: i32 = -1,
-    fn run(p: *anyopaque, b: *Backend) void {
-        const self: *AudioProbe = @ptrCast(@alignCast(p));
+    fn run(self: *AudioProbe, b: *Backend) void {
         if (b.nextAudioChunk()) |ch| {
             self.frame_count = ch.frame_count;
             self.tag = @intFromFloat(ch.samples[0]);
@@ -572,8 +571,7 @@ const AudioProbe = struct {
 const ReselectProbe = struct {
     index: i32,
     ok: bool = false,
-    fn run(p: *anyopaque, b: *Backend) void {
-        const self: *ReselectProbe = @ptrCast(@alignCast(p));
+    fn run(self: *ReselectProbe, b: *Backend) void {
         self.ok = b.reselectAudioTrack(self.index, 0.0);
     }
 };

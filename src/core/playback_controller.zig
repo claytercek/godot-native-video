@@ -498,8 +498,7 @@ pub const PlaybackController = struct {
         DecodeScheduler.instance().withBackend(self.stream.?, self, fillAudioClosure);
     }
 
-    fn fillAudioClosure(p: *anyopaque, backend: *Backend) void {
-        const self: *PlaybackController = @ptrCast(@alignCast(p));
+    fn fillAudioClosure(self: *PlaybackController, backend: *Backend) void {
         var ring = &self.audio_ring.?;
         // Half-fill: cushion against decode jitter without buffering unbounded
         // audio.
@@ -639,8 +638,7 @@ pub const PlaybackController = struct {
         if (!self.playing) {
             // Stopped / pre-play: cheap apply. Deferred in the backend until its
             // next seek — which play()'s scrub-resume resolve always issues first.
-            var ctx = SelectCtx{ .target = self.desired_track };
-            sched.withBackend(self.stream.?, &ctx, SelectCtx.run);
+            sched.withBackend(self.stream.?, self, applyDesiredTrack);
             self.live_track = self.desired_track;
             return;
         }
@@ -679,20 +677,15 @@ pub const PlaybackController = struct {
         self.audio_eos = false;
     }
 
-    const SelectCtx = struct {
-        target: i32,
-        fn run(p: *anyopaque, backend: *Backend) void {
-            const ctx: *SelectCtx = @ptrCast(@alignCast(p));
-            backend.selectAudioTrack(ctx.target);
-        }
-    };
+    fn applyDesiredTrack(self: *PlaybackController, backend: *Backend) void {
+        backend.selectAudioTrack(self.desired_track);
+    }
 
     const ReselectCtx = struct {
         target: i32,
         prime: f64,
         ok: bool = false,
-        fn run(p: *anyopaque, backend: *Backend) void {
-            const ctx: *ReselectCtx = @ptrCast(@alignCast(p));
+        fn run(ctx: *ReselectCtx, backend: *Backend) void {
             ctx.ok = backend.reselectAudioTrack(ctx.target, ctx.prime);
         }
     };

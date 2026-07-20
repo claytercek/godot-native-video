@@ -186,6 +186,11 @@ pub const PresentPipeline = struct {
     }
 
     fn buildResources(self: *PresentPipeline, width: i32, height: i32) bool {
+        // Reclaim any RIDs stranded by a previous failed build attempt before
+        // creating new ones. No-op on a clean first build or a normal rebuild
+        // (ensureReady already freed them) since every free is isValid()-guarded.
+        self.freeResources();
+
         // Use the global RenderingDevice — the present output must live on the
         // same device Godot samples from when compositing the player.
         const rd = RenderingServer.getRenderingDevice() orelse {

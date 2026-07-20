@@ -27,6 +27,15 @@ const core = @import("core").backend;
 // -----------------------------------------------------------------------
 const Shim = opaque {};
 
+// Tri-state result code shared by every shim entry point that can fail;
+// mirrors avf_shim.h's nv_avf_result. Which of the three values a given
+// function can actually produce is documented at each extern fn below.
+const Result = enum(c_int) {
+    fail = -1,
+    none = 0,
+    ok = 1,
+};
+
 const c_colorimetry = extern struct {
     matrix: c_int,
     primaries: c_int,
@@ -69,15 +78,21 @@ const c_audio_chunk = extern struct {
 
 extern fn nv_avf_create() ?*Shim;
 extern fn nv_avf_destroy(h: ?*Shim) void;
-extern fn nv_avf_open(h: *Shim, url_or_path: [*:0]const u8, info: *c_open_info) c_int;
+// Produces .ok or .none — never .fail.
+extern fn nv_avf_open(h: *Shim, url_or_path: [*:0]const u8, info: *c_open_info) Result;
 extern fn nv_avf_close(h: *Shim) void;
 extern fn nv_avf_get_audio_track_info(h: *Shim, index: c_int, out: *c_audio_track_info) c_int;
-extern fn nv_avf_build_reader(h: *Shim, start_time: f64, audio_track_index: c_int) c_int;
-extern fn nv_avf_build_audio_reader(h: *Shim, track_index: c_int, start_time: f64) c_int;
-extern fn nv_avf_build_video_reader(h: *Shim, start_time: f64) c_int;
+// Produces .ok or .fail — never .none.
+extern fn nv_avf_build_reader(h: *Shim, start_time: f64, audio_track_index: c_int) Result;
+// Produces .ok, .none, or .fail.
+extern fn nv_avf_build_audio_reader(h: *Shim, track_index: c_int, start_time: f64) Result;
+// Produces .ok, .none, or .fail.
+extern fn nv_avf_build_video_reader(h: *Shim, start_time: f64) Result;
 extern fn nv_avf_teardown_audio_reader(h: *Shim) void;
-extern fn nv_avf_next_video_frame(h: *Shim, out: *c_video_frame) c_int;
-extern fn nv_avf_next_audio_chunk(h: *Shim, out: *c_audio_chunk) c_int;
+// Produces .ok, .none, or .fail.
+extern fn nv_avf_next_video_frame(h: *Shim, out: *c_video_frame) Result;
+// Produces .ok, .none, or .fail.
+extern fn nv_avf_next_audio_chunk(h: *Shim, out: *c_audio_chunk) Result;
 extern fn nv_avf_frame_release(pixel_buffer: ?*anyopaque) void;
 
 // -----------------------------------------------------------------------
@@ -178,7 +193,10 @@ pub const AvfBackend = struct {
         defer self.allocator.free(path_z);
 
         var info: c_open_info = undefined;
-        if (nv_avf_open(self.shim, path_z.ptr, &info) == 0) return error.OpenFailed;
+        switch (nv_avf_open(self.shim, path_z.ptr, &info)) {
+            .ok => {},
+            .none, .fail => return error.OpenFailed,
+        }
 
         self.opened = true;
         self.duration = info.duration_seconds;
@@ -227,7 +245,10 @@ pub const AvfBackend = struct {
             self.selected_audio_index
         else
             -1;
-        if (nv_avf_build_reader(self.shim, 0.0, audio_idx) != 1) return error.BuildReaderFailed;
+        switch (nv_avf_build_reader(self.shim, 0.0, audio_idx)) {
+            .ok => {},
+            .none, .fail => return error.BuildReaderFailed,
+        }
     }
 
     fn closeImpl(self: *AvfBackend) void {
@@ -266,9 +287,12 @@ pub const AvfBackend = struct {
             self.selected_audio_index
         else
             -1;
-        if (nv_avf_build_reader(self.shim, target, audio_idx) != 1) {
-            self.err = true;
-            return false;
+        switch (nv_avf_build_reader(self.shim, target, audio_idx)) {
+            .ok => {},
+            .none, .fail => {
+                self.err = true;
+                return false;
+            },
         }
         return true;
     }
@@ -292,19 +316,28 @@ pub const AvfBackend = struct {
         self.err = false;
 
         // Step 1: dedicated audio-only reader for the new track.
-        const ar = nv_avf_build_audio_reader(self.shim, clamped, target);
-        if (ar != 1) {
-            if (ar < 0) self.err = true;
-            return false;
+        switch (nv_avf_build_audio_reader(self.shim, clamped, target)) {
+            .ok => {},
+            .none => return false,
+            .fail => {
+                self.err = true;
+                return false;
+            },
         }
         // Step 2: rebuild the combined reader as video-only from `target` so
         // video resumes near the requested position instead of repeating from
         // the clip start, and so its audio output cannot block video decode.
-        const vr = nv_avf_build_video_reader(self.shim, target);
-        if (vr != 1) {
-            if (vr < 0) self.err = true;
-            nv_avf_teardown_audio_reader(self.shim);
-            return false;
+        switch (nv_avf_build_video_reader(self.shim, target)) {
+            .ok => {},
+            .none => {
+                nv_avf_teardown_audio_reader(self.shim);
+                return false;
+            },
+            .fail => {
+                self.err = true;
+                nv_avf_teardown_audio_reader(self.shim);
+                return false;
+            },
         }
         _ = self.applyTrackSelection(clamped);
         return true;
@@ -312,10 +345,13 @@ pub const AvfBackend = struct {
 
     fn nextVideoFrameImpl(self: *AvfBackend) ?core.VideoFrame {
         var cf: c_video_frame = undefined;
-        const rc = nv_avf_next_video_frame(self.shim, &cf);
-        if (rc != 1) {
-            if (rc < 0) self.err = true;
-            return null;
+        switch (nv_avf_next_video_frame(self.shim, &cf)) {
+            .ok => {},
+            .none => return null,
+            .fail => {
+                self.err = true;
+                return null;
+            },
         }
         return .{
             .pts_seconds = cf.pts_seconds,
@@ -337,10 +373,13 @@ pub const AvfBackend = struct {
 
     fn nextAudioChunkImpl(self: *AvfBackend) ?core.AudioChunk {
         var cc: c_audio_chunk = undefined;
-        const rc = nv_avf_next_audio_chunk(self.shim, &cc);
-        if (rc != 1) {
-            if (rc < 0) self.err = true;
-            return null;
+        switch (nv_avf_next_audio_chunk(self.shim, &cc)) {
+            .ok => {},
+            .none => return null,
+            .fail => {
+                self.err = true;
+                return null;
+            },
         }
         const float_count: usize = @intCast(cc.float_count);
         const samples: []const f32 = if (cc.samples) |p| p[0..float_count] else &.{};

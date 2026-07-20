@@ -327,8 +327,8 @@ pub const DecodeScheduler = struct {
     pub fn withBackend(
         self: *DecodeScheduler,
         stream: StreamHandle,
-        ctx: *anyopaque,
-        func: *const fn (*anyopaque, *Backend) void,
+        ctx: anytype,
+        comptime func: fn (@TypeOf(ctx), *Backend) void,
     ) void {
         {
             self.mu.lock();

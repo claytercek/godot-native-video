@@ -55,6 +55,17 @@ enum {
 	NV_AVF_PIXFMT_BGRA8 = 3,
 };
 
+// Tri-state result code shared by every shim entry point that can fail.
+// FAIL is always a hard failure (state torn back down); OK is always
+// success; NONE is a soft/clean outcome whose meaning is call-site specific
+// (e.g. end-of-stream, or "no matching track") — see each function's doc
+// comment for which of the three it actually returns.
+typedef enum {
+	NV_AVF_FAIL = -1,
+	NV_AVF_NONE = 0,
+	NV_AVF_OK = 1,
+} nv_avf_result;
+
 // Opaque backend handle. Created by nv_avf_create, freed by nv_avf_destroy.
 typedef struct nv_avf_backend nv_avf_backend;
 
@@ -111,9 +122,10 @@ void nv_avf_destroy(nv_avf_backend *h);
 // Open the asset, resolve tracks, parse negotiated colorimetry, and
 // enumerate audio tracks. Does NOT build a reader — the caller drives that
 // with nv_avf_build_reader so track selection stays a Zig-side decision.
-// Returns 1 on success (info filled), 0 on failure (info zeroed). A media
-// with neither a video nor any audio track counts as a failure.
-int nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *info);
+// Returns NV_AVF_OK (info filled) or NV_AVF_NONE (info zeroed) — never
+// NV_AVF_FAIL. A media with neither a video nor any audio track counts as
+// NV_AVF_NONE.
+nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *info);
 
 // Release all reader/asset/track state and free shim-owned strings + scratch.
 // Safe to call repeatedly.
@@ -124,30 +136,35 @@ int nv_avf_get_audio_track_info(nv_avf_backend *h, int index, nv_avf_audio_track
 
 // --- Reader construction ---
 // Build the combined reader from `start_time` seconds. `audio_track_index`
-// selects which audio track to include; < 0 omits audio. Returns 1 on
-// success, -1 on hard failure (reader create/start failed).
-int nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_index);
+// selects which audio track to include; < 0 omits audio. Returns NV_AVF_OK
+// on success, NV_AVF_FAIL on hard failure (reader create/start failed) —
+// never NV_AVF_NONE.
+nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_index);
 
 // Build a dedicated audio-only reader for `track_index` from `start_time`.
-// Returns 1 success, 0 soft failure (bad index / output rejected), -1 hard
-// failure (reader create/start failed).
-int nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, double start_time);
+// Returns NV_AVF_OK on success, NV_AVF_NONE on soft failure (bad index /
+// output rejected), NV_AVF_FAIL on hard failure (reader create/start
+// failed).
+nv_avf_result nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, double start_time);
 
 // Build a video-only reader from `start_time`, tearing down only the combined
-// reader (leaves any audio-only reader intact). Returns 1 success, 0 soft
-// failure (no video / output rejected), -1 hard failure.
-int nv_avf_build_video_reader(nv_avf_backend *h, double start_time);
+// reader (leaves any audio-only reader intact). Returns NV_AVF_OK on
+// success, NV_AVF_NONE on soft failure (no video / output rejected),
+// NV_AVF_FAIL on hard failure.
+nv_avf_result nv_avf_build_video_reader(nv_avf_backend *h, double start_time);
 
 // Tear down the dedicated audio-only reader (no-op if none).
 void nv_avf_teardown_audio_reader(nv_avf_backend *h);
 
 // --- Decode pump ---
-// Returns 1 with *out filled, 0 on clean end-of-stream, -1 on decode error.
-int nv_avf_next_video_frame(nv_avf_backend *h, nv_avf_video_frame *out);
+// Returns NV_AVF_OK with *out filled, NV_AVF_NONE on clean end-of-stream,
+// NV_AVF_FAIL on decode error.
+nv_avf_result nv_avf_next_video_frame(nv_avf_backend *h, nv_avf_video_frame *out);
 
 // Reads from the audio-only reader when active, else the combined reader's
-// audio output. Returns 1 with *out filled, 0 on clean EOS, -1 on error.
-int nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out);
+// audio output. Returns NV_AVF_OK with *out filled, NV_AVF_NONE on clean
+// EOS, NV_AVF_FAIL on error.
+nv_avf_result nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out);
 
 // Release a CVPixelBufferRef handed out by nv_avf_next_video_frame.
 void nv_avf_frame_release(void *pixel_buffer);

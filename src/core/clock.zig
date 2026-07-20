@@ -1,95 +1,15 @@
-//! clock.zig — port of src/core/clock.h.
+//! Media-time clocks.
 //!
-//! Clock — abstract media-time interface.
-//!
-//! The Engine Core owns the master playback clock. The audio subsystem
-//! drives it when audio is present (audio-master mode); a monotonic delta
-//! fallback is used when no audio track exists.
+//! The Engine Core owns the master playback clock. Two concrete clocks and
+//! a bridge live here: AudioMasterClock derives time from audio sample
+//! consumption, MonotonicClock accumulates frame deltas for silent
+//! playback, and ClockBridge wraps both and switches mastership at runtime
+//! (audio-to-monotonic handoff across silent gaps, and re-anchor back).
 //!
 //! All times are in seconds using f64 to represent PTS values accurately
 //! for media up to several hours long.
 
 const std = @import("std");
-
-/// Generates the ptr+vtable forwarding shims for a type T that implements the
-/// Clock interface as plain methods (mediaTime/advance/setTime/setPaused/
-/// isPaused). MonotonicClock, AudioMasterClock, and ClockBridge each had an
-/// identical copy of this boilerplate; this comptime helper collapses the
-/// three into one.
-fn vtableFor(comptime T: type) Clock.VTable {
-    const Impl = struct {
-        fn mediaTimeVt(ptr: *anyopaque) f64 {
-            const self: *const T = @ptrCast(@alignCast(ptr));
-            return self.mediaTime();
-        }
-        fn advanceVt(ptr: *anyopaque, delta_seconds: f64) void {
-            const self: *T = @ptrCast(@alignCast(ptr));
-            self.advance(delta_seconds);
-        }
-        fn setTimeVt(ptr: *anyopaque, time_seconds: f64) void {
-            const self: *T = @ptrCast(@alignCast(ptr));
-            self.setTime(time_seconds);
-        }
-        fn setPausedVt(ptr: *anyopaque, paused: bool) void {
-            const self: *T = @ptrCast(@alignCast(ptr));
-            self.setPaused(paused);
-        }
-        fn isPausedVt(ptr: *anyopaque) bool {
-            const self: *const T = @ptrCast(@alignCast(ptr));
-            return self.isPaused();
-        }
-    };
-    return .{
-        .media_time = Impl.mediaTimeVt,
-        .advance = Impl.advanceVt,
-        .set_time = Impl.setTimeVt,
-        .set_paused = Impl.setPausedVt,
-        .is_paused = Impl.isPausedVt,
-    };
-}
-
-/// Pure-virtual C++ Clock → ptr + vtable (see backend.zig for the pattern).
-/// MonotonicClock, AudioMasterClock, and ClockBridge each expose `asClock()`
-/// to obtain this interface without owning-pointer indirection.
-pub const Clock = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        media_time: *const fn (*anyopaque) f64,
-        advance: *const fn (*anyopaque, delta_seconds: f64) void,
-        set_time: *const fn (*anyopaque, time_seconds: f64) void,
-        set_paused: *const fn (*anyopaque, paused: bool) void,
-        is_paused: *const fn (*anyopaque) bool,
-    };
-
-    /// Return the current media presentation time in seconds. This is the
-    /// time against which frame PTS values are compared.
-    pub fn mediaTime(self: Clock) f64 {
-        return self.vtable.media_time(self.ptr);
-    }
-
-    /// Advance the clock by `delta_seconds` (monotonic fallback path).
-    /// Audio-master implementations may ignore this and advance solely from
-    /// sample-count accounting.
-    pub fn advance(self: Clock, delta_seconds: f64) void {
-        self.vtable.advance(self.ptr, delta_seconds);
-    }
-
-    /// Seek the clock to an absolute media time (e.g. after a scrub).
-    pub fn setTime(self: Clock, time_seconds: f64) void {
-        self.vtable.set_time(self.ptr, time_seconds);
-    }
-
-    /// Pause / resume ticking. A paused clock returns a constant mediaTime().
-    pub fn setPaused(self: Clock, paused: bool) void {
-        self.vtable.set_paused(self.ptr, paused);
-    }
-
-    pub fn isPaused(self: Clock) bool {
-        return self.vtable.is_paused(self.ptr);
-    }
-};
 
 /// MonotonicClock — simple non-audio-master reference implementation.
 ///
@@ -123,12 +43,6 @@ pub const MonotonicClock = struct {
 
     pub fn isPaused(self: *const MonotonicClock) bool {
         return self.paused;
-    }
-
-    const vtable: Clock.VTable = vtableFor(MonotonicClock);
-
-    pub fn asClock(self: *MonotonicClock) Clock {
-        return .{ .ptr = self, .vtable = &vtable };
     }
 };
 
@@ -186,12 +100,6 @@ pub const AudioMasterClock = struct {
 
     pub fn isPaused(self: *const AudioMasterClock) bool {
         return self.paused;
-    }
-
-    const vtable: Clock.VTable = vtableFor(AudioMasterClock);
-
-    pub fn asClock(self: *AudioMasterClock) Clock {
-        return .{ .ptr = self, .vtable = &vtable };
     }
 };
 
@@ -302,26 +210,13 @@ pub const ClockBridge = struct {
         }
     }
 
-    /// Read a field of the inner audio clock, or `default` for a silent clip
-    /// (no audio track) — the "no audio -> silent clip" defaulting shared by
-    /// sampleRate() and latencySeconds().
-    fn audioFieldOr(self: *const ClockBridge, comptime field: []const u8, default: anytype) @TypeOf(default) {
-        return if (self.audio) |a| @field(a, field) else default;
-    }
-
     /// Accessors delegated to the inner audio clock. Return zero when there
     /// is no audio clock (silent clip).
     pub fn sampleRate(self: *const ClockBridge) i32 {
-        return self.audioFieldOr("sample_rate", @as(i32, 0));
+        return if (self.audio) |a| a.sample_rate else 0;
     }
     pub fn latencySeconds(self: *const ClockBridge) f64 {
-        return self.audioFieldOr("latency_seconds", @as(f64, 0.0));
-    }
-
-    const vtable: Clock.VTable = vtableFor(ClockBridge);
-
-    pub fn asClock(self: *ClockBridge) Clock {
-        return .{ .ptr = self, .vtable = &vtable };
+        return if (self.audio) |a| a.latency_seconds else 0.0;
     }
 };
 

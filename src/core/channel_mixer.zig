@@ -39,9 +39,8 @@
 const std = @import("std");
 
 /// Channel counts this mixer understands semantically (1/2/6, per the
-/// layouts documented above). It no longer gates a memcpy passthrough
-/// threshold — anything outside these layouts still gets a correct, if
-/// generic, mix via the copy-min-channels fallback.
+/// layouts documented above). Anything outside these layouts gets a
+/// correct, if generic, mix via the copy-min-channels fallback.
 pub const max_mix_source_channels: i32 = 6;
 
 /// Mix interleaved PCM float32 samples from `src_channels` to `dst_channels`.
