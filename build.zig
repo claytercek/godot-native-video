@@ -2,13 +2,9 @@ const std = @import("std");
 const Build = std.Build;
 const gdzig = @import("gdzig");
 
-// Machine-specific convenience so `zig build run` works with zero args; only
-// used when the file exists. Override with -Dgodot-path or the GODOT_PATH env
-// var.
-const default_godot = "/Users/clay/.gdvm/installs/registry.gdvm.io-7999f4302078c203/default/4.6.3-stable/Godot.app/Contents/MacOS/Godot";
-
 // Downloaded by the build for bindgen when no local Godot binary is available
-// (e.g. CI). Resolves to the newest matching stable release.
+// (e.g. CI, or a dev machine with neither -Dgodot-path nor -Dgodot-version
+// set). Resolves to the newest matching stable release.
 const default_godot_version = "4.6";
 
 pub fn build(b: *Build) !void {
@@ -18,13 +14,8 @@ pub fn build(b: *Build) !void {
     const opt_godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot;
     const opt_godot_version = b.option([]const u8, "godot-version", "Godot version to download for bindgen (e.g. `4.6`)");
 
-    // Explicit path > explicit version > local default binary > downloaded
-    // default version.
-    const godot_path: ?[]const u8 = opt_godot_path orelse blk: {
-        if (opt_godot_version != null) break :blk null;
-        std.Io.Dir.accessAbsolute(b.graph.io, default_godot, .{}) catch break :blk null;
-        break :blk default_godot;
-    };
+    // Explicit path > explicit version > downloaded default version.
+    const godot_path: ?[]const u8 = opt_godot_path;
 
     // --- Core: pure Zig, no Godot dependency. Mirrors src/core/ in C++. ---
     const core_mod = b.createModule(.{
