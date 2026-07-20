@@ -16,6 +16,7 @@
 //!    freed at close; slices stay valid until close().
 
 const std = @import("std");
+const builtin = @import("builtin");
 // Reach core through the build.zig-wired "core" named module: a module's root
 // forbids cross-directory @import ("../core/backend.zig" is outside this
 // module's root), and routing through the shared module makes core.Backend
@@ -76,6 +77,27 @@ const c_audio_chunk = extern struct {
     float_count: c_int,
 };
 
+// Mirrors avf_shim.h's nv_avf_abi_probe: the shim's actual sizeof for each
+// hand-mirrored struct above, plus the offsetof for EVERY one of its fields
+// (in declaration order), as its own compiler laid them out.
+const AbiProbe = extern struct {
+    sizeof_colorimetry: usize,
+    off_colorimetry: [5]usize, // matrix, primaries, transfer, range, bit_depth
+
+    sizeof_open_info: usize,
+    off_open_info: [6]usize, // duration_seconds, width, height, has_video, audio_track_count, color
+
+    sizeof_audio_track_info: usize,
+    off_audio_track_info: [4]usize, // language, channels, sample_rate, is_default
+
+    sizeof_video_frame: usize,
+    off_video_frame: [6]usize, // pixel_buffer, pts_seconds, width, height, pixel_format, color
+
+    sizeof_audio_chunk: usize,
+    off_audio_chunk: [4]usize, // samples, pts_seconds, frame_count, float_count
+};
+extern fn nv_avf_abi_probe_fill(out: *AbiProbe) void;
+
 extern fn nv_avf_create() ?*Shim;
 extern fn nv_avf_destroy(h: ?*Shim) void;
 // Produces .ok or .none — never .fail.
@@ -105,6 +127,73 @@ fn toColorimetry(c: c_colorimetry) core.Colorimetry {
         .range = @enumFromInt(@as(u8, @intCast(c.range))),
         .bit_depth = @intCast(c.bit_depth),
     };
+}
+
+// The @enumFromInt calls above (and the pixel_format one in
+// nextVideoFrameImpl) only work because avf_shim.h documents its
+// NV_AVF_MATRIX_*/PRIM_*/TRANSFER_*/RANGE_*/PIXFMT_* tags as matching these
+// core enums' numeric values bit-for-bit. Since the header's #defines
+// aren't reachable from Zig (no @cImport), pin the documented values here
+// so either side moving out of step is a compile error, not a silently
+// wrong color on screen.
+comptime {
+    std.debug.assert(@intFromEnum(core.ColorMatrix.unspecified) == 0);
+    std.debug.assert(@intFromEnum(core.ColorMatrix.bt709) == 1);
+    std.debug.assert(@intFromEnum(core.ColorMatrix.bt601) == 2);
+    std.debug.assert(@intFromEnum(core.ColorMatrix.bt2020) == 3);
+
+    std.debug.assert(@intFromEnum(core.ColorPrimaries.unspecified) == 0);
+    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt709) == 1);
+    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt601_625) == 2);
+    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt601_525) == 3);
+    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt2020) == 4);
+    std.debug.assert(@intFromEnum(core.ColorPrimaries.dci_p3) == 5);
+
+    std.debug.assert(@intFromEnum(core.TransferFunction.unspecified) == 0);
+    std.debug.assert(@intFromEnum(core.TransferFunction.bt709) == 1);
+    std.debug.assert(@intFromEnum(core.TransferFunction.pq) == 2);
+    std.debug.assert(@intFromEnum(core.TransferFunction.hlg) == 3);
+
+    std.debug.assert(@intFromEnum(core.ColorRange.unspecified) == 0);
+    std.debug.assert(@intFromEnum(core.ColorRange.video) == 1);
+    std.debug.assert(@intFromEnum(core.ColorRange.full) == 2);
+
+    std.debug.assert(@intFromEnum(core.PixelFormat.unknown) == 0);
+    std.debug.assert(@intFromEnum(core.PixelFormat.nv12) == 1);
+    std.debug.assert(@intFromEnum(core.PixelFormat.x420) == 2);
+    std.debug.assert(@intFromEnum(core.PixelFormat.bgra8) == 3);
+}
+
+// Whether every field of `T` sits at the offset the shim's compiler put it
+// at, and `T`'s overall size matches too. `expected_offsets` holds one
+// offset per field of `T`, in declaration order — a field reorder that
+// leaves sizeof unchanged (e.g. swapping two same-size scalar fields) still
+// changes at least one of these offsets, so it doesn't slip through.
+fn structMatchesAbi(comptime T: type, expected_size: usize, expected_offsets: []const usize) bool {
+    if (expected_size != @sizeOf(T)) return false;
+    const fields = @typeInfo(T).@"struct".fields;
+    if (fields.len != expected_offsets.len) return false;
+    inline for (fields, 0..) |field, i| {
+        if (@offsetOf(T, field.name) != expected_offsets[i]) return false;
+    }
+    return true;
+}
+
+/// Panics if the shim's actual struct layout has drifted from the
+/// hand-mirrored `c_*` extern structs above. Cheap — a few dozen integer
+/// compares — but only worth paying somewhere drift is actually exercised:
+/// called unconditionally from decode_smoke.zig (which CI runs on every
+/// build) and from `create()` in debug builds; skipped in the release
+/// extension's hot path.
+pub fn assertAbi() void {
+    var probe: AbiProbe = undefined;
+    nv_avf_abi_probe_fill(&probe);
+    const ok = structMatchesAbi(c_colorimetry, probe.sizeof_colorimetry, &probe.off_colorimetry) and
+        structMatchesAbi(c_open_info, probe.sizeof_open_info, &probe.off_open_info) and
+        structMatchesAbi(c_audio_track_info, probe.sizeof_audio_track_info, &probe.off_audio_track_info) and
+        structMatchesAbi(c_video_frame, probe.sizeof_video_frame, &probe.off_video_frame) and
+        structMatchesAbi(c_audio_chunk, probe.sizeof_audio_chunk, &probe.off_audio_chunk);
+    if (!ok) @panic("avf ABI drift: shim struct layout no longer matches avf_backend.zig's c_* mirrors");
 }
 
 // -----------------------------------------------------------------------
@@ -423,6 +512,8 @@ pub const AvfBackend = struct {
 /// ptr+vtable interface. The returned Backend owns its heap allocation and the
 /// shim handle; Backend.deinit() releases both.
 pub fn create(allocator: std.mem.Allocator) !core.Backend {
+    if (builtin.mode == .Debug) assertAbi();
+
     const shim = nv_avf_create() orelse return error.ShimCreateFailed;
     errdefer nv_avf_destroy(shim);
 

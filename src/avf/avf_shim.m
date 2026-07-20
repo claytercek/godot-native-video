@@ -230,6 +230,46 @@ static void free_tracks(NvAvfState *s) {
 }
 
 // -----------------------------------------------------------------------
+// ABI probe.
+// -----------------------------------------------------------------------
+void nv_avf_abi_probe_fill(nv_avf_abi_probe *out) {
+	out->sizeof_colorimetry = sizeof(nv_avf_colorimetry);
+	out->off_colorimetry[0] = offsetof(nv_avf_colorimetry, matrix);
+	out->off_colorimetry[1] = offsetof(nv_avf_colorimetry, primaries);
+	out->off_colorimetry[2] = offsetof(nv_avf_colorimetry, transfer);
+	out->off_colorimetry[3] = offsetof(nv_avf_colorimetry, range);
+	out->off_colorimetry[4] = offsetof(nv_avf_colorimetry, bit_depth);
+
+	out->sizeof_open_info = sizeof(nv_avf_open_info);
+	out->off_open_info[0] = offsetof(nv_avf_open_info, duration_seconds);
+	out->off_open_info[1] = offsetof(nv_avf_open_info, width);
+	out->off_open_info[2] = offsetof(nv_avf_open_info, height);
+	out->off_open_info[3] = offsetof(nv_avf_open_info, has_video);
+	out->off_open_info[4] = offsetof(nv_avf_open_info, audio_track_count);
+	out->off_open_info[5] = offsetof(nv_avf_open_info, color);
+
+	out->sizeof_audio_track_info = sizeof(nv_avf_audio_track_info);
+	out->off_audio_track_info[0] = offsetof(nv_avf_audio_track_info, language);
+	out->off_audio_track_info[1] = offsetof(nv_avf_audio_track_info, channels);
+	out->off_audio_track_info[2] = offsetof(nv_avf_audio_track_info, sample_rate);
+	out->off_audio_track_info[3] = offsetof(nv_avf_audio_track_info, is_default);
+
+	out->sizeof_video_frame = sizeof(nv_avf_video_frame);
+	out->off_video_frame[0] = offsetof(nv_avf_video_frame, pixel_buffer);
+	out->off_video_frame[1] = offsetof(nv_avf_video_frame, pts_seconds);
+	out->off_video_frame[2] = offsetof(nv_avf_video_frame, width);
+	out->off_video_frame[3] = offsetof(nv_avf_video_frame, height);
+	out->off_video_frame[4] = offsetof(nv_avf_video_frame, pixel_format);
+	out->off_video_frame[5] = offsetof(nv_avf_video_frame, color);
+
+	out->sizeof_audio_chunk = sizeof(nv_avf_audio_chunk);
+	out->off_audio_chunk[0] = offsetof(nv_avf_audio_chunk, samples);
+	out->off_audio_chunk[1] = offsetof(nv_avf_audio_chunk, pts_seconds);
+	out->off_audio_chunk[2] = offsetof(nv_avf_audio_chunk, frame_count);
+	out->off_audio_chunk[3] = offsetof(nv_avf_audio_chunk, float_count);
+}
+
+// -----------------------------------------------------------------------
 // Lifecycle.
 // -----------------------------------------------------------------------
 nv_avf_backend *nv_avf_create(void) {

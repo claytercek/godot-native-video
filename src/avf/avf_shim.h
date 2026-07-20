@@ -115,6 +115,32 @@ typedef struct {
 	int float_count; // total float elements in `samples`
 } nv_avf_audio_chunk;
 
+// Actual sizes and per-field offsets of the five structs above, as this
+// translation unit's compiler laid them out. avf_backend.zig hand-mirrors
+// these as extern structs (no @cImport by project convention); nothing
+// short of a runtime probe catches one side's field order or size drifting
+// from the other. Filled by nv_avf_abi_probe_fill and compared field-by-field
+// against @sizeOf/@offsetOf on the Zig side, so a reorder of same-size
+// fields (which leaves sizeof unchanged) is caught too.
+typedef struct {
+	size_t sizeof_colorimetry;
+	size_t off_colorimetry[5]; // matrix, primaries, transfer, range, bit_depth
+
+	size_t sizeof_open_info;
+	size_t off_open_info[6]; // duration_seconds, width, height, has_video, audio_track_count, color
+
+	size_t sizeof_audio_track_info;
+	size_t off_audio_track_info[4]; // language, channels, sample_rate, is_default
+
+	size_t sizeof_video_frame;
+	size_t off_video_frame[6]; // pixel_buffer, pts_seconds, width, height, pixel_format, color
+
+	size_t sizeof_audio_chunk;
+	size_t off_audio_chunk[4]; // samples, pts_seconds, frame_count, float_count
+} nv_avf_abi_probe;
+
+void nv_avf_abi_probe_fill(nv_avf_abi_probe *out);
+
 // --- Lifecycle ---
 nv_avf_backend *nv_avf_create(void);
 void nv_avf_destroy(nv_avf_backend *h);
