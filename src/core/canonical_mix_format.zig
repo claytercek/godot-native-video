@@ -1,5 +1,3 @@
-//! canonical_mix_format.zig — port of src/core/canonical_mix_format.h/.cpp.
-//!
 //! Pure derivation of a playback's Canonical Mix Format from a Backend's
 //! audio tracks.
 //!
@@ -7,7 +5,7 @@
 //! playback's entire lifetime once load() returns. Deriving it is a pure
 //! function of a Backend's audioTrackCount()/audioTrackInfo() queries — no
 //! DecodeScheduler, no clock, no state. Pulling it out of
-//! PlaybackController::load() lets the mixed-sample-rate / channel-clamp
+//! PlaybackController.load() lets the mixed-sample-rate / channel-clamp
 //! logic be unit-tested without spinning up the process-wide scheduler
 //! singleton the controller registers with.
 //!
@@ -88,7 +86,7 @@ pub fn deriveCanonicalMixFormat(allocator: std.mem.Allocator, backend: Backend) 
 }
 
 // -----------------------------------------------------------------------
-// Sanity coverage (no C++ test_canonical_mix_format.cpp exists to port).
+// Sanity coverage.
 // -----------------------------------------------------------------------
 
 const FakeBackend = struct {

@@ -6,7 +6,9 @@
 // CFTypeRefs that cross the C boundary (CVPixelBufferRef, CMSampleBufferRef,
 // CMBlockBufferRef) are NOT ARC-managed and are retained/released explicitly.
 //
-// Ports avf_backend.mm verbatim in mechanism; all policy lives in Zig.
+// This file is pure mechanism: it drives the AVFoundation object graph
+// behind a C ABI and makes no policy decisions. All policy (track
+// selection/clamping, EOS/error interpretation) lives in avf_backend.zig.
 // -----------------------------------------------------------------------
 #import "avf_shim.h"
 
@@ -18,8 +20,8 @@
 #include <string.h>
 
 // One audio track's shim-owned metadata. `language` is strdup'd and freed on
-// close so the pointer stays valid until close/destroy (mirrors the C++
-// Impl::audio_tracks vector, which outlives the returned AudioTrackInfo).
+// close so the pointer stays valid until close/destroy — the returned
+// AudioTrackInfo borrows it rather than owning a copy.
 typedef struct {
 	char *language;
 	int channels;
@@ -416,7 +418,7 @@ nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_ope
 				}
 				meta->language = strdup(lang ? [lang UTF8String] : "");
 
-				// Name is left empty in v1 (matches C++), so no field for it.
+				// Name is left empty; AVFoundation doesn't surface a track name.
 
 				// First track is the container default absent an explicit flag.
 				meta->is_default = (i == 0) ? 1 : 0;

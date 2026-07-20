@@ -1,16 +1,15 @@
 //! extension.zig — GDExtension entry point for the native video module.
 //!
-//! Port of src/register_types.cpp. Registers the three Binding classes and, at
-//! the SCENE initialization level, adds a NativeVideoResourceFormatLoader
-//! singleton to the ResourceLoader (removed at teardown) so a stock
-//! VideoStreamPlayer can load + play a native clip.
+//! Registers the three Binding classes and, at the SCENE initialization
+//! level, adds a NativeVideoResourceFormatLoader singleton to the
+//! ResourceLoader (removed at teardown) so a stock VideoStreamPlayer can
+//! load + play a native clip.
 //!
 //! Init-level handling: gdzig's entrypoint calls register() once at load, then
 //! registry.enter(level)/exit(level) per initialization level, and
 //! unregister() at final teardown. Classes registered with `.auto` commit at
-//! the SCENE level by default (matching the C++
-//! MODULE_INITIALIZATION_LEVEL_SCENE gate). The loader singleton has no class
-//! seam of its own for per-level setup, so we hook the SCENE enter/exit via the
+//! the SCENE level by default. The loader singleton has no class seam of its
+//! own for per-level setup, so we hook the SCENE enter/exit via the
 //! Registry's addCallbacks mechanism — the enter callback runs AFTER all
 //! classes for that level have committed (see Registry.enter), so the loader
 //! class is already registered and instantiable when we create the singleton.
@@ -54,14 +53,13 @@ pub fn sharedScheduler() *DecodeScheduler {
 }
 
 pub fn register(r: *Registry) void {
-    // Register playback before stream (C++ registers the playback class first
-    // so the stream's _instantiate_playback return type resolves).
+    // Playback must be registered before the stream so the stream's
+    // _instantiatePlayback return type resolves.
     r.addModule(NativeVideoStreamPlayback);
     r.addModule(NativeVideoStream);
     r.addModule(NativeVideoResourceFormatLoader);
 
-    // Loader singleton lifecycle, gated to the SCENE level (mirrors
-    // register_types.cpp's MODULE_INITIALIZATION_LEVEL_SCENE add/remove).
+    // Loader singleton lifecycle, gated to the SCENE level.
     r.addCallbacks(LoaderLifecycle, .{ .allocator = r.allocator }, .{});
 }
 
@@ -74,9 +72,9 @@ pub fn unregister(r: *Registry) void {
 // -----------------------------------------------------------------------
 // LoaderLifecycle — the ResourceFormatLoader singleton's per-level hook.
 //
-// enter/exit fire for every initialization level; we act only at SCENE,
-// exactly like register_types.cpp. Stored by value in the Registry arena; the
-// enter/exit callbacks receive a stable pointer to that copy.
+// enter/exit fire for every initialization level; we act only at SCENE.
+// Stored by value in the Registry arena; the enter/exit callbacks receive
+// a stable pointer to that copy.
 // -----------------------------------------------------------------------
 const LoaderLifecycle = struct {
     allocator: Allocator,

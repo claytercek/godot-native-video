@@ -1,7 +1,6 @@
 //! shaders.zig — the embedded GLSL present-pipeline shaders.
 //!
-//! Mirrors what tools/embed_shader.py does for the C++ build: it embeds
-//! src/common/nv12_to_rgb.glsl twice (SDR + HDR_OUTPUT=1), inlining the
+//! Embeds shaders/nv12_to_rgb.glsl twice (SDR + HDR_OUTPUT=1), inlining the
 //! `#include "hdr_color_math.glsl"` directive and stripping the Godot-specific
 //! `#[compute]` marker line, because Godot's runtime GLSL compiler
 //! (RenderingDevice.shaderCompileSpirvFromSource) does not resolve #includes.
@@ -25,12 +24,12 @@ pub const hdr_color_math_glsl = @embedFile("shaders/hdr_color_math.glsl");
 /// SDR variant: `#include` inlined, `#[compute]` stripped. Godot-compilable.
 pub const nv12_to_rgb_compute = preprocess(false);
 
-/// HDR variant: same, plus an injected `#define HDR_OUTPUT 1` after `#version`
-/// (the `-D HDR_OUTPUT=1` the C++ build passes to embed_shader.py).
+/// HDR variant: same, plus an injected `#define HDR_OUTPUT 1` after
+/// `#version`.
 pub const nv12_to_rgb_hdr_compute = preprocess(true);
 
 // -----------------------------------------------------------------------
-// Comptime preprocessing — the Zig equivalent of embed_shader.py.
+// Comptime preprocessing.
 // -----------------------------------------------------------------------
 
 const compute_marker = "#[compute]\n";

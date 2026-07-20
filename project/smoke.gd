@@ -35,7 +35,7 @@ func _process(_d: float) -> void:
 	# compute pass wrote real video content (not all-black / all-one-color).
 	# The clip is greyscale and mostly dark, so single points can be genuinely
 	# black — average the whole image (8px stride) to prove real content and
-	# pin NV12->RGB conversion fidelity against the C++ reference (avg ~= 0.078).
+	# pin NV12->RGB conversion fidelity against the known-good value (avg ~= 0.078).
 	if frames == 60 and saw_texture:
 		var rtex := player.get_video_texture()
 		var img := rtex.get_image() if rtex != null else null

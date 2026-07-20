@@ -35,9 +35,7 @@ Highlights:
 ## Requirements
 
 - **macOS** (Apple Silicon or Intel; the extension links AVFoundation,
-  CoreMedia, CoreVideo, and Metal directly). Windows support was dropped in
-  the rewrite from C++ — the Media Foundation backend was retired along
-  with it.
+  CoreMedia, CoreVideo, and Metal directly). Windows is not supported.
 - **Godot 4.6+**, **Forward+ or Mobile renderer** (the RenderingDevice
   renderers). The Compatibility/OpenGL renderer is not supported — there is
   no CPU present path.
@@ -53,10 +51,6 @@ Highlights:
   playback state machines keep running normally, and end-of-stream is
   reached. No texture output is available.
 - **Compatibility/OpenGL renderer**: not supported — no CPU present path.
-- **Windows**: not supported. The C++ implementation's Media Foundation
-  backend covered it; the Zig port is macOS-only. See
-  [EVALUATION.md](EVALUATION.md) for why the rewrite didn't carry it
-  forward.
 
 ## Scope
 
@@ -101,8 +95,8 @@ track with a differing rate is refused.
 
    This compiles `libnative_video.dylib` and installs it to
    `project/lib/`, where `project/native_video.gdextension` expects it.
-   No SCons, no godot-cpp submodule, no Python tooling — `build.zig` is the
-   entire build.
+   `build.zig` is the entire build — one command, no other tooling
+   required.
 
    Builds default to a stripped `ReleaseFast` binary (~380 KB). Pass
    `-Doptimize=Debug` for a debug build, or `-Doptimize=ReleaseSmall` to
@@ -142,9 +136,8 @@ track with a differing rate is refused.
 - `project/` — the example/verification Godot project. Its
   `smoke.gd` script is what `zig build run` executes.
 
-See [EVALUATION.md](EVALUATION.md) for the rationale behind porting from
-C++ to Zig and the benchmarks (performance, binary size, build times, test
-parity) that backed the decision.
+For the historical record of how this implementation was chosen —
+benchmarks and rationale — see [EVALUATION.md](EVALUATION.md).
 
 ## License
 

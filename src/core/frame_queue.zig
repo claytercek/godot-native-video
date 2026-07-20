@@ -1,5 +1,3 @@
-//! frame_queue.zig — port of src/core/frame_queue.h.
-//!
 //! FrameQueue(T, Capacity) — a bounded, lock-free Single-Producer /
 //! Single-Consumer (SPSC) ring queue.
 //!
@@ -224,9 +222,9 @@ test "FrameQueue wraps around ring correctly" {
 }
 
 test "FrameQueue works with move-only type" {
-    // C++ exercises std::unique_ptr<int>; Zig has no move-only type, so we
-    // exercise the same "owns a heap allocation transferred through the
-    // queue" property with an allocated pointer instead.
+    // Zig has no move-only type, so this exercises the "owns a heap
+    // allocation transferred through the queue" property with an allocated
+    // pointer instead.
     var q: FrameQueue(?*i32, 4) = .init;
     const p = try std.testing.allocator.create(i32);
     p.* = 7;

@@ -16,15 +16,15 @@
 //
 // Output is an engine-owned storage image that Godot samples through a
 // Texture2DRD. Godot never samples the decoder planes directly. This file
-// is compiled twice (see tools/embed_shader.py's `-D` support): once with no
-// defines for the SDR variant, and once with HDR_OUTPUT=1 for the HDR
-// variant.
+// is compiled twice (see shaders.zig, which embeds and preprocesses the
+// source at comptime): once with no defines for the SDR variant, and once
+// with HDR_OUTPUT=1 for the HDR variant.
 //
 // Colour math: the YCbCr matrix and video/full-range normalisation are
 // selected by the push constants from per-frame metadata (matrix_select,
 // range_select, bit_depth), so BT.601 SD clips, BT.2020 UHD clips, and 10-bit
 // sources all decode correctly. Untagged clips default to BT.709 video range
-// 8-bit (matching the old hard-coded behaviour).
+// 8-bit.
 //
 // Output modes (HDR_OUTPUT):
 //   * SDR (0, default): writes rgba8. When transfer_select is PQ (2) or HLG
@@ -34,7 +34,8 @@
 //     BT.709 by matrix-then-clip — HDR content degrades gracefully to a
 //     clamped SDR output that's readable on any display with no
 //     configuration. The colour math functions live in hdr_color_math.glsl,
-//     which is #included here and shared with the C++ unit tests.
+//     which is #included here and whose source text is parsed and checked
+//     against the Zig constants by color_matrix_test.zig.
 //   * HDR (1): writes rgba16f and emits scene-linear values scaled so 1.0
 //     represents 203-nit Reference White (BT.2408): PQ and HLG are decoded
 //     via their EOTFs and normalised by the reference white, while SDR
@@ -59,17 +60,17 @@ layout(set = 0, binding = 2, rgba8) uniform restrict writeonly image2D rgba_out;
 layout(push_constant, std430) uniform Params {
 	uint out_width;
 	uint out_height;
-	uint matrix_select;  // 0=Unspecified, 1=BT.709, 2=BT.601, 3=BT.2020 (core::ColorMatrix)
-	uint range_select;   // 0=Unspecified, 1=Video, 2=Full (core::ColorRange)
+	uint matrix_select;  // 0=Unspecified, 1=BT.709, 2=BT.601, 3=BT.2020 (core.ColorMatrix)
+	uint range_select;   // 0=Unspecified, 1=Video, 2=Full (core.ColorRange)
 	uint bit_depth;      // 8 or 10
-	uint transfer_select; // 0=Unspecified, 1=BT.709, 2=PQ, 3=HLG (core::TransferFunction)
+	uint transfer_select; // 0=Unspecified, 1=BT.709, 2=PQ, 3=HLG (core.TransferFunction)
 	uint primaries_select; // 0=Unspecified, 1=BT.709, 2=BT.601_625, 3=BT.601_525,
-	                       // 4=BT.2020, 5=DCI_P3 (core::ColorPrimaries)
+	                       // 4=BT.2020, 5=DCI_P3 (core.ColorPrimaries)
 	float sample_scale; // 10-bit code recovery: code = texel * 65535 * sample_scale.
 	                    // 1.0 for every path that stores right-justified codes;
 	                    // 1/64 for the Vulkan Zero-Copy Path's P010 import, whose
 	                    // plane views alias left-justified P010 memory
-	                    // (surface_importer.h).
+	                    // (surface_importer.zig).
 	                    // Occupying the former pad slot keeps the block a 16-byte
 	                    // multiple: pre-4.7 Godot rounds the required
 	                    // push-constant size up to 32, 4.7+ validates the exact

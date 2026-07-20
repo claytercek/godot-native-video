@@ -1,8 +1,6 @@
-//! colorimetry_test.zig — port of tests/core/test_colorimetry.cpp.
-//!
-//! Regression coverage for backend.Colorimetry, the single struct that
-//! replaced the five parallel scalar colorimetry fields on backend.VideoFrame
-//! and the five separate virtuals on backend.Backend.
+//! Regression coverage for backend.Colorimetry, the single struct carrying
+//! a video frame's color primaries, transfer function, matrix coefficients,
+//! range, and bit depth.
 //!
 //! Pins the two default conventions that must coexist:
 //!   - Per-frame (VideoFrame.color): Colorimetry{} defaults to all
@@ -12,9 +10,7 @@
 //!     Colorimetry.bt709_defaults returns concrete BT709/BT709/BT709/Video/8
 //!     values.
 //!
-//! Sibling file per PORTING.md (test_colorimetry.cpp depends solely on
-//! backend.h, whose module file is not to be edited): kept separate from
-//! backend.zig rather than appended to it.
+//! Kept as a sibling file rather than appended to backend.zig.
 
 const std = @import("std");
 const backend_mod = @import("backend.zig");

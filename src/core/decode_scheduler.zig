@@ -1,5 +1,3 @@
-//! decode_scheduler.zig — port of src/core/decode_scheduler.h/.cpp.
-//!
 //! The bounded shared decode-worker pool (Engine Core).
 //!
 //! PROBLEM: a scene may hold many VideoStreamPlayers. Spawning one decode
@@ -46,16 +44,13 @@
 //! before resuming decode-ahead; a scrubbing slice uses it to request a
 //! keyframe-only decode without changing the threading model.
 //!
-//! OWNERSHIP NOTE (deviation from the C++ shared_ptr): the C++ uses
-//! `StreamHandle = std::shared_ptr<DecodeStream>` for shared ownership between
-//! the binding and the scheduler's `registered_`/`ready_` lists. The Zig port
-//! makes `StreamHandle = *DecodeStream`, with the DecodeStream owned solely by
-//! the scheduler: register allocates it, unregister (and the scheduler's
-//! deinit for leftovers) frees it. This is sound because the teardown ordering
-//! already guarantees no worker references the stream after unregister returns
-//! (dead_ set + busy_ waited out + removed from ready_), so no reference
-//! counting is actually required — the handle is simply invalid after
-//! unregister, which is exactly how every caller uses it.
+//! OWNERSHIP NOTE: `StreamHandle = *DecodeStream`, with the DecodeStream
+//! owned solely by the scheduler: register allocates it, unregister (and the
+//! scheduler's deinit for leftovers) frees it. No reference counting is
+//! needed because unregister orders itself against every worker before it
+//! returns — the stream is marked dead, any in-flight busy claim is waited
+//! out, and it is removed from the ready list — so the handle is simply
+//! invalid after unregister, which is exactly how every caller uses it.
 
 const std = @import("std");
 const builtin = @import("builtin");

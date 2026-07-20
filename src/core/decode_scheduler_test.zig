@@ -1,5 +1,3 @@
-//! decode_scheduler_test.zig — port of tests/core/test_decode_scheduler.cpp.
-
 const std = @import("std");
 
 const backend_mod = @import("backend.zig");

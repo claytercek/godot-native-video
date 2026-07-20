@@ -1,4 +1,4 @@
-//! Root of the pure-Zig engine core — mirrors src/core/ in the C++ tree.
+//! Root of the engine core: platform-independent playback logic.
 //! No Godot, no RenderingDevice, no platform SDK types.
 
 pub const backend = @import("backend.zig");

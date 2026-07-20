@@ -1,7 +1,6 @@
 //! present_pipeline.zig — the zero-copy NV12->RGB present pipeline.
 //!
-//! Port of src/common/present_pipeline.h/.cpp. Owns, on Godot's
-//! RenderingDevice:
+//! Owns, on Godot's RenderingDevice:
 //!   - the NV12->RGB compute shader + pipeline + sampler,
 //!   - an N-buffered ring of engine-owned RGBA storage textures (rgba8 in SDR
 //!     mode, rgba16f in HDR mode), exposed through ONE stable Texture2DRD that

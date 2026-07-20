@@ -1,10 +1,10 @@
 //! avf_backend.zig — AVFoundation Decoder-mode Backend (macOS).
 //!
-//! Port of src/backends/avf/avf_backend.mm. Implements the core.Backend
-//! ptr+vtable contract on top of the C-ABI shim in avf_shim.m. This file owns
-//! all policy: the reader state machine, track selection/clamping, EOS/error
-//! interpretation, and translation of shim results into VideoFrame /
-//! AudioChunk. The shim owns the AVFoundation object graph.
+//! Implements the core.Backend ptr+vtable contract on top of the C-ABI shim
+//! in avf_shim.m. This file owns all policy: the reader state machine, track
+//! selection/clamping, EOS/error interpretation, and translation of shim
+//! results into VideoFrame / AudioChunk. The shim owns the AVFoundation
+//! object graph.
 //!
 //! Ownership at the boundaries:
 //!  - Video frames: the shim hands out a CVPixelBufferRef carrying a +1
@@ -293,8 +293,7 @@ pub const AvfBackend = struct {
             });
         }
 
-        // Initialise selection from the first (default) track, mirroring the
-        // C++ apply_track_selection(0) at open.
+        // Initialise selection to the first (default) track at open.
         self.selected_audio_index = 0;
         if (self.audio_tracks.items.len > 0) {
             self.audio_channels = self.audio_tracks.items[0].channels;
@@ -304,7 +303,7 @@ pub const AvfBackend = struct {
             self.audio_rate = 0;
         }
 
-        // Build the combined reader from the start; C++ open() returns this.
+        // Build the combined reader from the start; open() returns this.
         const audio_idx: c_int = if (self.audio_tracks.items.len > 0)
             self.selected_audio_index
         else
@@ -399,7 +398,7 @@ pub const AvfBackend = struct {
         if (nv_avf_next_audio_chunk(self.shim, &cc) != .ok) return null;
         const float_count: usize = @intCast(cc.float_count);
         const samples: []const f32 = if (cc.samples) |p| p[0..float_count] else &.{};
-        // channel_count mirrors C++: the selected track's channel count, min 1.
+        // channel_count is the selected track's channel count, min 1.
         const channels: i32 = if (self.audio_channels > 0) self.audio_channels else 1;
         return .{
             .pts_seconds = cc.pts_seconds,

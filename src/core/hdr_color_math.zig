@@ -185,7 +185,7 @@ pub fn hdrToSdr(r: *f64, g: *f64, b: *f64, transfer: i32) void {
 }
 
 // =========================================================================
-// Tests — ported from tests/core/test_hdr_color_math.cpp.
+// Tests
 // =========================================================================
 
 const testing = std.testing;

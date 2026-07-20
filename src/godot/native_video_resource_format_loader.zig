@@ -1,10 +1,10 @@
 //! native_video_resource_format_loader.zig — loads a clip path into a
 //! NativeVideoStream resource so VideoStreamPlayer can play it.
 //!
-//! Port of src/common/native_video_resource_format_loader.h/.cpp. Registered
-//! with ResourceLoader for the video container extensions the OS decodes
-//! (mp4/mov/m4v). It does NOT decode anything here — it just produces a
-//! VideoStream pointing at the file; decoding happens lazily in the playback.
+//! Registered with ResourceLoader for the video container extensions the OS
+//! decodes (mp4/mov/m4v). It does NOT decode anything here — it just
+//! produces a VideoStream pointing at the file; decoding happens lazily in
+//! the playback.
 
 const NativeVideoResourceFormatLoader = @This();
 

@@ -1,5 +1,3 @@
-//! av_drift_test.zig — port of tests/core/test_av_drift.cpp.
-//!
 //! A/V drift simulation — the key correctness gate for this slice.
 //!
 //! Model (no Godot, no GPU, fully deterministic with a fixed RNG seed):
@@ -30,15 +28,13 @@
 //!       does NOT drift permanently — drop-late collapses the backlog).
 //!
 //! This file lives as a sibling test (rather than inside clock.zig or
-//! present_selector.zig) because it exercises both modules together, per
-//! PORTING.md's "or a sibling <name>_test.zig" allowance.
+//! present_selector.zig) because it exercises both modules together.
 //!
-//! NOTE: the C++ test drives its jitter with a seeded std::mt19937 for
-//! bit-exact reproducibility. Zig's std.Random.DefaultPrng is a different
-//! algorithm, so the exact per-tick jitter sequence differs from the C++
-//! run. The assertions below are statistical bounds (steady-state drift
-//! budget, spike-recovery bound), not exact-value checks, so a different
-//! (but still fixed-seed, deterministic) PRNG preserves the test's intent.
+//! NOTE: jitter is drawn from a fixed-seed std.Random.DefaultPrng, so the
+//! run is deterministic but the assertions below are statistical bounds
+//! (steady-state drift budget, spike-recovery bound), not exact-value
+//! checks — that's what makes the fixed seed meaningful without pinning
+//! the literal per-tick jitter sequence.
 
 const std = @import("std");
 const clock_mod = @import("clock.zig");

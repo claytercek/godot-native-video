@@ -1,11 +1,11 @@
 //! native_video_stream.zig — the VideoStream resource for native clips.
 //!
-//! Port of src/common/native_video_stream.h/.cpp. A stock VideoStreamPlayer
-//! holds a VideoStream and calls _instantiatePlayback() to get a
-//! VideoStreamPlayback. This resource carries the clip's file path (set by the
-//! ResourceFormatLoader) and instantiates a NativeVideoStreamPlayback bound to
-//! it. It also exposes a lazy, cached audio-track probe (getAudioTracks()) so
-//! GDScript can query per-track metadata before playback.
+//! A stock VideoStreamPlayer holds a VideoStream and calls
+//! _instantiatePlayback() to get a VideoStreamPlayback. This resource
+//! carries the clip's file path (set by the ResourceFormatLoader) and
+//! instantiates a NativeVideoStreamPlayback bound to it. It also exposes a
+//! lazy, cached audio-track probe (getAudioTracks()) so GDScript can query
+//! per-track metadata before playback.
 
 const NativeVideoStream = @This();
 
@@ -31,7 +31,7 @@ pub fn register(r: *Registry) void {
     // On macOS (and iOS) Metal-accelerated VideoToolbox produces 10-bit
     // biplanar surfaces we import zero-copy: always supported here. Registered
     // as an instance method (gdzig has no static-method seam); GDScript calls
-    // it on an instance. C++ bound it as a static method — a minor deviation.
+    // it on an instance.
     class.addMethod("hdr_decode_supported", .auto);
     class.addMethod("get_audio_tracks", .auto);
     // output_mode (SDR,HDR) enum property, backed by set/get methods.
@@ -88,8 +88,8 @@ pub fn hdrDecodeSupported(self: *NativeVideoStream) bool {
 // -----------------------------------------------------------------------
 // Live-playback resolution.
 //
-// Resolve playback_ids to the playbacks still alive, pruning dead ids. Mirrors
-// C++ live_playbacks() using gdzig's instanceFromId + typed downcast.
+// Resolve playback_ids to the playbacks still alive, pruning dead ids, using
+// gdzig's instanceFromId + typed downcast.
 // -----------------------------------------------------------------------
 fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
     var write: usize = 0;
@@ -167,7 +167,7 @@ pub fn getAudioTracks(self: *NativeVideoStream) Array {
 }
 
 /// Called by NativeVideoStreamPlayback? No — the engine calls this virtual on
-/// the stream to obtain a playback. Mirrors C++ _instantiate_playback().
+/// the stream to obtain a playback.
 pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     const playback = NativeVideoStreamPlayback.create(&self.allocator) catch return null;
     playback.applyOutputMode(self.output_mode);

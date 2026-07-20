@@ -1,11 +1,9 @@
-//! color_matrix_test.zig — port of tests/core/test_color_matrix.cpp.
-//!
 //! Reference-value tests for the YCbCr→RGB matrix derivations used by the
 //! NV12→RGB present shader. Platform-independent: no GPU, no Godot. Verifies
 //! the BT.601 / BT.709 / BT.2020 coefficients against ITU-R reference values
 //! AND parses the actual embedded shader SOURCE TEXT (core/shaders.zig) to
 //! catch the shader's code diverging from its own derivation — something a
-//! pure C++/Zig reference mirror can never see.
+//! hand-maintained reference mirror can never see.
 //!
 //! Run standalone:
 //!   zig test zig/src/core/color_matrix_test.zig
@@ -141,7 +139,7 @@ fn parseFloatAfter(s: []const u8, from: usize, needle: []const u8) ?struct { val
 /// Parse the three coefficient assignment lines out of one matrix branch's
 /// code block. The shader writes the g-channel line as two subtractions with
 /// positive literals (`rgb.g = yf - A * cb - B * cr;`), so the signed
-/// coefficients (negative, matching Bt*Coeffs::g_cb/g_cr) are the negation of
+/// coefficients (negative, matching Bt*Coeffs.g_cb/g_cr) are the negation of
 /// the parsed magnitudes.
 fn parseMatrixBlock(allocator: std.mem.Allocator, block_raw: []const u8) !ParsedCoeffs {
     const block = try stripCommentLines(allocator, block_raw);
@@ -168,7 +166,7 @@ fn parseMatrixBlock(allocator: std.mem.Allocator, block_raw: []const u8) !Parsed
 }
 
 // =========================================================================
-// Tests — ported from tests/core/test_color_matrix.cpp.
+// Tests
 // =========================================================================
 
 test "BT.601 matrix coefficients match ITU-R BT.601-7" {

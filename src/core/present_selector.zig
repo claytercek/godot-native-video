@@ -1,5 +1,3 @@
-//! present_selector.zig — port of src/core/present_selector.h.
-//!
 //! present_selector — Godot-free drop-late / hold-early present policy.
 //!
 //! Linear-playback A/V sync needs a deterministic rule for "which decoded
@@ -7,9 +5,10 @@
 //! the heart of staying in sync, so it lives here in the Engine Core,
 //! isolated from Godot and unit-tested headlessly.
 //!
-//! The Binding owns a FrameQueue<VideoFrame> of decode-ahead frames sorted
-//! by PTS (the backend pumps them in PTS order). Each render tick it asks
-//! the selector what to do with the queue head, given:
+//! Each stream's DecodeScheduler entry owns a FrameQueue<VideoFrame> of
+//! decode-ahead frames sorted by PTS (the backend pumps them in PTS order).
+//! Each render tick, the playback controller asks the selector what to do
+//! with the queue head, given:
 //!   - the master clock time `now` (audio-master or monotonic fallback), and
 //!   - the nominal frame interval (1 / fps), used to decide what "late" means.
 //!

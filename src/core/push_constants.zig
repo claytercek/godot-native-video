@@ -1,5 +1,3 @@
-//! push_constants.zig — port of src/common/push_constants.h.
-//!
 //! Byte-packing for the NV12-to-RGB compute shader's push-constant block.
 //!
 //! The GLSL shader declares a std430 push-constant block with seven uint32
@@ -10,11 +8,11 @@
 //! Layout (std430, little-endian assumed — x86-64 and ARM64 both are):
 //!   offset 0: out_width       (uint32)
 //!   offset 4: out_height      (uint32)
-//!   offset 8: matrix_select   (uint32) — core::ColorMatrix
-//!   offset 12: range_select   (uint32) — core::ColorRange
+//!   offset 8: matrix_select   (uint32) — core.ColorMatrix
+//!   offset 12: range_select   (uint32) — core.ColorRange
 //!   offset 16: bit_depth      (uint32) — 8 or 10
-//!   offset 20: transfer_select (uint32) — core::TransferFunction
-//!   offset 24: primaries_select (uint32) — core::ColorPrimaries
+//!   offset 20: transfer_select (uint32) — core.TransferFunction
+//!   offset 24: primaries_select (uint32) — core.ColorPrimaries
 //!   offset 28: sample_scale   (float)
 //!   Total: push_constant_size (32) bytes
 //!
@@ -88,7 +86,7 @@ pub fn packPushConstants(
 }
 
 // =========================================================================
-// Tests — ported from tests/core/test_push_constant.cpp.
+// Tests
 // =========================================================================
 
 const testing = std.testing;

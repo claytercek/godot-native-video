@@ -14,7 +14,7 @@ pub fn build(b: *Build) !void {
     const opt_godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot;
     const opt_godot_version = b.option([]const u8, "godot-version", "Godot version to download for bindgen (e.g. `4.6`)");
 
-    // --- Core: pure Zig, no Godot dependency. Mirrors src/core/ in C++. ---
+    // --- Core: pure Zig, no Godot dependency. ---
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/core.zig"),
         .target = target,

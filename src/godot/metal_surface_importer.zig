@@ -1,13 +1,13 @@
 //! metal_surface_importer.zig — macOS CVPixelBuffer -> Metal -> RD importer.
 //!
-//! Port of src/common/metal_surface_importer.mm. Takes a hardware-decoded
-//! biplanar Y'CbCr CVPixelBuffer (NV12 8-bit or x420/P010 10-bit, from the AVF
-//! backend) and produces two Godot RenderingDevice plane texture RIDs — luma
-//! (R8/R16) and chroma (RG8/RG16) — WITHOUT any CPU copy. It reuses Godot's
-//! *own* MTLDevice (RenderingDevice.getDriverResource) so a CVMetalTextureCache
-//! wraps each IOSurface-backed plane as an MTLTexture usable inside Godot's RD
-//! command stream, then hands that MTLTexture handle to
-//! textureCreateFromExtension — still no copy.
+//! Takes a hardware-decoded biplanar Y'CbCr CVPixelBuffer (NV12 8-bit or
+//! x420/P010 10-bit, from the AVF backend) and produces two Godot
+//! RenderingDevice plane texture RIDs — luma (R8/R16) and chroma (RG8/RG16)
+//! — WITHOUT any CPU copy. It reuses Godot's *own* MTLDevice
+//! (RenderingDevice.getDriverResource) so a CVMetalTextureCache wraps each
+//! IOSurface-backed plane as an MTLTexture usable inside Godot's RD command
+//! stream, then hands that MTLTexture handle to textureCreateFromExtension
+//! — still no copy.
 //!
 //! CoreVideo/CoreFoundation are plain C, declared extern by hand (mirrors how
 //! avf_backend.zig declares its shim ABI; gdzig projects avoid @cImport). The
@@ -123,8 +123,7 @@ const pf_xf20 = fourcc("xf20"); // 420YpCbCr10BiPlanarFullRange
 // -----------------------------------------------------------------------
 
 /// Build a 1x1 R8Unorm ShaderRead probe MTLTexture on `device`. Returns a +1
-/// retained id<MTLTexture> the caller must release, or null. Mirrors the ObjC
-/// probe descriptor in metal_surface_importer.mm.
+/// retained id<MTLTexture> the caller must release, or null.
 fn makeProbeTexture(device: ?*anyopaque) ?*anyopaque {
     const desc_class = objc_getClass("MTLTextureDescriptor") orelse return null;
     const send_desc: SendDescriptor = @ptrCast(&objc_msgSend);
@@ -228,8 +227,7 @@ pub const MetalSurfaceImporter = struct {
     /// import().
     pub fn initialize(self: *MetalSurfaceImporter, rd: *RenderingDevice) bool {
         // Already initialised (a successful init always has a cache); a prior
-        // *failed* attempt left texture_cache null, so it retries fully — same
-        // behaviour as the C++ `if (impl_) return impl_->texture_cache != null`.
+        // *failed* attempt left texture_cache null, so it retries fully.
         if (self.texture_cache != null) return true;
 
         // DRIVER_RESOURCE_LOGICAL_DEVICE returns the id<MTLDevice> as an int on

@@ -297,7 +297,7 @@ test "an out-of-range pre-load track selection is validated and reset once load(
     defer sched.deinit();
     var controller = PlaybackController.init();
     defer controller.deinit();
-    // Pre-load selection: no stream yet, so this just records desired_track_.
+    // Pre-load selection: no stream yet, so this just records desired_track.
     controller.requestAudioTrack(2);
     {
         var w = controller.takeWarnings();

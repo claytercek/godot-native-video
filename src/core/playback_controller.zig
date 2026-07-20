@@ -1,5 +1,3 @@
-//! playback_controller.zig — port of src/core/playback_controller.h/.cpp.
-//!
 //! Godot-free per-stream playback state machine.
 //!
 //! The Binding (NativeVideoStreamPlayback) owns exactly one of these per
@@ -199,8 +197,9 @@ pub const PlaybackController = struct {
         return .{};
     }
 
-    /// Frees the controller's owned resources. Runs shutdown() first (matching
-    /// the C++ destructor). Safe to call once after any (or no) load().
+    /// Frees the controller's owned resources. Runs shutdown() first so no
+    /// in-flight decode slice touches state being freed. Safe to call once
+    /// after any (or no) load().
     pub fn deinit(self: *PlaybackController) void {
         self.shutdown();
         if (self.audio_ring) |*r| r.deinit();

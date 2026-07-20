@@ -1,5 +1,3 @@
-//! audio_eos_fallback_test.zig — port of tests/core/test_audio_eos_fallback.cpp.
-//!
 //! Audio-EOS wall-clock fallback — no Godot, no GPU.
 //!
 //! A clip's audio track can legitimately end before its video track. The

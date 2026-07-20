@@ -1,5 +1,12 @@
 # Zig port evaluation
 
+> **Superseded.** This evaluation's recommendation — keep the previous
+> implementation as the shipped default — was not adopted. The
+> implementation evaluated here replaced the previous one entirely and is
+> now the only implementation in this repository. The document is
+> preserved unmodified below as the historical benchmark and rationale
+> record.
+
 ## What was ported
 
 The macOS/AVFoundation path only: full core (decode, A/V sync, color math),

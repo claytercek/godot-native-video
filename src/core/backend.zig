@@ -1,10 +1,8 @@
-//! backend.zig — port of src/core/backend.h/.cpp.
-//!
 //! Backend wraps one OS media framework (AVFoundation, MF, GStreamer) as a
 //! pure hardware decoder: opened on a source, configured to a track, then
 //! polled for the next decoded frame / audio chunk.
 //!
-//! Design rules (unchanged from C++):
+//! Design rules:
 //!  - No Godot / RenderingDevice types — Godot-independent.
 //!  - No player-mode callbacks — we own the clock; the Backend is a dumb
 //!    decode pump.
@@ -62,7 +60,7 @@ pub const ColorRange = enum(u8) {
 
 /// The five colorimetry fields bundled into one value type.
 ///
-/// Two default conventions, both preserved from C++:
+/// Two default conventions coexist:
 ///  - Per-frame (VideoFrame.color): all-Unspecified; the shader treats
 ///    Unspecified as BT.709 video range.
 ///  - Negotiated (Backend.colorimetry() and backend impls): concrete BT.709

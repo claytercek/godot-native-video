@@ -1,8 +1,6 @@
-//! scrubber.zig — port of src/core/scrubber.h.
-//!
 //! scrubber.zig — Godot-free adaptive-scrubbing state machine (Engine Core).
 //!
-//! Godot drives seeking with nothing but repeated VideoStreamPlayback::_seek(time)
+//! Godot drives seeking with nothing but repeated VideoStreamPlayback._seek(time)
 //! calls. There is no "drag started / drag ended" signal: a rapid BURST of seeks
 //! is a user dragging the playhead, and a GAP (or a playback resume) means they
 //! settled. The Scrubber turns that bare stream of (target, wall-clock-now) seek
@@ -34,7 +32,7 @@
 //!
 //! NO Godot / RenderingDevice / Backend types here — pure policy. The binding
 //! maps a Keyframe resolve to a tolerant keyframe seek (the existing
-//! DecodeScheduler::request_seek path) and an Exact resolve to a precise
+//! DecodeScheduler.requestSeek path) and an Exact resolve to a precise
 //! seek-and-decode-forward to the target PTS.
 
 const std = @import("std");

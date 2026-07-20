@@ -1,8 +1,8 @@
 //! native_video_stream_playback.zig — the Binding's VideoStreamPlayback.
 //!
-//! Port of src/common/native_video_stream_playback.h/.cpp. Adapts the
-//! Godot-independent Engine Core (core.PlaybackController) to Godot's
-//! VideoStreamPlayback so a stock VideoStreamPlayer can play a native clip.
+//! Adapts the Godot-independent Engine Core (core.PlaybackController) to
+//! Godot's VideoStreamPlayback so a stock VideoStreamPlayer can play a
+//! native clip.
 //! Holds no playback logic of its own — every state machine lives in the
 //! Godot-free PlaybackController. This class is exactly the translation layer:
 //! Godot type conversion, a MixSink implementation wrapping mixAudio(), and

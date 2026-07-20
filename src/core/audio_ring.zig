@@ -1,5 +1,3 @@
-//! audio_ring.zig — port of src/core/audio_ring.h.
-//!
 //! AudioRing — Godot-free interleaved-PCM ring buffer for the audio path.
 //!
 //! The decode side pushes interleaved float32 samples decoded from the

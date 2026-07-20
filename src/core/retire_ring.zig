@@ -1,5 +1,3 @@
-//! retire_ring.zig — port of src/core/retire_ring.h.
-//!
 //! RetireRing(N) — bounded surface-lifetime guard (the memory-safety core).
 //!
 //! Problem: when we import a decoder surface (CVPixelBuffer / IOSurface) into
@@ -220,11 +218,8 @@ test "drain releases all parked surfaces and is idempotent" {
     try std.testing.expectEqual(3, releases);
 }
 
-test "destructor releases outstanding surfaces (no leak)" {
-    // C++ captures a shared_ptr in the closure and checks its refcount drops
-    // when the ring is destroyed. Zig has no shared_ptr; we pin the same
-    // externally-observable behaviour instead: deinit() (the C++ destructor
-    // equivalent) invokes the still-parked closure exactly once, so any
+test "deinit releases outstanding surfaces (no leak)" {
+    // deinit() invokes the still-parked closure exactly once, so any
     // resource it owns is released without the ring holding on to it.
     var released = false;
     const Ctx = struct {
