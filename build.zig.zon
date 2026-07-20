@@ -1,6 +1,6 @@
 .{
-    .name = .native_video_zig,
-    .fingerprint = 0xbad401ad9bad7f1,
+    .name = .native_video,
+    .fingerprint = 0xd0024eda61a31314,
     .version = "0.0.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

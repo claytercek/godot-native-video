@@ -4,5 +4,5 @@ compatibility_minimum = "4.4"
 reloadable = false
 
 [libraries]
-macos.debug = "lib/libnative_video_zig.dylib"
-macos.release = "lib/libnative_video_zig.dylib"
+macos.debug = "lib/libnative_video.dylib"
+macos.release = "lib/libnative_video.dylib"

@@ -99,8 +99,8 @@ track with a differing rate is refused.
    zig build
    ```
 
-   This compiles `libnative_video_zig.dylib` and installs it to
-   `project/lib/`, where `project/native_video_zig.gdextension` expects it.
+   This compiles `libnative_video.dylib` and installs it to
+   `project/lib/`, where `project/native_video.gdextension` expects it.
    No SCons, no godot-cpp submodule, no Python tooling — `build.zig` is the
    entire build.
 

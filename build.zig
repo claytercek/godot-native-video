@@ -14,9 +14,6 @@ pub fn build(b: *Build) !void {
     const opt_godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot;
     const opt_godot_version = b.option([]const u8, "godot-version", "Godot version to download for bindgen (e.g. `4.6`)");
 
-    // Explicit path > explicit version > downloaded default version.
-    const godot_path: ?[]const u8 = opt_godot_path;
-
     // --- Core: pure Zig, no Godot dependency. Mirrors src/core/ in C++. ---
     const core_mod = b.createModule(.{
         .root_source_file = b.path("src/core/core.zig"),
@@ -29,7 +26,8 @@ pub fn build(b: *Build) !void {
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
     // --- Godot extension: gdzig glue + AVFoundation backend. ---
-    const gdzig_dep = if (godot_path) |p| b.dependency("gdzig", .{
+    // Explicit path > explicit version > downloaded default version.
+    const gdzig_dep = if (opt_godot_path) |p| b.dependency("gdzig", .{
         .target = target,
         .optimize = optimize,
         .@"godot-path" = p,
@@ -62,7 +60,7 @@ pub fn build(b: *Build) !void {
     });
 
     const extension = gdzig.addExtension(b, .{
-        .name = "native_video_zig",
+        .name = "native_video",
         .root_module = ext_mod,
         .entry_symbol = "native_video_init",
         .minimum_initialization_level = .scene,
@@ -75,16 +73,10 @@ pub fn build(b: *Build) !void {
         extension.compile.link_gc_sections = true;
     }
 
-    // AVFoundation ObjC shim + frameworks (macOS only).
+    // AVFoundation ObjC shim + frameworks (macOS only). Metal is
+    // extension-only — the decode harness never presents.
     if (target.result.os.tag == .macos) {
-        extension.compile.root_module.addCSourceFile(.{
-            .file = b.path("src/avf/avf_shim.m"),
-            .flags = &.{"-fobjc-arc"},
-        });
-        extension.compile.root_module.linkFramework("Foundation", .{});
-        extension.compile.root_module.linkFramework("AVFoundation", .{});
-        extension.compile.root_module.linkFramework("CoreMedia", .{});
-        extension.compile.root_module.linkFramework("CoreVideo", .{});
+        linkAvfShim(b, extension.compile.root_module);
         extension.compile.root_module.linkFramework("Metal", .{});
     }
 
@@ -98,14 +90,7 @@ pub fn build(b: *Build) !void {
                 .{ .name = "core", .module = core_mod },
             },
         });
-        smoke_mod.addCSourceFile(.{
-            .file = b.path("src/avf/avf_shim.m"),
-            .flags = &.{"-fobjc-arc"},
-        });
-        smoke_mod.linkFramework("Foundation", .{});
-        smoke_mod.linkFramework("AVFoundation", .{});
-        smoke_mod.linkFramework("CoreMedia", .{});
-        smoke_mod.linkFramework("CoreVideo", .{});
+        linkAvfShim(b, smoke_mod);
         const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
         const smoke_run = b.addRunArtifact(smoke_exe);
         smoke_run.addArg(b.pathFromRoot("project/synthetic.mp4"));
@@ -121,4 +106,15 @@ pub fn build(b: *Build) !void {
     run.addDirectoryArg(b.path("./project"));
     run.step.dependOn(&install.step);
     b.step("run", "Run the demo project in Godot").dependOn(&run.step);
+}
+
+/// Compile the AVFoundation ObjC shim into `mod` and link the frameworks it
+/// needs. Shared by the extension and the decode-smoke harness so the shim
+/// path and framework list live in exactly one place. Metal is not included
+/// here — only the presenting extension needs it.
+fn linkAvfShim(b: *Build, mod: *Build.Module) void {
+    mod.addCSourceFile(.{ .file = b.path("src/avf/avf_shim.m"), .flags = &.{"-fobjc-arc"} });
+    for ([_][]const u8{ "Foundation", "AVFoundation", "CoreMedia", "CoreVideo" }) |fw| {
+        mod.linkFramework(fw, .{});
+    }
 }
