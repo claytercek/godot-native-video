@@ -446,8 +446,9 @@ const CappedMixSink = struct {
     accept_cap: i32,
     last_offered: i32 = 0,
 
-    fn mixImpl(p: *anyopaque, _: []const f32, frame_count: i32, _: i32) i32 {
+    fn mixImpl(p: *anyopaque, interleaved: []const f32, channel_count: i32) i32 {
         const self: *CappedMixSink = @ptrCast(@alignCast(p));
+        const frame_count: i32 = @intCast(interleaved.len / @as(usize, @intCast(channel_count)));
         self.last_offered = frame_count;
         return @min(frame_count, self.accept_cap);
     }
@@ -460,8 +461,8 @@ const CappedMixSink = struct {
 };
 
 const AcceptAllMixSink = struct {
-    fn mixImpl(_: *anyopaque, _: []const f32, frame_count: i32, _: i32) i32 {
-        return frame_count;
+    fn mixImpl(_: *anyopaque, interleaved: []const f32, channel_count: i32) i32 {
+        return @intCast(interleaved.len / @as(usize, @intCast(channel_count)));
     }
     const vtable: MixSink.VTable = .{ .mix = mixImpl };
     fn sink(self: *AcceptAllMixSink) MixSink {

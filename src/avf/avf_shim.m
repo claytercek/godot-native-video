@@ -44,8 +44,9 @@ typedef struct {
 	NSArray<AVAssetTrack *> *all_audio_tracks;
 
 	// Dedicated audio-only reader for mid-decode track reselect. Non-nil only
-	// after nv_avf_build_audio_reader; the combined reader keeps feeding video
-	// undisturbed, and nv_avf_next_audio_chunk prefers this reader when set.
+	// after nv_avf_reselect_audio_track; the combined reader keeps feeding
+	// video undisturbed, and nv_avf_next_audio_chunk prefers this reader when
+	// set.
 	AVAssetReader *audio_reader;
 	AVAssetReaderTrackOutput *audio_only_out;
 
@@ -520,8 +521,10 @@ nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audi
 	}
 }
 
-nv_avf_result nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, double start_time) {
-	NvAvfState *s = state_of(h);
+// Build a dedicated audio-only reader for `track_index` from `start_time`.
+// Internal step of nv_avf_reselect_audio_track. NV_AVF_NONE on bad index or
+// a rejected output, NV_AVF_FAIL on reader create/start failure.
+static nv_avf_result build_audio_reader(NvAvfState *s, int track_index, double start_time) {
 	teardown_audio_reader(s);
 
 	if (track_index < 0 || !s->all_audio_tracks ||
@@ -547,9 +550,11 @@ nv_avf_result nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, doub
 	}
 }
 
-nv_avf_result nv_avf_build_video_reader(nv_avf_backend *h, double start_time) {
-	NvAvfState *s = state_of(h);
-	// Tear down only the combined reader; leave the audio-only reader intact.
+// Build a video-only reader from `start_time`, tearing down only the
+// combined reader (leaves any audio-only reader intact). Internal step of
+// nv_avf_reselect_audio_track. NV_AVF_NONE when there's no video or the
+// output is rejected, NV_AVF_FAIL on reader create/start failure.
+static nv_avf_result build_video_reader(NvAvfState *s, double start_time) {
 	teardown_combined(s);
 
 	if (!s->video_track) {
@@ -569,6 +574,23 @@ nv_avf_result nv_avf_build_video_reader(nv_avf_backend *h, double start_time) {
 		// audio_out stays nil — no audio output to back up and block video.
 		return NV_AVF_OK;
 	}
+}
+
+nv_avf_result nv_avf_reselect_audio_track(nv_avf_backend *h, int track_index, double start_time) {
+	NvAvfState *s = state_of(h);
+
+	nv_avf_result ar = build_audio_reader(s, track_index, start_time);
+	if (ar != NV_AVF_OK) {
+		return ar;
+	}
+	nv_avf_result vr = build_video_reader(s, start_time);
+	if (vr != NV_AVF_OK) {
+		// Partial failure: don't leave a dedicated audio reader dangling
+		// with no matching video-only combined reader behind it.
+		teardown_audio_reader(s);
+		return vr;
+	}
+	return NV_AVF_OK;
 }
 
 void nv_avf_teardown_audio_reader(nv_avf_backend *h) {

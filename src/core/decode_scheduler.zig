@@ -480,68 +480,57 @@ pub const DecodeScheduler = struct {
         var wake = false;
         {
             self.mu.lock();
-            // Enqueue only if the stream wants more work and is neither already
-            // queued nor currently being decoded. This single guard is what
-            // guarantees a stream is never handed to two workers at once ->
-            // per-stream serial decode.
-            if (stream.dead or stream.queued or stream.busy or !stream.wants_more) {
-                self.mu.unlock();
-                return;
-            }
-            stream.queued = true;
-            self.ready.append(self.allocator, stream) catch @panic("DecodeScheduler OOM");
-            wake = true;
+            wake = self.enqueueLocked(stream);
             self.mu.unlock();
         }
         if (wake) self.cv.signal();
     }
 
-    // Pull the next ready stream off the work queue, marking it busy. Returns
-    // null when the pool is shutting down and the queue is empty, or when the
-    // stream was torn down between enqueue and now.
+    // Enqueue `stream` for a decode slice if it is eligible: alive, wanting
+    // more work, and neither already queued nor claimed. The single
+    // queued/busy guard is what guarantees a stream is never handed to two
+    // workers at once -> per-stream serial decode. Consumes the wants_more
+    // demand when it enqueues. Returns true if the stream was enqueued (the
+    // caller wakes a worker outside the lock). Requires mu held.
+    fn enqueueLocked(self: *DecodeScheduler, stream: StreamHandle) bool {
+        if (stream.dead or stream.queued or stream.busy or !stream.wants_more) return false;
+        stream.wants_more = false;
+        stream.queued = true;
+        self.ready.append(self.allocator, stream) catch @panic("DecodeScheduler OOM");
+        return true;
+    }
+
+    // Pull the next ready stream off the work queue, marking it busy. Dead
+    // streams (torn down between enqueue and now) are skipped internally, so
+    // null means exactly one thing: the pool is shutting down and the queue
+    // is empty.
     fn takeReadyStream(self: *DecodeScheduler) ?StreamHandle {
         self.mu.lock();
         defer self.mu.unlock();
-        while (!self.shutting_down and self.ready.items.len == 0) self.cv.wait(&self.mu);
-        if (self.shutting_down and self.ready.items.len == 0) return null;
-        const stream = self.ready.orderedRemove(0);
-        stream.queued = false;
-        if (stream.dead) {
-            // Was torn down between enqueue and now; skip it.
-            return null;
+        while (true) {
+            while (!self.shutting_down and self.ready.items.len == 0) self.cv.wait(&self.mu);
+            if (self.shutting_down and self.ready.items.len == 0) return null;
+            const stream = self.ready.orderedRemove(0);
+            stream.queued = false;
+            if (stream.dead) continue;
+            stream.busy = true;
+            return stream;
         }
-        stream.busy = true;
-        return stream;
     }
 
     fn workerMain(self: *DecodeScheduler) void {
         while (true) {
-            const stream_opt = self.takeReadyStream();
-            if (stream_opt == null) {
-                // Either shutdown, or a stream that died before we claimed it.
-                // Loop to re-check the shutdown condition.
-                self.mu.lock();
-                const done = self.shutting_down and self.ready.items.len == 0;
-                self.mu.unlock();
-                if (done) return;
-                continue;
-            }
-            const stream = stream_opt.?;
+            const stream = self.takeReadyStream() orelse return;
 
             self.pumpStream(stream);
 
             {
                 self.mu.lock();
                 stream.busy = false;
-                // If the consumer asked for more while we were decoding (or the
-                // queue is not yet full and the stream is alive), re-enqueue for
-                // another slice so streams are fairly serviced round-robin
-                // without one starving others.
-                if (!stream.dead and stream.wants_more and !stream.queued) {
-                    stream.queued = true;
-                    stream.wants_more = false;
-                    self.ready.append(self.allocator, stream) catch @panic("DecodeScheduler OOM");
-                }
+                // If the consumer asked for more while we were decoding,
+                // re-enqueue for another slice so streams are fairly serviced
+                // round-robin without one starving others.
+                _ = self.enqueueLocked(stream);
                 self.mu.unlock();
             }
             // Wake unregister/requestSeek waiters (busy just dropped) and, if we

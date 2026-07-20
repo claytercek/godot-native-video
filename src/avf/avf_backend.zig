@@ -85,9 +85,7 @@ extern fn nv_avf_get_audio_track_info(h: *Shim, index: c_int, out: *c_audio_trac
 // Produces .ok or .fail — never .none.
 extern fn nv_avf_build_reader(h: *Shim, start_time: f64, audio_track_index: c_int) Result;
 // Produces .ok, .none, or .fail.
-extern fn nv_avf_build_audio_reader(h: *Shim, track_index: c_int, start_time: f64) Result;
-// Produces .ok, .none, or .fail.
-extern fn nv_avf_build_video_reader(h: *Shim, start_time: f64) Result;
+extern fn nv_avf_reselect_audio_track(h: *Shim, track_index: c_int, start_time: f64) Result;
 extern fn nv_avf_teardown_audio_reader(h: *Shim) void;
 // Produces .ok, .none, or .fail.
 extern fn nv_avf_next_video_frame(h: *Shim, out: *c_video_frame) Result;
@@ -310,16 +308,10 @@ pub const AvfBackend = struct {
         // back via applyResult, a soft failure leaves it clear.
         self.err = false;
 
-        // Step 1: dedicated audio-only reader for the new track.
-        if (!self.applyResult(nv_avf_build_audio_reader(self.shim, clamped, target))) return false;
-
-        // Step 2: rebuild the combined reader as video-only from `target` so
-        // video resumes near the requested position instead of repeating from
-        // the clip start, and so its audio output cannot block video decode.
-        if (!self.applyResult(nv_avf_build_video_reader(self.shim, target))) {
-            nv_avf_teardown_audio_reader(self.shim);
-            return false;
-        }
+        // The shim builds the dedicated audio-only reader and rebuilds the
+        // combined reader as video-only in one atomic step, rolling back on
+        // partial failure — the reader lifecycle stays shim-side.
+        if (!self.applyResult(nv_avf_reselect_audio_track(self.shim, clamped, target))) return false;
         _ = self.applyTrackSelection(clamped);
         return true;
     }

@@ -63,21 +63,25 @@ pub const kScrubSpinSleepMs: f64 = 0.1;
 // min(accepted, real_frames) so neither underrun silence nor a full downstream
 // buffer inflates media time). The Binding wraps mix_audio().
 //
-// The C++ pure-virtual class becomes a ptr + vtable interface. `interleaved`
-// points at frame_count * channel_count contiguous float32 samples.
+// A ptr + vtable interface (Zig has no capturing closures). `interleaved`
+// holds whole frames of `channel_count` contiguous float32 samples; the
+// frame count is interleaved.len / channel_count.
 // -----------------------------------------------------------------------
 pub const MixSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        mix: *const fn (*anyopaque, interleaved: []const f32, frame_count: i32, channel_count: i32) i32,
+        mix: *const fn (*anyopaque, interleaved: []const f32, channel_count: i32) i32,
     };
 
-    /// Mix `frame_count` frames of `channel_count`-channel interleaved PCM into
-    /// the downstream buffer. Returns the number of frames actually accepted.
-    pub fn mix(self: MixSink, interleaved: []const f32, frame_count: i32, channel_count: i32) i32 {
-        return self.vtable.mix(self.ptr, interleaved, frame_count, channel_count);
+    /// Mix `channel_count`-channel interleaved PCM into the downstream
+    /// buffer. `interleaved.len` must be an exact multiple of
+    /// `channel_count`. Returns the number of frames actually accepted.
+    pub fn mix(self: MixSink, interleaved: []const f32, channel_count: i32) i32 {
+        std.debug.assert(channel_count > 0);
+        std.debug.assert(interleaved.len % @as(usize, @intCast(channel_count)) == 0);
+        return self.vtable.mix(self.ptr, interleaved, channel_count);
     }
 };
 
@@ -277,7 +281,7 @@ pub const PlaybackController = struct {
         // Resuming after a scrub: force an exact resolve at the last scrub target
         // so play starts from the precise frame, not an approximate keyframe one.
         if (!was_playing and self.stream != null) {
-            self.applyScrubResolve(self.scrubber.onResume(now.ms));
+            self.applyScrubResolve(self.scrubber.onResume(now));
         }
     }
 
@@ -317,7 +321,7 @@ pub const PlaybackController = struct {
     // Feeds the scrubber and applies the resulting resolve (keyframe or exact).
     pub fn seek(self: *PlaybackController, time_seconds: f64, now: WallClockMs) void {
         if (self.stream == null or self.master() == null) return;
-        const resolve = self.scrubber.onSeek(@max(time_seconds, 0.0), now.ms);
+        const resolve = self.scrubber.onSeek(@max(time_seconds, 0.0), now);
         self.applyScrubResolve(resolve);
     }
 
@@ -389,7 +393,7 @@ pub const PlaybackController = struct {
     // the debounce window, upgrade the approximate keyframe frame to the
     // exact target frame.
     fn settleScrub(self: *PlaybackController, now: WallClockMs) void {
-        if (self.scrubber.poll(now.ms)) |settle| {
+        if (self.scrubber.poll(now)) |settle| {
             self.applyScrubResolve(settle);
         }
     }
@@ -548,7 +552,7 @@ pub const PlaybackController = struct {
         // time. If the sink accepts fewer than `real_frames` (near-full
         // downstream buffer), the surplus is dropped: the clock stays honest at
         // the cost of a little lost audio. Tolerable for linear playback.
-        const accepted = sink.mix(self.drive_scratch.items[0..needed], request, ch);
+        const accepted = sink.mix(self.drive_scratch.items[0..needed], ch);
         const advance = @min(accepted, @as(i32, @intCast(real_frames)));
         if (advance > 0) self.clock.?.onAudioMixed(advance);
         return advance > 0;

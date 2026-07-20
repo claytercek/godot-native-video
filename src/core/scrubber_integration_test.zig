@@ -202,10 +202,10 @@ test "exact-frame-on-settle: settle resolves to the precise target frame" {
     // keyframe scrub lands on a DIFFERENT frame than the exact target.
     const targets = [_]f64{ 10.40, 12.70, 15.15 }; // frames 312, 381, 454
     var now_ms: f64 = 0.0;
-    _ = scrub.onSeek(2.0, now_ms); // prime
+    _ = scrub.onSeek(2.0, .{ .ms = now_ms }); // prime
     for (targets) |t| {
         now_ms += 20.0; // 20ms apart -> fast burst -> keyframe
-        const last = scrub.onSeek(t, now_ms);
+        const last = scrub.onSeek(t, .{ .ms = now_ms });
         try std.testing.expectEqual(ResolveMode.keyframe, last.mode);
         const kf = applyResolve(sched, s, last);
         // Keyframe scrub lands on the keyframe at/before the target.
@@ -215,7 +215,7 @@ test "exact-frame-on-settle: settle resolves to the precise target frame" {
     // The user stops moving. After the debounce, the Scrubber emits an Exact
     // resolve at the LAST target.
     now_ms += 150.0;
-    const settle = scrub.poll(now_ms);
+    const settle = scrub.poll(.{ .ms = now_ms });
     try std.testing.expect(settle != null);
     try std.testing.expectEqual(ResolveMode.exact, settle.?.mode);
 

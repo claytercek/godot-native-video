@@ -118,13 +118,14 @@ fn mixSinkAdapter(self: *NativeVideoStreamPlayback) MixSink {
 
 const mix_sink_vtable: MixSink.VTable = .{ .mix = mixSinkMix };
 
-fn mixSinkMix(ptr: *anyopaque, interleaved: []const f32, frame_count: i32, channel_count: i32) i32 {
+fn mixSinkMix(ptr: *anyopaque, interleaved: []const f32, channel_count: i32) i32 {
     const self: *NativeVideoStreamPlayback = @ptrCast(@alignCast(ptr));
-    const total: i64 = @as(i64, frame_count) * channel_count;
+    const frame_count: i32 = @intCast(interleaved.len / @as(usize, @intCast(channel_count)));
+    const total: i64 = @intCast(interleaved.len);
     if (@as(i64, @intCast(self.mix_buffer.size())) < total) {
         _ = self.mix_buffer.resize(total);
     }
-    for (interleaved[0..@intCast(total)], 0..) |sample, i| {
+    for (interleaved, 0..) |sample, i| {
         self.mix_buffer.set(@intCast(i), sample);
     }
     return self.base.mixAudio(frame_count, .{ .buffer = self.mix_buffer, .offset = 0 });
