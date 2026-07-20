@@ -23,7 +23,6 @@ const RenderingDevice = godot.class.RenderingDevice;
 const Rid = godot.builtin.Rid;
 
 const si = @import("surface_importer.zig");
-const SurfaceImporter = si.SurfaceImporter;
 const PlaneTextures = si.PlaneTextures;
 
 const log = std.log.scoped(.native_video_metal_import);
@@ -182,35 +181,31 @@ fn driverStealsImportReference(rd: *RenderingDevice, device: ?*anyopaque) bool {
 }
 
 // -----------------------------------------------------------------------
-// Per-frame release context — the C++ std::function lambda that captured the
-// two RD RIDs plus the two CVMetalTexture wrappers. Heap-allocated on import,
-// freed by its own run() after tearing everything down. Order matters: RD must
-// be done with the MTLTexture (free_rid) before we release the CVMetalTexture
-// that owns it. The retire-ring only invokes this after N rendered frames, so
-// the GPU is finished sampling.
+// Per-frame release payload: the two RD RIDs plus the two CVMetalTexture
+// wrappers, heap-boxed by si.boxClosure() on import. Order matters in the
+// teardown below: RD must be done with the MTLTexture (free_rid) before the
+// CVMetalTexture that owns it is released. The retire-ring only runs this
+// after N rendered frames, so the GPU is finished sampling.
 // -----------------------------------------------------------------------
-const ReleaseCtx = struct {
-    allocator: std.mem.Allocator,
+const ReleaseValue = struct {
     rd: *RenderingDevice,
     luma: Rid,
     chroma: Rid,
     cv_luma: ?*anyopaque,
     cv_chroma: ?*anyopaque,
-
-    fn run(ptr: ?*anyopaque) void {
-        const self: *ReleaseCtx = @ptrCast(@alignCast(ptr.?));
-        si.freePlaneRids(self.rd, self.luma, self.chroma);
-        if (self.cv_luma) |t| CFRelease(t);
-        if (self.cv_chroma) |t| CFRelease(t);
-        self.allocator.destroy(self);
-    }
 };
+
+fn releaseTeardown(v: *ReleaseValue) void {
+    si.freePlaneRids(v.rd, v.luma, v.chroma);
+    if (v.cv_luma) |t| CFRelease(t);
+    if (v.cv_chroma) |t| CFRelease(t);
+}
 
 // -----------------------------------------------------------------------
 // The concrete Metal importer. Owns the CVMetalTextureCache bound to Godot's
 // MTLDevice; constructed once per present pipeline and reused across frames.
 // -----------------------------------------------------------------------
-const MetalSurfaceImporter = struct {
+pub const MetalSurfaceImporter = struct {
     allocator: std.mem.Allocator,
     rd: ?*RenderingDevice = null,
     device: ?*anyopaque = null, // borrowed: Godot owns its MTLDevice
@@ -220,20 +215,18 @@ const MetalSurfaceImporter = struct {
     // reference. Detected at initialize() by probing the live driver.
     donate_reference_to_godot: bool = false,
 
-    const vtable: SurfaceImporter.VTable = .{
-        .initialize = vtInitialize,
-        .is_initialized = vtIsInitialized,
-        .is_zero_copy = vtIsZeroCopy,
-        .import = vtImport,
-        .deinit = vtDeinit,
-    };
-
-    fn fromPtr(p: *anyopaque) *MetalSurfaceImporter {
-        return @ptrCast(@alignCast(p));
+    /// Construct the importer. Held by value in the present pipeline and reused
+    /// across frames; initialize() binds it to RD and deinit() releases its
+    /// CVMetalTextureCache. Never fails — the fallible work happens in
+    /// initialize().
+    pub fn init(allocator: std.mem.Allocator) MetalSurfaceImporter {
+        return .{ .allocator = allocator };
     }
 
-    fn vtInitialize(p: *anyopaque, rd: *RenderingDevice) bool {
-        const self = fromPtr(p);
+    /// Bind to Godot's RenderingDevice. Returns false if the importer cannot
+    /// run on this RD (e.g. a non-Metal RD on macOS). Must be called before
+    /// import().
+    pub fn initialize(self: *MetalSurfaceImporter, rd: *RenderingDevice) bool {
         // Already initialised (a successful init always has a cache); a prior
         // *failed* attempt left texture_cache null, so it retries fully — same
         // behaviour as the C++ `if (impl_) return impl_->texture_cache != null`.
@@ -262,14 +255,6 @@ const MetalSurfaceImporter = struct {
                 "driver is balanced",
         });
         return true;
-    }
-
-    fn vtIsInitialized(p: *anyopaque) bool {
-        return fromPtr(p).texture_cache != null;
-    }
-
-    fn vtIsZeroCopy(_: *anyopaque) bool {
-        return true; // Metal import is zero-copy (no CPU pixel copy).
     }
 
     /// Build one RD texture aliasing a CVMetalTexture's MTLTexture, zero-copy.
@@ -348,8 +333,10 @@ const MetalSurfaceImporter = struct {
         return rid;
     }
 
-    fn vtImport(p: *anyopaque, native_handle: ?*anyopaque, _: u32) PlaneTextures {
-        const self = fromPtr(p);
+    /// Import a decoder surface (CVPixelBufferRef) into two RD plane textures,
+    /// zero-copy. Returns an invalid PlaneTextures on failure. Does NOT take
+    /// ownership of the decoder surface.
+    pub fn import(self: *MetalSurfaceImporter, native_handle: ?*anyopaque, _: u32) PlaneTextures {
         var out: PlaneTextures = .{};
         if (self.texture_cache == null or native_handle == null) return out;
 
@@ -396,8 +383,14 @@ const MetalSurfaceImporter = struct {
             return out;
         }
 
-        // Park the teardown in a heap ctx (C++ captured it in a std::function).
-        const ctx = self.allocator.create(ReleaseCtx) catch {
+        // Park the teardown in a heap box.
+        const release = si.boxClosure(self.allocator, ReleaseValue{
+            .rd = rd,
+            .luma = luma,
+            .chroma = chroma,
+            .cv_luma = cv_luma,
+            .cv_chroma = cv_chroma,
+        }, releaseTeardown) catch {
             // Out of memory: free everything now rather than leak.
             rd.freeRid(luma);
             rd.freeRid(chroma);
@@ -405,41 +398,24 @@ const MetalSurfaceImporter = struct {
             if (cv_chroma) |t| CFRelease(t);
             return out;
         };
-        ctx.* = .{
-            .allocator = self.allocator,
-            .rd = rd,
-            .luma = luma,
-            .chroma = chroma,
-            .cv_luma = cv_luma,
-            .cv_chroma = cv_chroma,
-        };
 
         out.luma = luma;
         out.chroma = chroma;
         out.width = @intCast(CVPixelBufferGetWidthOfPlane(pb, 0));
         out.height = @intCast(CVPixelBufferGetHeightOfPlane(pb, 0));
-        out.release = .{ .ctx = ctx, .func = ReleaseCtx.run };
+        out.release = release;
         return out;
     }
 
-    fn vtDeinit(p: *anyopaque) void {
-        const self = fromPtr(p);
+    /// Release importer state (the owned CVMetalTextureCache). The importer
+    /// itself is held by value in the present pipeline, so there is nothing to
+    /// free here.
+    pub fn deinit(self: *MetalSurfaceImporter) void {
         if (self.texture_cache) |cache| {
             CVMetalTextureCacheFlush(cache, 0);
             CFRelease(cache);
             self.texture_cache = null;
         }
         self.device = null;
-        const allocator = self.allocator;
-        allocator.destroy(self);
     }
 };
-
-/// Construct the Metal importer as the SurfaceImporter ptr+vtable interface.
-/// Returns null only on allocation failure. Mirrors the macOS branch of C++
-/// make_surface_importer().
-pub fn create(allocator: std.mem.Allocator) ?SurfaceImporter {
-    const self = allocator.create(MetalSurfaceImporter) catch return null;
-    self.* = .{ .allocator = allocator };
-    return .{ .ptr = self, .vtable = &MetalSurfaceImporter.vtable };
-}

@@ -33,7 +33,6 @@ const AudioServer = godot.class.AudioServer;
 const ProjectSettings = godot.class.ProjectSettings;
 const String = godot.builtin.String;
 const Dictionary = godot.builtin.Dictionary;
-const Variant = godot.builtin.Variant;
 const PackedFloat32Array = godot.builtin.PackedFloat32Array;
 
 const avf = @import("avf");
@@ -54,6 +53,7 @@ const present_pipeline = @import("present_pipeline.zig");
 const PresentPipeline = present_pipeline.PresentPipeline;
 const OutputMode = present_pipeline.OutputMode;
 const extension = @import("extension.zig");
+const setDict = @import("godot_dict.zig").setDict;
 
 const log = std.log.scoped(.native_video);
 
@@ -126,8 +126,12 @@ fn mixSinkMix(ptr: *anyopaque, interleaved: []const f32, channel_count: i32) i32
     if (@as(i64, @intCast(self.mix_buffer.size())) < total) {
         _ = self.mix_buffer.resize(total);
     }
-    for (interleaved, 0..) |sample, i| {
-        self.mix_buffer.set(@intCast(i), sample);
+    if (interleaved.len > 0) {
+        // index() is PackedFloat32Array's non-const operator[]; Godot detaches
+        // the array's CoW storage before handing back the pointer, same as
+        // resize() above, so this is the array's own unique buffer.
+        const dst: [*]f32 = @ptrCast(self.mix_buffer.index(0));
+        @memcpy(dst[0..interleaved.len], interleaved);
     }
     return self.base.mixAudio(frame_count, .{ .buffer = self.mix_buffer, .offset = 0 });
 }
@@ -154,12 +158,13 @@ fn flushWarnings(self: *NativeVideoStreamPlayback) void {
     }
 }
 
-/// Open the media file. Returns true on success. Called by NativeVideoStream.
-pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
-    var backend = avf.create(self.allocator) catch return false;
+/// Resolve a Godot res:// / user:// path to an absolute OS path and open it
+/// on a fresh backend. globalizePath leaves absolute OS paths untouched.
+/// Returns null if the backend can't be constructed or open() fails; on
+/// success the caller owns the (already open) backend and must deinit() it.
+pub fn openBackendForPath(allocator: Allocator, path: String) ?Backend {
+    var backend = avf.create(allocator) catch return null;
 
-    // Resolve a Godot res:// / user:// path to an absolute OS path the backend
-    // can open. globalizePath leaves absolute OS paths untouched.
     var os_path = ProjectSettings.globalizePath(path);
     defer os_path.deinit();
     var buf: [4096]u8 = undefined;
@@ -167,8 +172,14 @@ pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
 
     if (!backend.open(utf8)) {
         backend.deinit();
-        return false;
+        return null;
     }
+    return backend;
+}
+
+/// Open the media file. Returns true on success. Called by NativeVideoStream.
+pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
+    var backend = openBackendForPath(self.allocator, path) orelse return false;
 
     // Audio-master latency compensation shifts reported media time back so it
     // reflects what the speaker is emitting now, not what was just pushed into
@@ -186,13 +197,19 @@ pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
 // --- Output mode ---
 
 pub fn setOutputMode(self: *NativeVideoStreamPlayback, mode: i64) void {
-    if (mode < 0 or mode > 1) return;
-    const om: OutputMode = if (mode == 1) .hdr else .sdr;
-    self.present.setOutputMode(om);
+    const om = OutputMode.fromInt(mode) orelse return;
+    self.applyOutputMode(om);
 }
 
 pub fn getOutputMode(self: *NativeVideoStreamPlayback) i64 {
     return @intFromEnum(self.present.outputMode());
+}
+
+/// Applies an already-resolved OutputMode, bypassing the Variant boundary
+/// conversion above. Used when the owning NativeVideoStream forwards its own
+/// (already-converted) output mode to a live playback.
+pub fn applyOutputMode(self: *NativeVideoStreamPlayback, mode: OutputMode) void {
+    self.present.setOutputMode(mode);
 }
 
 // --- VideoStreamPlayback overrides ---
@@ -279,19 +296,13 @@ pub fn _getMixRate(self: *NativeVideoStreamPlayback) i32 {
 pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     const color: Colorimetry = self.controller.color;
     var info = Dictionary.init();
-    setDictInt(&info, "matrix", @intFromEnum(color.matrix));
-    setDictInt(&info, "primaries", @intFromEnum(color.primaries));
-    setDictInt(&info, "transfer", @intFromEnum(color.transfer));
-    setDictInt(&info, "range", @intFromEnum(color.range));
-    setDictInt(&info, "bit_depth", @intCast(color.bit_depth));
+    setDict(&info, "matrix", @intFromEnum(color.matrix));
+    setDict(&info, "primaries", @intFromEnum(color.primaries));
+    setDict(&info, "transfer", @intFromEnum(color.transfer));
+    setDict(&info, "range", @intFromEnum(color.range));
+    setDict(&info, "bit_depth", color.bit_depth);
     // Report the effective output mode so callers can distinguish an SDR clip
     // in an HDR viewport vs a native HDR clip.
-    setDictInt(&info, "output_mode", @intFromEnum(self.present.outputMode()));
+    setDict(&info, "output_mode", @intFromEnum(self.present.outputMode()));
     return info;
-}
-
-fn setDictInt(dict: *Dictionary, comptime key: [:0]const u8, value: i64) void {
-    var k = String.fromLatin1(key);
-    defer k.deinit();
-    _ = dict.set(Variant.init(String, k), Variant.init(i64, value));
 }

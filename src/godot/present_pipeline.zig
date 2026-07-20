@@ -6,8 +6,8 @@
 //!   - an N-buffered ring of engine-owned RGBA storage textures (rgba8 in SDR
 //!     mode, rgba16f in HDR mode), exposed through ONE stable Texture2DRD that
 //!     Godot samples (see getTexture()),
-//!   - a SurfaceImporter (Metal on macOS) that turns a decoder surface into two
-//!     RD plane textures — zero-copy,
+//!   - a MetalSurfaceImporter that turns a decoder surface into two RD plane
+//!     textures — zero-copy,
 //!   - a RetireRing(N) that holds each frame's transient surfaces for N
 //!     rendered frames so the GPU never reads a freed surface.
 //!
@@ -48,13 +48,25 @@ const retire_ring = core.retire_ring;
 const shaders = core.shaders;
 
 const si = @import("surface_importer.zig");
-const SurfaceImporter = si.SurfaceImporter;
 const PlaneTextures = si.PlaneTextures;
+const MetalSurfaceImporter = @import("metal_surface_importer.zig").MetalSurfaceImporter;
 
 /// Present-pipeline output format.
 pub const OutputMode = enum(u8) {
     sdr = 0, // RGBA8, non-linear (tone-mapped / clamped), Godot's standard 2D
     hdr = 1, // RGBA16F, scene-linear, 1.0 = 203-nit Reference White (BT.2408)
+
+    /// Converts a Variant-boundary i64 (as received from a Godot property
+    /// setter) into an OutputMode. Null for anything out of range, so the
+    /// caller can ignore the set — matches the property's enum hint, which
+    /// only ever offers 0 or 1.
+    pub fn fromInt(v: i64) ?OutputMode {
+        return switch (v) {
+            0 => .sdr,
+            1 => .hdr,
+            else => null,
+        };
+    }
 };
 
 /// Number of rendered frames a decoder surface is held before retirement, and
@@ -75,36 +87,37 @@ const State = enum(u8) {
 };
 
 // -----------------------------------------------------------------------
-// The retire-ring payload: freeing one presented frame's transient surfaces.
-// C++ captured this in a std::function lambda; Zig needs an explicit heap ctx
-// carrying the uniform set RID + the plane-release + frame-release closures.
-// The ctx is freed after its release closure runs.
+// The retire-ring payload: freeing one presented frame's transient surfaces
+// (the uniform set RID, the imported plane textures, and the decoder frame
+// itself). Heap-boxed by si.boxClosure() and run by the retire ring once the
+// frame has survived its GPU latency window.
 // -----------------------------------------------------------------------
-const RetirePayload = struct {
-    allocator: std.mem.Allocator,
+const RetireValue = struct {
     rd: *RenderingDevice,
     uniform_set: Rid,
     plane_release: si.Closure,
     frame: VideoFrame,
-
-    fn run(ctx: ?*anyopaque) void {
-        const self: *RetirePayload = @ptrCast(@alignCast(ctx.?));
-        if (self.uniform_set.isValid()) self.rd.freeRid(self.uniform_set);
-        self.plane_release.call();
-        self.frame.release();
-        self.allocator.destroy(self);
-    }
 };
+
+fn retireTeardown(v: *RetireValue) void {
+    if (v.uniform_set.isValid()) v.rd.freeRid(v.uniform_set);
+    v.plane_release.call();
+    v.frame.release();
+}
 
 pub const PresentPipeline = struct {
     allocator: std.mem.Allocator,
 
     rd: ?*RenderingDevice = null, // borrowed: the global RD
-    importer: ?SurfaceImporter = null, // per-platform, chosen at first build
+    importer: ?MetalSurfaceImporter = null, // built at first buildResources
 
     shader: Rid = si.rid_invalid,
     pipeline: Rid = si.rid_invalid,
     sampler: Rid = si.rid_invalid,
+
+    // Reusable push-constant staging buffer, resized once in buildResources and
+    // repacked in place every present() — avoids a per-frame heap alloc.
+    push_scratch: PackedByteArray,
 
     ring: [ring_depth]RingSlot = @splat(.{}),
     ring_index: usize = 0,
@@ -120,10 +133,8 @@ pub const PresentPipeline = struct {
     state: State = .unbuilt,
     output_mode: OutputMode = .sdr,
 
-    cpu_copy_count: u64 = 0, // invariant: 0 on the zero-copy Import Paths
-
     pub fn init(allocator: std.mem.Allocator) PresentPipeline {
-        return .{ .allocator = allocator };
+        return .{ .allocator = allocator, .push_scratch = PackedByteArray.init() };
     }
 
     pub fn deinit(self: *PresentPipeline) void {
@@ -136,10 +147,6 @@ pub const PresentPipeline = struct {
 
     pub fn outputMode(self: *const PresentPipeline) OutputMode {
         return self.output_mode;
-    }
-
-    pub fn cpuCopyCount(self: *const PresentPipeline) u64 {
-        return self.cpu_copy_count;
     }
 
     /// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
@@ -204,18 +211,19 @@ pub const PresentPipeline = struct {
         };
         self.rd = rd;
 
-        // Build the per-platform surface importer lazily, then bind it to RD.
+        // Build the surface importer lazily, then bind it to RD.
         if (self.importer == null) {
-            self.importer = si.makeSurfaceImporter(self.allocator);
+            self.importer = MetalSurfaceImporter.init(self.allocator);
         }
-        const importer = self.importer orelse {
-            log.err("Surface importer construction failed.", .{});
-            return false;
-        };
+        const importer = &self.importer.?;
         if (!importer.initialize(rd)) {
             log.err("Surface importer init failed (RD backend not supported by importer?).", .{});
             return false;
         }
+
+        // Size the reusable push-constant staging buffer once. present()
+        // repacks into its detached buffer instead of allocating per frame.
+        _ = self.push_scratch.resize(@intCast(push_constants.push_constant_size));
 
         // --- Compile the shader variant for the active output mode. ---
         const want_hdr = self.output_mode == .hdr;
@@ -338,7 +346,7 @@ pub const PresentPipeline = struct {
             return false;
         }
         const rd = self.rd.?;
-        const importer = self.importer.?;
+        const importer = &self.importer.?;
 
         // Age the retire-ring by one rendered frame BEFORE parking this frame's
         // surfaces. advance() releases whatever was parked frame_latency ago.
@@ -364,11 +372,9 @@ pub const PresentPipeline = struct {
 
         // Push constant: output dimensions + colorimetry + bit depth + the
         // importer's 10-bit sample scale (std430, push_constant_size bytes).
-        var pc = self.buildPushConstants(frame, planes.sample_scale);
-        defer pc.deinit();
-
-        // Cross-API sync hooks (no-op on macOS: acquire/release are empty).
-        planes.acquire.call();
+        // Repacked into the reusable, pre-sized scratch buffer — no per-frame
+        // alloc.
+        self.packPushConstants(frame, planes.sample_scale);
 
         // --- ONE compute dispatch: NV12 -> RGBA into the engine-owned slot. ---
         const gx: u32 = @intCast(@divTrunc(self.width + 7, 8));
@@ -377,39 +383,29 @@ pub const PresentPipeline = struct {
         const cl = rd.computeListBegin();
         rd.computeListBindComputePipeline(cl, self.pipeline);
         rd.computeListBindUniformSet(cl, uniform_set, 0);
-        rd.computeListSetPushConstant(cl, pc, push_constants.push_constant_size);
+        rd.computeListSetPushConstant(cl, self.push_scratch, push_constants.push_constant_size);
         rd.computeListDispatch(cl, gx, gy, 1);
         rd.computeListEnd();
-
-        // Release the keyed mutex back to the decoder (no-op on macOS).
-        planes.release_sync.call();
 
         // Re-point the stable output texture at the slot the dispatch wrote.
         self.getTexture().setTextureRdRid(slot.rgba_rid);
 
-        // Count this frame if the CPU-Copy Import Path produced the planes.
-        if (!importer.isZeroCopy()) {
-            self.cpu_copy_count += 1;
-        }
-
         // Park this frame's surfaces (plane textures + uniform set + the
         // decoder VideoFrame's own release) for frame_latency frames. They are
         // freed together once the GPU is guaranteed done (N frames later).
-        const payload = self.allocator.create(RetirePayload) catch {
+        const release = si.boxClosure(self.allocator, RetireValue{
+            .rd = rd,
+            .uniform_set = uniform_set,
+            .plane_release = planes.release,
+            .frame = frame,
+        }, retireTeardown) catch {
             // Out of memory: free everything now rather than leaking.
             if (uniform_set.isValid()) rd.freeRid(uniform_set);
             planes.release.call();
             frame.release();
             return true;
         };
-        payload.* = .{
-            .allocator = self.allocator,
-            .rd = rd,
-            .uniform_set = uniform_set,
-            .plane_release = planes.release,
-            .frame = frame,
-        };
-        self.retire.retain(.{ .ctx = payload, .func = RetirePayload.run });
+        self.retire.retain(release);
         return true;
     }
 
@@ -451,14 +447,12 @@ pub const PresentPipeline = struct {
         return rd.uniformSetCreate(uniforms, self.shader, 0);
     }
 
-    /// Pack the compute shader's push constants (output dimensions +
-    /// colorimetry + bit depth + the importer's 10-bit sample scale) into a
-    /// PackedByteArray ready for rd.computeListSetPushConstant(). The caller
-    /// owns the returned array and must deinit() it.
-    fn buildPushConstants(self: *PresentPipeline, frame: VideoFrame, sample_scale: f32) PackedByteArray {
-        var pc = PackedByteArray.init();
-        _ = pc.resize(@intCast(push_constants.push_constant_size));
-        // pack into a stack buffer, then copy into the PackedByteArray.
+    /// Repack the compute shader's push constants (output dimensions +
+    /// colorimetry + bit depth + the importer's 10-bit sample scale) into the
+    /// reusable push_scratch buffer (sized once in buildResources), ready for
+    /// rd.computeListSetPushConstant(). No allocation.
+    fn packPushConstants(self: *PresentPipeline, frame: VideoFrame, sample_scale: f32) void {
+        // Pack into a stack buffer, then copy into push_scratch's own storage.
         var buf: [push_constants.push_constant_size]u8 = undefined;
         push_constants.packPushConstants(
             &buf,
@@ -467,8 +461,11 @@ pub const PresentPipeline = struct {
             frame.color,
             sample_scale,
         );
-        for (buf, 0..) |b, i| pc.set(@intCast(i), @intCast(b));
-        return pc;
+        // index(0) detaches push_scratch's CoW storage and hands back its
+        // unique buffer (same idiom as the audio mix path), so the memcpy
+        // writes in place — no per-frame heap alloc.
+        const dst: [*]u8 = @ptrCast(self.push_scratch.index(0));
+        @memcpy(dst[0..buf.len], buf[0..]);
     }
 
     fn freeResources(self: *PresentPipeline) void {
@@ -506,7 +503,7 @@ pub const PresentPipeline = struct {
         // Release any surfaces still parked before tearing down RD resources.
         self.retire.drain();
         self.freeResources();
-        if (self.importer) |imp| {
+        if (self.importer) |*imp| {
             imp.deinit();
             self.importer = null;
         }
@@ -514,6 +511,7 @@ pub const PresentPipeline = struct {
             if (t.unreference()) t.destroy();
             self.current_texture = null;
         }
+        self.push_scratch.deinit();
         self.rd = null;
     }
 };

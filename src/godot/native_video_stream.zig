@@ -21,9 +21,10 @@ const Array = godot.builtin.Array;
 const Dictionary = godot.builtin.Dictionary;
 const Variant = godot.builtin.Variant;
 
-const avf = @import("avf");
-
 const NativeVideoStreamPlayback = @import("native_video_stream_playback.zig");
+const present_pipeline = @import("present_pipeline.zig");
+const OutputMode = present_pipeline.OutputMode;
+const setDict = @import("godot_dict.zig").setDict;
 
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStream, r.allocator, .auto);
@@ -47,19 +48,18 @@ pub fn unregister(r: *Registry) void {
 allocator: Allocator,
 base: *VideoStream,
 
-output_mode: i64 = 0, // matches NativeVideoStreamPlayback OutputMode
+output_mode: OutputMode = .sdr,
 
 // Instance ids of playbacks instantiated from this stream. ObjectIDs, not
 // refs, on purpose: the stream must never extend a playback's lifetime.
 // Dead ids are pruned whenever the list is walked.
 playback_ids: std.ArrayList(u64) = .empty,
 
-// True once getAudioTracks() has probed the clip, whether or not the probe
-// succeeded. Distinguishes "not probed yet" from "probed and found no audio
+// The cached audio-track probe. null until getAudioTracks() has probed the
+// clip, whether or not the probe succeeded; a non-null (possibly empty) Array
+// afterwards. Distinguishes "not probed yet" from "probed and found no audio
 // tracks" so a failed probe or an audio-less clip doesn't re-open the file.
-audio_tracks_probed: bool = false,
-cached_audio_tracks: Array = undefined,
-has_cached_tracks: bool = false,
+cached_audio_tracks: ?Array = null,
 
 pub fn create(allocator: *Allocator) !*NativeVideoStream {
     const self = try allocator.create(NativeVideoStream);
@@ -73,7 +73,7 @@ pub fn create(allocator: *Allocator) !*NativeVideoStream {
 
 pub fn destroy(self: *NativeVideoStream, allocator: *Allocator) void {
     self.playback_ids.deinit(self.allocator);
-    if (self.has_cached_tracks) self.cached_audio_tracks.deinit();
+    if (self.cached_audio_tracks) |*a| a.deinit();
     self.base.destroy();
     allocator.destroy(self);
 }
@@ -112,19 +112,19 @@ fn resolvePlayback(id: u64) ?*NativeVideoStreamPlayback {
 }
 
 pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
-    if (mode < 0 or mode > 1) return;
-    self.output_mode = mode;
+    const om = OutputMode.fromInt(mode) orelse return;
+    self.output_mode = om;
     // Forward to every still-alive playback instantiated from this stream.
     self.pruneDeadPlaybacks();
     for (self.playback_ids.items) |id| {
         if (resolvePlayback(id)) |playback| {
-            playback.setOutputMode(self.output_mode);
+            playback.applyOutputMode(self.output_mode);
         }
     }
 }
 
 pub fn getOutputMode(self: *NativeVideoStream) i64 {
-    return self.output_mode;
+    return @intFromEnum(self.output_mode);
 }
 
 /// Lazy, cached probe of audio track metadata. Probes exactly once; the result
@@ -132,51 +132,37 @@ pub fn getOutputMode(self: *NativeVideoStream) i64 {
 /// clip) is cached for every subsequent call. Returns an Array of Dictionaries;
 /// array position is the track index for VideoStreamPlayer.audio_track.
 pub fn getAudioTracks(self: *NativeVideoStream) Array {
-    if (self.audio_tracks_probed) {
-        return self.cached_audio_tracks;
+    if (self.cached_audio_tracks) |cached| {
+        return cached;
     }
-    self.audio_tracks_probed = true;
 
     // Lazy probe: open the clip briefly to read audio track metadata, then
     // close the backend. The result (including empty, on failure) is cached.
     var tracks = Array.init();
 
-    var backend = avf.create(self.allocator) catch {
-        self.cached_audio_tracks = tracks;
-        self.has_cached_tracks = true;
+    var file = self.base.getFile();
+    defer file.deinit();
+    var backend = NativeVideoStreamPlayback.openBackendForPath(self.allocator, file) orelse {
+        self.cached_audio_tracks = tracks; // empty on failure
         return tracks;
     };
     defer backend.deinit();
-
-    var file = self.base.getFile();
-    defer file.deinit();
-    var os_path = godot.class.ProjectSettings.globalizePath(file);
-    defer os_path.deinit();
-    var buf: [4096]u8 = undefined;
-    const utf8 = os_path.toUtf8Buf(buf[0..]);
-
-    if (!backend.open(utf8)) {
-        self.cached_audio_tracks = tracks; // empty on failure
-        self.has_cached_tracks = true;
-        return tracks;
-    }
 
     const count: usize = @intCast(@max(backend.audioTrackCount(), 0));
     _ = tracks.resize(@intCast(count));
     for (0..count) |i| {
         const dinfo = backend.audioTrackInfo(@intCast(i));
         var dict = Dictionary.init();
-        setDictString(&dict, "language", dinfo.language);
-        setDictString(&dict, "name", dinfo.name);
-        setDictInt(&dict, "channels", dinfo.channels);
-        setDictInt(&dict, "sample_rate", dinfo.sample_rate);
-        setDictBool(&dict, "default", dinfo.is_default);
+        setDict(&dict, "language", dinfo.language);
+        setDict(&dict, "name", dinfo.name);
+        setDict(&dict, "channels", dinfo.channels);
+        setDict(&dict, "sample_rate", dinfo.sample_rate);
+        setDict(&dict, "default", dinfo.is_default);
         tracks.set(@intCast(i), Variant.init(Dictionary, dict));
     }
 
     backend.close();
     self.cached_audio_tracks = tracks;
-    self.has_cached_tracks = true;
     return tracks;
 }
 
@@ -184,7 +170,7 @@ pub fn getAudioTracks(self: *NativeVideoStream) Array {
 /// the stream to obtain a playback. Mirrors C++ _instantiate_playback().
 pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     const playback = NativeVideoStreamPlayback.create(&self.allocator) catch return null;
-    playback.setOutputMode(self.output_mode);
+    playback.applyOutputMode(self.output_mode);
 
     // Prune dead ids, then record the new playback's id so setOutputMode() can
     // reach it later. The list stays bounded across many instantiations.
@@ -198,24 +184,4 @@ pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     // gracefully instead of crashing; _getTexture() yields a null texture.
     _ = playback.load(file);
     return playback.base;
-}
-
-fn setDictInt(dict: *Dictionary, comptime key: [:0]const u8, value: i32) void {
-    var k = String.fromLatin1(key);
-    defer k.deinit();
-    _ = dict.set(Variant.init(String, k), Variant.init(i64, @intCast(value)));
-}
-
-fn setDictBool(dict: *Dictionary, comptime key: [:0]const u8, value: bool) void {
-    var k = String.fromLatin1(key);
-    defer k.deinit();
-    _ = dict.set(Variant.init(String, k), Variant.init(bool, value));
-}
-
-fn setDictString(dict: *Dictionary, comptime key: [:0]const u8, value: []const u8) void {
-    var k = String.fromLatin1(key);
-    defer k.deinit();
-    var v = String.fromUtf8(value) catch String.fromLatin1(value);
-    defer v.deinit();
-    _ = dict.set(Variant.init(String, k), Variant.init(String, v));
 }

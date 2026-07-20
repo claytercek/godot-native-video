@@ -1,28 +1,18 @@
-//! surface_importer.zig — platform-agnostic surface-import interface.
+//! surface_importer.zig — platform-neutral vocabulary for surface import.
 //!
-//! Port of src/common/surface_importer.h (+ importer_selector.h). The zero-copy
-//! present pipeline imports a hardware-decoded biplanar Y'CbCr surface (NV12
-//! 8-bit, or P010/x420 10-bit) into Godot's RenderingDevice as two plane
-//! textures WITHOUT any CPU copy, then runs the single NV12->RGB compute pass.
-//! The *mechanism* of that import is platform-specific:
+//! The zero-copy present pipeline imports a hardware-decoded biplanar
+//! Y'CbCr surface (NV12 8-bit, or P010/x420 10-bit) into Godot's
+//! RenderingDevice as two plane textures WITHOUT any CPU copy, then runs
+//! the single NV12->RGB compute pass. The concrete importer lives in
+//! metal_surface_importer.zig (CVPixelBuffer IOSurface -> MTLTexture via
+//! CVMetalTextureCache -> RenderingDevice.textureCreateFromExtension);
+//! Windows import paths (DXGI/D3D12/CPU-Copy) are a non-goal on this
+//! macOS-only build.
 //!
-//!   - macOS: CVPixelBuffer IOSurface -> MTLTexture (CVMetalTextureCache)
-//!            -> RenderingDevice.textureCreateFromExtension. (MetalSurfaceImporter)
-//!   - Windows: the DXGI/D3D12/CPU-Copy import paths.
-//!
-//! This is the seam between the platform-agnostic Binding (present pipeline,
-//! video-stream playback) and the per-platform importer. Importer selection
-//! lives in exactly ONE place (make_surface_importer); nothing in the shared
-//! path knows which concrete importer is in use.
-//!
-//! SCOPE: this build is macOS-only. Only the Metal importer is wired (see
-//! metal_surface_importer.zig — currently a compiling stub). The Windows
-//! D3D11/D3D12/DXGI and CPU-Copy import paths are a non-goal; there is no
-//! importer selection logic here because there is nothing to select between.
-//!
-//! The C++ pure-virtual class becomes a ptr + vtable interface (composition,
-//! not inheritance), matching src/core/backend.zig's style. std::function
-//! release/acquire hooks become ctx + fn-pointer Closures.
+//! This module holds the types shared across that module boundary — the
+//! PlaneTextures import result and the small RID/closure helpers — so the
+//! present pipeline never reaches into CoreVideo/Metal directly. Zig has no
+//! capturing closures, so teardown hooks are ctx + fn-pointer Closures.
 
 const std = @import("std");
 
@@ -30,21 +20,38 @@ const godot = @import("godot");
 const RenderingDevice = godot.class.RenderingDevice;
 const Rid = godot.builtin.Rid;
 
-const metal = @import("metal_surface_importer.zig");
+const core = @import("core");
 
 /// An invalid (zero) RID for struct-field defaults. isValid() is false.
 pub const rid_invalid: Rid = std.mem.zeroes(Rid);
 
-/// C++ std::function<void()> hook → ctx + fn pointer. An empty value
-/// (func == null) is the "no hook" state, ignored by call().
-pub const Closure = struct {
-    ctx: ?*anyopaque = null,
-    func: ?*const fn (?*anyopaque) void = null,
+/// Release/sync hook for an imported surface: ctx + fn pointer, shared with
+/// every other type-erased callback in the codebase.
+pub const Closure = core.backend.VoidClosure;
 
-    pub fn call(self: Closure) void {
-        if (self.func) |f| f(self.ctx);
-    }
-};
+/// Heap-boxes `value` and returns a Closure whose thunk runs `teardown`
+/// against the boxed value, then frees the box. Every heap-boxed-teardown
+/// closure in the present pipeline goes through here, so the allocate /
+/// teardown / free ordering lives in exactly one place.
+pub fn boxClosure(
+    allocator: std.mem.Allocator,
+    value: anytype,
+    comptime teardown: fn (*@TypeOf(value)) void,
+) !Closure {
+    const Box = struct {
+        allocator: std.mem.Allocator,
+        value: @TypeOf(value),
+
+        fn run(ctx: ?*anyopaque) void {
+            const box: *@This() = @ptrCast(@alignCast(ctx.?));
+            teardown(&box.value);
+            box.allocator.destroy(box);
+        }
+    };
+    const box = try allocator.create(Box);
+    box.* = .{ .allocator = allocator, .value = value };
+    return .{ .ctx = box, .func = Box.run };
+}
 
 // -----------------------------------------------------------------------
 // PlaneTextures — the import result for one frame.
@@ -71,12 +78,6 @@ pub const PlaneTextures = struct {
     /// exactly once (the retire-ring does this after N frames).
     release: Closure = .{},
 
-    /// Optional GPU-sync hooks for platforms that gate decoder<->Godot access
-    /// on a keyed mutex / fence (Windows). On macOS these stay empty: CoreVideo
-    /// + Metal share one device so no cross-device sync object is needed.
-    acquire: Closure = .{}, // keyed-mutex acquire or fence wait (Windows)
-    release_sync: Closure = .{}, // keyed-mutex release (Windows)
-
     pub fn valid(self: PlaneTextures) bool {
         return self.luma.isValid() and self.chroma.isValid();
     }
@@ -88,58 +89,4 @@ pub const PlaneTextures = struct {
 pub fn freePlaneRids(rd: *RenderingDevice, luma: Rid, chroma: Rid) void {
     if (luma.isValid()) rd.freeRid(luma);
     if (chroma.isValid()) rd.freeRid(chroma);
-}
-
-// -----------------------------------------------------------------------
-// SurfaceImporter — abstract per-platform decoder-surface importer.
-//
-// One instance per present pipeline; reused across frames. Concrete importers
-// own whatever cache/device state their platform needs (a CVMetalTextureCache
-// on macOS).
-// -----------------------------------------------------------------------
-pub const SurfaceImporter = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        /// Bind to Godot's RenderingDevice. Returns false if the importer
-        /// cannot run on this RD (e.g. a non-Metal RD on macOS). Must be called
-        /// before import().
-        initialize: *const fn (*anyopaque, rd: *RenderingDevice) bool,
-        is_initialized: *const fn (*anyopaque) bool,
-        /// Whether this importer's planes reach RD without a CPU pixel copy.
-        /// Fixed per importer. Optional: null → true (zero-copy default).
-        is_zero_copy: ?*const fn (*anyopaque) bool = null,
-        /// Import a decoder surface (CVPixelBufferRef on macOS) into two RD
-        /// plane textures, zero-copy. Returns an invalid PlaneTextures on
-        /// failure. Does NOT take ownership of the decoder surface.
-        import: *const fn (*anyopaque, native_handle: ?*anyopaque, plane_slice: u32) PlaneTextures,
-        /// Virtual destructor: release importer state and free the instance.
-        deinit: *const fn (*anyopaque) void,
-    };
-
-    pub fn initialize(self: SurfaceImporter, rd: *RenderingDevice) bool {
-        return self.vtable.initialize(self.ptr, rd);
-    }
-    pub fn isInitialized(self: SurfaceImporter) bool {
-        return self.vtable.is_initialized(self.ptr);
-    }
-    pub fn isZeroCopy(self: SurfaceImporter) bool {
-        if (self.vtable.is_zero_copy) |f| return f(self.ptr);
-        return true;
-    }
-    pub fn import(self: SurfaceImporter, native_handle: ?*anyopaque, plane_slice: u32) PlaneTextures {
-        return self.vtable.import(self.ptr, native_handle, plane_slice);
-    }
-    pub fn deinit(self: SurfaceImporter) void {
-        self.vtable.deinit(self.ptr);
-    }
-};
-
-/// Factory: returns the importer for the current build. Metal is the only
-/// importer this codebase implements — other platforms' import paths are a
-/// non-goal, so there is no selection logic here. Returns null if the
-/// importer cannot be constructed.
-pub fn makeSurfaceImporter(allocator: std.mem.Allocator) ?SurfaceImporter {
-    return metal.create(allocator);
 }
