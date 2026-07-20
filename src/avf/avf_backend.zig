@@ -131,11 +131,10 @@ pub const AvfBackend = struct {
     // Negotiated colorimetry parsed at open; defaults to BT.709 video range.
     color: core.Colorimetry = core.Colorimetry.bt709_defaults,
 
-    // Per-track audio metadata. Strings point into `string_storage`.
+    // Per-track audio metadata. `language` slices borrow the shim's own
+    // strdup'd storage (avf_shim.h: valid until nv_avf_close/destroy), so
+    // there's no separate backend-owned copy to track or free.
     audio_tracks: std.ArrayList(core.AudioTrackInfo) = .empty,
-    // Owned copies of the language strings backing audio_tracks[*].language;
-    // valid until close().
-    string_storage: std.ArrayList([]u8) = .empty,
 
     selected_audio_index: i32 = 0,
     audio_channels: i32 = 0,
@@ -165,11 +164,25 @@ pub const AvfBackend = struct {
         return @ptrCast(@alignCast(p));
     }
 
-    /// Drop the cached track table and its backing strings.
+    /// Drop the cached track table. The language strings it points into are
+    /// shim-owned and freed by nv_avf_close, not here.
     fn clearTracks(self: *AvfBackend) void {
-        for (self.string_storage.items) |s| self.allocator.free(s);
-        self.string_storage.clearRetainingCapacity();
         self.audio_tracks.clearRetainingCapacity();
+    }
+
+    /// Shared shim-result mapping: .fail latches the error flag, .ok/.none
+    /// don't touch it. Returns whether the call site should treat this as
+    /// success. Callers own resetting `err` at entry where that applies
+    /// (open/seek/reselect) — this only ever sets it, never clears it.
+    fn applyResult(self: *AvfBackend, rc: Result) bool {
+        switch (rc) {
+            .ok => return true,
+            .none => return false,
+            .fail => {
+                self.err = true;
+                return false;
+            },
+        }
     }
 
     // ---- lifecycle ----
@@ -193,10 +206,7 @@ pub const AvfBackend = struct {
         defer self.allocator.free(path_z);
 
         var info: c_open_info = undefined;
-        switch (nv_avf_open(self.shim, path_z.ptr, &info)) {
-            .ok => {},
-            .none, .fail => return error.OpenFailed,
-        }
+        if (!self.applyResult(nv_avf_open(self.shim, path_z.ptr, &info))) return error.OpenFailed;
 
         self.opened = true;
         self.duration = info.duration_seconds;
@@ -205,24 +215,18 @@ pub const AvfBackend = struct {
         self.has_video = info.has_video != 0;
         self.color = toColorimetry(info.color);
 
-        // Cache per-track audio metadata, duplicating language strings into
-        // backend-owned storage so the slices stay valid until close().
+        // Cache per-track audio metadata. `language` borrows the shim's own
+        // strdup'd pointer directly (valid until close/destroy) instead of a
+        // separate backend-owned copy.
         const count: usize = @intCast(@max(info.audio_track_count, 0));
         for (0..count) |i| {
             var track: c_audio_track_info = undefined;
             if (nv_avf_get_audio_track_info(self.shim, @intCast(i), &track) == 0) continue;
 
-            const lang_src: []const u8 = if (track.language) |p| std.mem.span(p) else "";
-            const lang_copy = try self.allocator.dupe(u8, lang_src);
-            {
-                // Owned by string_storage from here; closeImpl frees it on any
-                // later failure.
-                errdefer self.allocator.free(lang_copy);
-                try self.string_storage.append(self.allocator, lang_copy);
-            }
+            const lang: []const u8 = if (track.language) |p| std.mem.span(p) else "";
             try self.audio_tracks.append(self.allocator, .{
-                .language = lang_copy,
-                .name = "", // not surfaced by AVFoundation in v1 (matches C++)
+                .language = lang,
+                .name = "", // not surfaced by AVFoundation in v1
                 .channels = @intCast(track.channels),
                 .sample_rate = @intCast(track.sample_rate),
                 .is_default = track.is_default != 0,
@@ -245,10 +249,7 @@ pub const AvfBackend = struct {
             self.selected_audio_index
         else
             -1;
-        switch (nv_avf_build_reader(self.shim, 0.0, audio_idx)) {
-            .ok => {},
-            .none, .fail => return error.BuildReaderFailed,
-        }
+        if (!self.applyResult(nv_avf_build_reader(self.shim, 0.0, audio_idx))) return error.BuildReaderFailed;
     }
 
     fn closeImpl(self: *AvfBackend) void {
@@ -287,13 +288,7 @@ pub const AvfBackend = struct {
             self.selected_audio_index
         else
             -1;
-        switch (nv_avf_build_reader(self.shim, target, audio_idx)) {
-            .ok => {},
-            .none, .fail => {
-                self.err = true;
-                return false;
-            },
-        }
+        if (!self.applyResult(nv_avf_build_reader(self.shim, target, audio_idx))) return false;
         return true;
     }
 
@@ -311,33 +306,19 @@ pub const AvfBackend = struct {
         const clamped = std.math.clamp(index, 0, count - 1);
         const target = @max(pts_seconds, 0.0);
 
-        // Mirrors C++ build_audio_reader() clearing the error flag at entry;
-        // a hard reader failure (-1) sets it, a soft failure (0) leaves it.
+        // Clears the error flag at entry; a hard reader failure latches it
+        // back via applyResult, a soft failure leaves it clear.
         self.err = false;
 
         // Step 1: dedicated audio-only reader for the new track.
-        switch (nv_avf_build_audio_reader(self.shim, clamped, target)) {
-            .ok => {},
-            .none => return false,
-            .fail => {
-                self.err = true;
-                return false;
-            },
-        }
+        if (!self.applyResult(nv_avf_build_audio_reader(self.shim, clamped, target))) return false;
+
         // Step 2: rebuild the combined reader as video-only from `target` so
         // video resumes near the requested position instead of repeating from
         // the clip start, and so its audio output cannot block video decode.
-        switch (nv_avf_build_video_reader(self.shim, target)) {
-            .ok => {},
-            .none => {
-                nv_avf_teardown_audio_reader(self.shim);
-                return false;
-            },
-            .fail => {
-                self.err = true;
-                nv_avf_teardown_audio_reader(self.shim);
-                return false;
-            },
+        if (!self.applyResult(nv_avf_build_video_reader(self.shim, target))) {
+            nv_avf_teardown_audio_reader(self.shim);
+            return false;
         }
         _ = self.applyTrackSelection(clamped);
         return true;
@@ -345,14 +326,7 @@ pub const AvfBackend = struct {
 
     fn nextVideoFrameImpl(self: *AvfBackend) ?core.VideoFrame {
         var cf: c_video_frame = undefined;
-        switch (nv_avf_next_video_frame(self.shim, &cf)) {
-            .ok => {},
-            .none => return null,
-            .fail => {
-                self.err = true;
-                return null;
-            },
-        }
+        if (!self.applyResult(nv_avf_next_video_frame(self.shim, &cf))) return null;
         return .{
             .pts_seconds = cf.pts_seconds,
             .native_handle = cf.pixel_buffer,
@@ -373,14 +347,7 @@ pub const AvfBackend = struct {
 
     fn nextAudioChunkImpl(self: *AvfBackend) ?core.AudioChunk {
         var cc: c_audio_chunk = undefined;
-        switch (nv_avf_next_audio_chunk(self.shim, &cc)) {
-            .ok => {},
-            .none => return null,
-            .fail => {
-                self.err = true;
-                return null;
-            },
-        }
+        if (!self.applyResult(nv_avf_next_audio_chunk(self.shim, &cc))) return null;
         const float_count: usize = @intCast(cc.float_count);
         const samples: []const f32 = if (cc.samples) |p| p[0..float_count] else &.{};
         // channel_count mirrors C++: the selected track's channel count, min 1.
@@ -412,7 +379,6 @@ pub const AvfBackend = struct {
         self.closeImpl();
         nv_avf_destroy(self.shim);
         self.audio_tracks.deinit(self.allocator);
-        self.string_storage.deinit(self.allocator);
         const allocator = self.allocator;
         allocator.destroy(self);
     }

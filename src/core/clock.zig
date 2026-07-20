@@ -40,10 +40,6 @@ pub const MonotonicClock = struct {
     pub fn setPaused(self: *MonotonicClock, paused: bool) void {
         self.paused = paused;
     }
-
-    pub fn isPaused(self: *const MonotonicClock) bool {
-        return self.paused;
-    }
 };
 
 /// AudioMasterClock — drives media time from audio sample consumption.
@@ -82,13 +78,6 @@ pub const AudioMasterClock = struct {
         return @max(t, 0.0);
     }
 
-    /// advance() is a no-op for the audio-master clock; time is governed
-    /// entirely by onAudioMixed().
-    pub fn advance(self: *AudioMasterClock, delta_seconds: f64) void {
-        _ = self;
-        _ = delta_seconds;
-    }
-
     pub fn setTime(self: *AudioMasterClock, time_seconds: f64) void {
         // After a seek the audio subsystem resets; re-anchor here.
         self.accumulated_seconds = time_seconds + self.latency_seconds;
@@ -96,10 +85,6 @@ pub const AudioMasterClock = struct {
 
     pub fn setPaused(self: *AudioMasterClock, paused: bool) void {
         self.paused = paused;
-    }
-
-    pub fn isPaused(self: *const AudioMasterClock) bool {
-        return self.paused;
     }
 };
 
@@ -120,7 +105,6 @@ pub const ClockBridge = struct {
     audio: ?AudioMasterClock,
     mono: MonotonicClock,
     audio_master: bool,
-    paused: bool = false,
 
     /// `mono` is always present. `audio` may be null for a silent clip, in
     /// which case `audio_master` is forced to false regardless of the
@@ -130,7 +114,6 @@ pub const ClockBridge = struct {
             .audio = audio,
             .mono = mono,
             .audio_master = if (audio != null) audio_master else false,
-            .paused = false,
         };
     }
 
@@ -140,13 +123,14 @@ pub const ClockBridge = struct {
         return if (self.audio_master) self.audio.?.mediaTime() else self.mono.mediaTime();
     }
 
+    /// Advance media time by a render delta. Only valid in monotonic-master
+    /// mode: audio-master time comes solely from onAudioMixed(), and callers
+    /// must route each tick's advance through exactly one of the two.
     pub fn advance(self: *ClockBridge, delta_seconds: f64) void {
-        if (!self.paused and delta_seconds > 0.0) {
-            if (!self.audio_master) {
-                self.mono.advance(delta_seconds);
-            }
-            // audio-master: advance() is ignored (same as AudioMasterClock).
-        }
+        std.debug.assert(!self.audio_master);
+        // mono.advance() gates on its own paused flag and delta > 0, so the
+        // pause/positive-delta invariant lives there — no separate bridge copy.
+        self.mono.advance(delta_seconds);
     }
 
     pub fn setTime(self: *ClockBridge, time_seconds: f64) void {
@@ -157,15 +141,16 @@ pub const ClockBridge = struct {
     }
 
     pub fn setPaused(self: *ClockBridge, paused: bool) void {
-        self.paused = paused;
         if (self.audio) |*a| {
             a.setPaused(paused);
         }
         self.mono.setPaused(paused);
     }
 
+    /// mono is always present and setPaused() keeps it in lockstep with the
+    /// audio clock, so it is the single source of truth for pause state.
     pub fn isPaused(self: *const ClockBridge) bool {
-        return self.paused;
+        return self.mono.paused;
     }
 
     // --- Handoff API ---
@@ -258,7 +243,6 @@ test "MonotonicClock set_time repositions the clock" {
 test "MonotonicClock paused does not advance" {
     var c = MonotonicClock.init(5.0);
     c.setPaused(true);
-    try std.testing.expect(c.isPaused());
     c.advance(1.0);
     try std.testing.expectApproxEqAbs(5.0, c.mediaTime(), 1e-9);
 }
@@ -268,7 +252,6 @@ test "MonotonicClock resumes after unpause" {
     c.setPaused(true);
     c.advance(1.0);
     c.setPaused(false);
-    try std.testing.expect(!c.isPaused());
     c.advance(0.5);
     try std.testing.expectApproxEqAbs(0.5, c.mediaTime(), 1e-9);
 }
@@ -344,12 +327,6 @@ test "AudioMasterClock paused does not advance on mix" {
     try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
 }
 
-test "AudioMasterClock advance() is a no-op" {
-    var c = AudioMasterClock.init(48000, 0.0);
-    c.advance(999.0); // should be ignored
-    try std.testing.expectApproxEqAbs(0.0, c.mediaTime(), 1e-9);
-}
-
 test "AudioMasterClock sample_rate and latency accessors" {
     const c = AudioMasterClock.init(44100, 0.05);
     try std.testing.expectEqual(44100, c.sample_rate);
@@ -399,10 +376,8 @@ test "ClockBridge starts as monotonic-master" {
     try std.testing.expectApproxEqAbs(5.0, b.mediaTime(), 1e-9);
 }
 
-test "ClockBridge audio-master: advance is no-op, on_audio_mixed advances" {
+test "ClockBridge audio-master: on_audio_mixed advances" {
     var b = makeAudioBridge(0.0);
-    b.advance(1.0);
-    try std.testing.expectApproxEqAbs(0.0, b.mediaTime(), 1e-9);
     b.onAudioMixed(48000); // 1 s
     try std.testing.expectApproxEqAbs(1.0, b.mediaTime(), 1e-9);
 }

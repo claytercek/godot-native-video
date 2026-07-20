@@ -425,6 +425,72 @@ int nv_avf_get_audio_track_info(nv_avf_backend *h, int index, nv_avf_audio_track
 // -----------------------------------------------------------------------
 // Reader construction.
 // -----------------------------------------------------------------------
+
+// Which of the two requested outputs actually attached to the reader a
+// create_started_reader call produced. `reader` is nil on any failure.
+typedef struct {
+	AVAssetReader *reader;
+	BOOL video_attached;
+	BOOL audio_attached;
+} started_reader_t;
+
+// Shared skeleton behind all three reader constructors below: create an
+// AVAssetReader for `asset`, window it to [start_time, +inf) when
+// start_time > 0 (AVAssetReader decodes from the keyframe at or before
+// start; PTS values stay in absolute media time), attach whichever of
+// `video_output`/`audio_output` are non-nil, and start reading.
+//
+// A `*_required` output the reader rejects (canAddOutput false) makes the
+// whole call NV_AVF_NONE before startReading ever runs; a non-required
+// output that's rejected is silently dropped (out->*_attached stays NO)
+// and the reader still starts — this is how the combined reader tolerates
+// a track it can't back without failing video or audio outright.
+static nv_avf_result create_started_reader(AVURLAsset *asset, double start_time,
+		AVAssetReaderTrackOutput *video_output, BOOL video_required,
+		AVAssetReaderTrackOutput *audio_output, BOOL audio_required,
+		started_reader_t *out) {
+	out->reader = nil;
+	out->video_attached = NO;
+	out->audio_attached = NO;
+
+	NSError *err = nil;
+	AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
+	if (!r || err) {
+		return NV_AVF_FAIL;
+	}
+	if (start_time > 0.0) {
+		CMTime start = CMTimeMakeWithSeconds(start_time, 600);
+		r.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
+	}
+
+	// alwaysCopiesSampleData = NO on every output: hand out the decoder's
+	// own surface/buffer instead of a defensive copy.
+	if (video_output) {
+		video_output.alwaysCopiesSampleData = NO;
+		if ([r canAddOutput:video_output]) {
+			[r addOutput:video_output];
+			out->video_attached = YES;
+		} else if (video_required) {
+			return NV_AVF_NONE;
+		}
+	}
+	if (audio_output) {
+		audio_output.alwaysCopiesSampleData = NO;
+		if ([r canAddOutput:audio_output]) {
+			[r addOutput:audio_output];
+			out->audio_attached = YES;
+		} else if (audio_required) {
+			return NV_AVF_NONE;
+		}
+	}
+
+	if (![r startReading]) {
+		return NV_AVF_FAIL;
+	}
+	out->reader = r;
+	return NV_AVF_OK;
+}
+
 nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_index) {
 	NvAvfState *s = state_of(h);
 	teardown_audio_reader(s);
@@ -437,41 +503,19 @@ nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audi
 			use_audio = s->all_audio_tracks[audio_track_index];
 		}
 
-		NSError *err = nil;
-		AVAssetReader *r = [AVAssetReader assetReaderWithAsset:s->asset error:&err];
-		if (!r || err) {
-			return NV_AVF_FAIL;
-		}
+		AVAssetReaderTrackOutput *vo = s->video_track ? make_video_output(s->video_track, &s->color) : nil;
+		AVAssetReaderTrackOutput *ao = use_audio ? make_audio_output(use_audio) : nil;
 
-		// Restrict to [start_time, duration] so seek resumes mid-clip at the
-		// nearest decodable sample. PTS values reported stay in absolute media
-		// time. AVAssetReader decodes from the keyframe at or before start.
-		if (start_time > 0.0) {
-			CMTime start = CMTimeMakeWithSeconds(start_time, 600);
-			r.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
+		// Both outputs are optional here: a track that can't be added is
+		// dropped rather than failing the whole combined reader.
+		started_reader_t started;
+		nv_avf_result rc = create_started_reader(s->asset, start_time, vo, NO, ao, NO, &started);
+		if (rc != NV_AVF_OK) {
+			return rc;
 		}
-
-		if (s->video_track) {
-			AVAssetReaderTrackOutput *vo = make_video_output(s->video_track, &s->color);
-			vo.alwaysCopiesSampleData = NO; // hand out the decoder's own surface
-			if ([r canAddOutput:vo]) {
-				[r addOutput:vo];
-				s->video_out = vo;
-			}
-		}
-		if (use_audio) {
-			AVAssetReaderTrackOutput *ao = make_audio_output(use_audio);
-			ao.alwaysCopiesSampleData = NO;
-			if ([r canAddOutput:ao]) {
-				[r addOutput:ao];
-				s->audio_out = ao;
-			}
-		}
-
-		if (![r startReading]) {
-			return NV_AVF_FAIL;
-		}
-		s->reader = r;
+		s->reader = started.reader;
+		s->video_out = started.video_attached ? vo : nil;
+		s->audio_out = started.audio_attached ? ao : nil;
 		return NV_AVF_OK;
 	}
 }
@@ -490,28 +534,14 @@ nv_avf_result nv_avf_build_audio_reader(nv_avf_backend *h, int track_index, doub
 	}
 
 	@autoreleasepool {
-		NSError *err = nil;
-		AVAssetReader *ar = [AVAssetReader assetReaderWithAsset:s->asset error:&err];
-		if (!ar || err) {
-			return NV_AVF_FAIL;
-		}
-
-		// Same [start_time, +inf] windowing as build_reader on seek, so audio
-		// starts at the keyframe at or before the requested position.
-		CMTime start = CMTimeMakeWithSeconds(start_time, 600);
-		ar.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
-
 		AVAssetReaderTrackOutput *ao = make_audio_output(use_audio);
-		ao.alwaysCopiesSampleData = NO;
-		if (![ar canAddOutput:ao]) {
-			return NV_AVF_NONE;
-		}
-		[ar addOutput:ao];
 
-		if (![ar startReading]) {
-			return NV_AVF_FAIL;
+		started_reader_t started;
+		nv_avf_result rc = create_started_reader(s->asset, start_time, nil, NO, ao, YES, &started);
+		if (rc != NV_AVF_OK) {
+			return rc;
 		}
-		s->audio_reader = ar;
+		s->audio_reader = started.reader;
 		s->audio_only_out = ao;
 		return NV_AVF_OK;
 	}
@@ -527,27 +557,14 @@ nv_avf_result nv_avf_build_video_reader(nv_avf_backend *h, double start_time) {
 	}
 
 	@autoreleasepool {
-		NSError *err = nil;
-		AVAssetReader *r = [AVAssetReader assetReaderWithAsset:s->asset error:&err];
-		if (!r || err) {
-			return NV_AVF_FAIL;
-		}
-		if (start_time > 0.0) {
-			CMTime start = CMTimeMakeWithSeconds(start_time, 600);
-			r.timeRange = CMTimeRangeMake(start, kCMTimePositiveInfinity);
-		}
-
 		AVAssetReaderTrackOutput *vo = make_video_output(s->video_track, &s->color);
-		vo.alwaysCopiesSampleData = NO;
-		if (![r canAddOutput:vo]) {
-			return NV_AVF_NONE;
-		}
-		[r addOutput:vo];
 
-		if (![r startReading]) {
-			return NV_AVF_FAIL;
+		started_reader_t started;
+		nv_avf_result rc = create_started_reader(s->asset, start_time, vo, YES, nil, NO, &started);
+		if (rc != NV_AVF_OK) {
+			return rc;
 		}
-		s->reader = r;
+		s->reader = started.reader;
 		s->video_out = vo;
 		// audio_out stays nil — no audio output to back up and block video.
 		return NV_AVF_OK;

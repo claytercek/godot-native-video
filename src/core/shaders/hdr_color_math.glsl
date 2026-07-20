@@ -1,9 +1,10 @@
 // -----------------------------------------------------------------------
 // hdr_color_math.glsl — GLSL implementations of HDR color math functions.
 //
-// Mirrors src/common/hdr_color_math.h. Both files implement the same ITU
-// formulas with identical constants; the C++ unit tests verify against
-// published reference values so the shader matches.
+// Mirrors the CPU-side constants and formulas in hdr_color_math.zig. A test
+// in that file parses this source text and checks each constant below
+// against published ITU reference values, so the two files cannot drift
+// apart.
 //
 // These functions are #included by the NV12→RGB compute shader and are
 // only called when the transfer function is PQ (2) or HLG (3).

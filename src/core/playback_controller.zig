@@ -395,21 +395,28 @@ pub const PlaybackController = struct {
     }
 
     // Advance the master clock for this tick and return the resulting media
-    // time. `c.advance()` is a no-op when audio-master; it keeps video moving
-    // through monotonic-master silence (silent clip, or the handoff window
-    // during a track switch). One clock rule: advance from real audio samples
-    // when any exist; once no more can ever come (a shorter audio track fully
-    // drained — legitimate in real-world files), advance by the render delta
-    // instead — see advanceMasterClock().
+    // time. One-clock rule: each tick advances media time from exactly one
+    // source. Audio-master ticks advance from real mixed audio frames; when
+    // audio is exhausted (a shorter audio track fully drained — legitimate in
+    // real-world files) and did not advance the clock, the render delta
+    // substitutes so video keeps moving. Monotonic-master ticks (silent clip,
+    // or the handoff window during a track switch) advance by the render
+    // delta; audio is still pumped so a mid-switch track re-anchors as soon
+    // as its samples flow.
     fn advanceClock(self: *PlaybackController, delta_seconds: f64, sink: MixSink, c: *ClockBridge) f64 {
-        c.advance(delta_seconds);
-
-        var advanced_from_audio = false;
-        if (self.has_audio) {
+        if (c.isAudioMaster()) {
             self.fillAudio();
-            advanced_from_audio = self.driveAudio(sink);
+            const advanced_from_audio = self.driveAudio(sink);
+            if (!advanced_from_audio and self.audioExhausted()) {
+                c.setTime(c.mediaTime() + delta_seconds);
+            }
+        } else {
+            c.advance(delta_seconds);
+            if (self.has_audio) {
+                self.fillAudio();
+                _ = self.driveAudio(sink);
+            }
         }
-        self.advanceMasterClock(delta_seconds, advanced_from_audio);
         return c.mediaTime();
     }
 
@@ -471,24 +478,6 @@ pub const PlaybackController = struct {
             if (self.audio_ring) |*r| return r.empty();
         }
         return false;
-    }
-
-    // advanceMasterClock — the one-clock rule: advance the master clock by
-    // exactly one source per tick, never two. When audio is present and drove
-    // the clock (`advanced_from_audio`), that is the one advance. When audio is
-    // master but exhausted (no more real samples will ever come — a shorter
-    // audio track fully drained, a legitimate real-world case), fall back to the
-    // render delta. The gates prevent double-advance: the `!advanced_from_audio`
-    // gate keeps the last partial ring drain from stacking real frames + delta;
-    // the `isAudioMaster()` gate keeps this from stacking on top of the bridge
-    // advance() while in monotonic-master mode. Reordering these conditions would
-    // silently break A/V sync — the three "one-clock rule" tests pin the
-    // behavior.
-    fn advanceMasterClock(self: *PlaybackController, delta_seconds: f64, advanced_from_audio: bool) void {
-        const c = self.master() orelse return;
-        if (!c.isAudioMaster() or advanced_from_audio) return;
-        if (!self.audioExhausted()) return;
-        c.setTime(c.mediaTime() + delta_seconds);
     }
 
     fn fillAudio(self: *PlaybackController) void {

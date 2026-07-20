@@ -1,18 +1,20 @@
-//! hdr_color_math.zig — port of src/common/hdr_color_math.h.
+//! hdr_color_math.zig — CPU-side HDR color conversion math.
 //!
 //! Shared HDR color conversion math functions.
 //!
 //! Matches ITU-R BT.2100 (PQ/HLG EOTFs), SMPTE ST 2084, BT.2390-4 EETF,
 //! and BT.2020->BT.709 primary-matrix conversion. The same mathematical
-//! constants appear in src/common/hdr_color_math.glsl for the GPU path; the
-//! tests below verify both against published ITU reference values so the
-//! constants cannot drift independently.
+//! constants appear in src/core/shaders/hdr_color_math.glsl for the GPU
+//! path; the tests below verify the Zig constants against published ITU
+//! reference values AND parse the embedded GLSL source text, comparing each
+//! shared constant numerically, so the two files cannot drift independently.
 //!
 //! All luminance values are in candelas per square metre (cd/m^2).
 //! All normalized signal values are in [0, 1] unless noted.
 
 const std = @import("std");
 const backend = @import("backend.zig");
+const shaders = @import("shaders.zig");
 
 // =======================================================================
 // Reference white (SDR target) — 203 cd/m^2 per BT.2408-2 §4.1.
@@ -473,4 +475,95 @@ test "hdr_to_sdr: HLG produces watchable output across range" {
     hdrToSdr(&r, &g, &b, 3);
     try testing.expect(r < 1.0);
     try testing.expect(r > 0.7);
+}
+
+// =========================================================================
+// GLSL constant-mirroring guard.
+//
+// Parses the embedded hdr_color_math.glsl source text and checks every
+// `const float kXxx = <expr>;` constant it declares against the Zig
+// constant it mirrors above, so a change to one side without the other
+// fails this test instead of silently producing wrong pixels.
+// =========================================================================
+
+fn isGlslIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// Return the RHS expression text of `const float <name> = <expr>;` in
+/// `source`, matching `name` at a word boundary so e.g. "kPQM1" cannot
+/// match inside a longer identifier.
+fn findGlslConstExpr(source: []const u8, name: []const u8) []const u8 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, source, from, name)) |pos| {
+        const before_ok = pos == 0 or !isGlslIdentChar(source[pos - 1]);
+        const after = pos + name.len;
+        const after_ok = after >= source.len or !isGlslIdentChar(source[after]);
+        if (before_ok and after_ok) {
+            const eq = std.mem.indexOfPos(u8, source, after, "=") orelse
+                @panic("hdr_color_math.glsl: no '=' after constant name");
+            const semi = std.mem.indexOfPos(u8, source, eq, ";") orelse
+                @panic("hdr_color_math.glsl: no ';' terminating constant declaration");
+            return source[eq + 1 .. semi];
+        }
+        from = pos + name.len;
+    }
+    @panic("hdr_color_math.glsl: constant not found");
+}
+
+/// Evaluate a GLSL float-literal expression built only from '*' and '/'
+/// (the only forms the constants below use), folding left to right — valid
+/// because '*' and '/' share precedence and associate left-to-right in
+/// both GLSL and Zig.
+fn evalGlslFloatExpr(expr: []const u8) f64 {
+    var result: f64 = 0.0;
+    var have_result = false;
+    var pending_op: u8 = '*';
+    var i: usize = 0;
+    while (i < expr.len) {
+        const c = expr[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '*' or c == '/') {
+            pending_op = c;
+            i += 1;
+            continue;
+        }
+        const start = i;
+        while (i < expr.len and (std.ascii.isDigit(expr[i]) or expr[i] == '.')) : (i += 1) {}
+        if (i == start) @panic("hdr_color_math.glsl: unexpected character in constant expression");
+        const value = std.fmt.parseFloat(f64, expr[start..i]) catch
+            @panic("hdr_color_math.glsl: bad float literal in constant expression");
+        if (!have_result) {
+            result = value;
+            have_result = true;
+        } else if (pending_op == '*') {
+            result *= value;
+        } else {
+            result /= value;
+        }
+    }
+    return result;
+}
+
+fn expectGlslConstMatchesZig(source: []const u8, glsl_name: []const u8, zig_value: f64) !void {
+    const glsl_value = evalGlslFloatExpr(findGlslConstExpr(source, glsl_name));
+    const tol = @abs(zig_value) * 1e-9 + 1e-12;
+    try testing.expect(@abs(glsl_value - zig_value) <= tol);
+}
+
+test "GLSL HDR constants match the Zig constants they mirror" {
+    const source = shaders.hdr_color_math_glsl;
+    try expectGlslConstMatchesZig(source, "kPQM1", pq_m1);
+    try expectGlslConstMatchesZig(source, "kPQM2", pq_m2);
+    try expectGlslConstMatchesZig(source, "kPQC1", pq_c1);
+    try expectGlslConstMatchesZig(source, "kPQC2", pq_c2);
+    try expectGlslConstMatchesZig(source, "kPQC3", pq_c3);
+    try expectGlslConstMatchesZig(source, "kPQPeak", pq_peak);
+    try expectGlslConstMatchesZig(source, "kHLGA", hlg_a);
+    try expectGlslConstMatchesZig(source, "kHLGB", hlg_b);
+    try expectGlslConstMatchesZig(source, "kHLGC", hlg_c);
+    try expectGlslConstMatchesZig(source, "kReferenceWhite", reference_white);
 }

@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const backend = @import("backend.zig");
+const shaders = @import("shaders.zig");
 
 /// Size in bytes of the packed push-constant block (see layout above).
 pub const push_constant_size: u32 = 32;
@@ -259,4 +260,77 @@ test "Push constant: does not write past byte 31" {
     // packPushConstants. Spot-check the first and last written bytes.
     try testing.expectEqual(0, buf[2]);
     try testing.expectEqual(0, buf[2 + push_constant_size - 1]);
+}
+
+// =========================================================================
+// GLSL layout-mirroring guard.
+//
+// Parses the `layout(push_constant, std430) uniform Params {...}` block out
+// of the embedded shader source text and checks its member order, names,
+// and types against PushConstants, so a field reorder/retype/rename on
+// either side fails this test instead of silently corrupting GPU memory.
+// =========================================================================
+
+/// Extract the member-declaration text between the braces of the shader's
+/// `uniform Params { ... }` block.
+fn extractGlslParamsBlock(source: []const u8) []const u8 {
+    const marker = "uniform Params {";
+    const start = std.mem.indexOf(u8, source, marker) orelse
+        @panic("nv12_to_rgb.glsl: Params uniform block not found");
+    const body_start = start + marker.len;
+    const end = std.mem.indexOfPos(u8, source, body_start, "}") orelse
+        @panic("nv12_to_rgb.glsl: unterminated Params uniform block");
+    return source[body_start..end];
+}
+
+const GlslMember = struct {
+    type_name: []const u8,
+    field_name: []const u8,
+};
+
+/// Parse the one-member-per-line declarations inside a `Params` block body,
+/// stripping `//` comments (including comment-only continuation lines).
+fn parseGlslMembers(allocator: std.mem.Allocator, block: []const u8) ![]GlslMember {
+    var members: std.ArrayList(GlslMember) = .empty;
+    errdefer members.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |raw_line| {
+        var line = raw_line;
+        if (std.mem.indexOf(u8, line, "//")) |c| line = line[0..c];
+        line = std.mem.trim(u8, line, " \t\r");
+        if (line.len == 0) continue;
+        if (!std.mem.endsWith(u8, line, ";"))
+            @panic("nv12_to_rgb.glsl: expected ';'-terminated Params member");
+        const decl = std.mem.trim(u8, line[0 .. line.len - 1], " \t");
+        var it = std.mem.tokenizeAny(u8, decl, " \t");
+        const type_tok = it.next() orelse @panic("nv12_to_rgb.glsl: missing type in Params member");
+        const name_tok = it.next() orelse @panic("nv12_to_rgb.glsl: missing name in Params member");
+        if (it.next() != null) @panic("nv12_to_rgb.glsl: unexpected extra token in Params member");
+        try members.append(allocator, .{ .type_name = type_tok, .field_name = name_tok });
+    }
+    return members.toOwnedSlice(allocator);
+}
+
+/// Whether a GLSL std430 scalar type name matches a Zig field type.
+fn glslTypeMatchesZig(glsl_type: []const u8, comptime T: type) bool {
+    if (std.mem.eql(u8, glsl_type, "uint")) return T == u32;
+    if (std.mem.eql(u8, glsl_type, "int")) return T == i32;
+    if (std.mem.eql(u8, glsl_type, "float")) return T == f32;
+    return false;
+}
+
+test "GLSL push-constant layout matches PushConstants field order" {
+    const allocator = testing.allocator;
+    const block = extractGlslParamsBlock(shaders.nv12_to_rgb_glsl);
+    const members = try parseGlslMembers(allocator, block);
+    defer allocator.free(members);
+
+    const zig_fields = @typeInfo(PushConstants).@"struct".fields;
+    try testing.expectEqual(zig_fields.len, members.len);
+
+    inline for (zig_fields, 0..) |field, i| {
+        const m = members[i];
+        try testing.expectEqualStrings(field.name, m.field_name);
+        try testing.expect(glslTypeMatchesZig(m.type_name, field.type));
+    }
 }
