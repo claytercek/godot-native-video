@@ -96,13 +96,17 @@ test "MF_VERSION is 0x00020070" {
 
 // ---------------------------------------------------------------------------
 // Runtime smoke test — proves linkage, calling conventions, and the hot-path
-// vtable slot positions on real hardware. Requires a D3D11-capable GPU; this
-// repo's CI is macOS-only, so gating on hardware here is fine.
+// vtable slot positions. Prefers a real hardware D3D11 device, but CI runners
+// have no GPU, so it falls back to the WARP software rasterizer (and, since
+// WARP doesn't reliably support VIDEO_SUPPORT, to WARP without that flag) so
+// the vtable/linkage checks below still run; if every driver fails to come up
+// the test skips rather than failing.
 //
 // Path: CoInitializeEx -> MFStartup -> MFCreateAttributes (+ set/get a UINT32
-// attribute) -> D3D11CreateDevice (hardware, VIDEO|BGRA) -> QI ID3D10Multithread
-// -> SetMultithreadProtected(TRUE) -> MFCreateDXGIDeviceManager + ResetDevice ->
-// release everything -> MFShutdown -> CoUninitialize.
+// attribute) -> D3D11CreateDevice (hardware, falling back to WARP, VIDEO|BGRA)
+// -> QI ID3D10Multithread -> SetMultithreadProtected(TRUE) ->
+// MFCreateDXGIDeviceManager + ResetDevice -> release everything -> MFShutdown
+// -> CoUninitialize.
 // ---------------------------------------------------------------------------
 test "runtime: MF + D3D11 device manager round-trip" {
     const t = std.testing;
@@ -124,15 +128,20 @@ test "runtime: MF + D3D11 device manager round-trip" {
     try t.expect(com.SUCCEEDED(attrs.?.GetUINT32(&mf.MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, &got)));
     try t.expectEqual(@as(u32, 1), got);
 
-    // --- D3D11 hardware device with the video-decode flags. ---
+    // --- D3D11 device with the video-decode flags. Hardware first, so this
+    // machine (which has a GPU) still exercises the real path; fall back to
+    // WARP for GPU-less CI runners, and if WARP rejects VIDEO_SUPPORT too,
+    // drop it — this test is proving vtable slots/linkage, not decode. ---
     var device: ?*d3d11.ID3D11Device = null;
     var context: ?*d3d11.ID3D11DeviceContext = null;
     var feature_level: d3d11.D3D_FEATURE_LEVEL = d3d11.D3D_FEATURE_LEVEL_11_0;
-    const hr_dev = d3d11.D3D11CreateDevice(
+    const video_flags = d3d11.D3D11_CREATE_DEVICE_BGRA_SUPPORT | d3d11.D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+
+    var hr_dev = d3d11.D3D11CreateDevice(
         null,
         d3d11.D3D_DRIVER_TYPE_HARDWARE,
         null,
-        d3d11.D3D11_CREATE_DEVICE_BGRA_SUPPORT | d3d11.D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        video_flags,
         null,
         0,
         d3d11.D3D11_SDK_VERSION,
@@ -140,7 +149,35 @@ test "runtime: MF + D3D11 device manager round-trip" {
         &feature_level,
         &context,
     );
-    if (com.FAILED(hr_dev)) return error.SkipZigTest; // no D3D11 GPU available
+    if (com.FAILED(hr_dev)) {
+        hr_dev = d3d11.D3D11CreateDevice(
+            null,
+            d3d11.D3D_DRIVER_TYPE_WARP,
+            null,
+            video_flags,
+            null,
+            0,
+            d3d11.D3D11_SDK_VERSION,
+            &device,
+            &feature_level,
+            &context,
+        );
+    }
+    if (com.FAILED(hr_dev)) {
+        hr_dev = d3d11.D3D11CreateDevice(
+            null,
+            d3d11.D3D_DRIVER_TYPE_WARP,
+            null,
+            d3d11.D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            null,
+            0,
+            d3d11.D3D11_SDK_VERSION,
+            &device,
+            &feature_level,
+            &context,
+        );
+    }
+    if (com.FAILED(hr_dev)) return error.SkipZigTest; // no D3D11 device available (hardware or WARP)
     defer _ = device.?.Release();
     defer _ = context.?.Release();
 

@@ -43,6 +43,9 @@ pub const ID3D11ShaderResourceView = opaque {};
 pub const D3D_DRIVER_TYPE = i32;
 pub const D3D_DRIVER_TYPE_UNKNOWN: D3D_DRIVER_TYPE = 0;
 pub const D3D_DRIVER_TYPE_HARDWARE: D3D_DRIVER_TYPE = 1;
+// Software rasterizer fallback (d3dcommon.h) — used where no GPU is present,
+// e.g. CI runners.
+pub const D3D_DRIVER_TYPE_WARP: D3D_DRIVER_TYPE = 5;
 
 pub const D3D_FEATURE_LEVEL = i32;
 pub const D3D_FEATURE_LEVEL_11_0: D3D_FEATURE_LEVEL = 0xb000;
