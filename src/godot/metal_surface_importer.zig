@@ -359,12 +359,12 @@ pub const MetalSurfaceImporter = struct {
         if (is_10bit) {
             // 10-bit biplanar: each sample stored in 16 bits (lower 10 bits
             // valid). Metal texture: R16Unorm luma, RG16Unorm interleaved chroma.
-            luma = importPlane(rd, cache, pb, 0, .data_format_r16_unorm, mtl_pixel_format_r16_unorm, donate, &cv_luma);
-            chroma = importPlane(rd, cache, pb, 1, .data_format_r16g16_unorm, mtl_pixel_format_rg16_unorm, donate, &cv_chroma);
+            luma = importPlane(rd, cache, pb, 0, si.planeFormat(true, false), mtl_pixel_format_r16_unorm, donate, &cv_luma);
+            chroma = importPlane(rd, cache, pb, 1, si.planeFormat(true, true), mtl_pixel_format_rg16_unorm, donate, &cv_chroma);
         } else {
             // 8-bit NV12: each sample a single byte. R8 + RG8.
-            luma = importPlane(rd, cache, pb, 0, .data_format_r8_unorm, mtl_pixel_format_r8_unorm, donate, &cv_luma);
-            chroma = importPlane(rd, cache, pb, 1, .data_format_r8g8_unorm, mtl_pixel_format_rg8_unorm, donate, &cv_chroma);
+            luma = importPlane(rd, cache, pb, 0, si.planeFormat(false, false), mtl_pixel_format_r8_unorm, donate, &cv_luma);
+            chroma = importPlane(rd, cache, pb, 1, si.planeFormat(false, true), mtl_pixel_format_rg8_unorm, donate, &cv_chroma);
         }
 
         if (!luma.isValid()) {
@@ -403,6 +403,14 @@ pub const MetalSurfaceImporter = struct {
         out.height = @intCast(CVPixelBufferGetHeightOfPlane(pb, 0));
         out.release = release;
         return out;
+    }
+
+    /// Metal is always zero-copy: nothing here ever violates the contract, so
+    /// the count is always zero. Present purely so PresentPipeline can query
+    /// cpuCopyCount() through the same call shape on every platform.
+    pub fn cpuCopyCount(self: *const MetalSurfaceImporter) u64 {
+        _ = self;
+        return 0;
     }
 
     /// Release importer state (the owned CVMetalTextureCache). The importer

@@ -14,7 +14,6 @@ pub const shaders = @import("shaders.zig");
 pub const clock = @import("clock.zig");
 pub const scrubber = @import("scrubber.zig");
 pub const present_selector = @import("present_selector.zig");
-pub const importer_selector = @import("importer_selector.zig");
 pub const hdr_color_math = @import("hdr_color_math.zig");
 pub const push_constants = @import("push_constants.zig");
 pub const sys_clock = @import("sys_clock.zig");

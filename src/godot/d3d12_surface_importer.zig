@@ -81,6 +81,9 @@ const d3dcompiler = win.d3dcompiler;
 const si = @import("surface_importer.zig");
 const PlaneTextures = si.PlaneTextures;
 
+const wic = @import("windows_import_common.zig");
+const CachedTex2D = wic.CachedTex2D;
+
 const log = std.log.scoped(.native_video_d3d12_import);
 
 // -----------------------------------------------------------------------
@@ -186,10 +189,7 @@ pub const D3D12SurfaceImporter = struct {
 
     // Intermediate NV12/P010 texture the decoder slice is blitted into, cached
     // and reused (recreated only on size/format change).
-    intermediate: ?*d3d11.ID3D11Texture2D = null,
-    intermediate_width: com.UINT = 0,
-    intermediate_height: com.UINT = 0,
-    intermediate_format: dxgi.DXGI_FORMAT = dxgi.DXGI_FORMAT_UNKNOWN,
+    intermediate: CachedTex2D = .{},
 
     // Shared D3D11.4/D3D12 fence: one persistent object; import() increments
     // next_fence_value and signals after the plane-split pass.
@@ -249,16 +249,13 @@ pub const D3D12SurfaceImporter = struct {
 
         // Bind to the SAME device the decoder texture lives on. GetDevice /
         // GetImmediateContext AddRef; teardown() Releases both.
-        var dev_out: ?*d3d11.ID3D11Device = null;
-        decoded.GetDevice(&dev_out);
-        const dev11 = dev_out orelse {
+        const bound = wic.bindDecoderDevice(decoded) orelse {
             log.err("init: ID3D11Texture2D.GetDevice failed.", .{});
             return false;
         };
-        self.device = dev11;
-        var ctx_out: ?*d3d11.ID3D11DeviceContext = null;
-        dev11.GetImmediateContext(&ctx_out);
-        self.context = ctx_out;
+        self.device = bound.device;
+        self.context = bound.context;
+        const dev11 = bound.device;
 
         const d3d12_device = self.d3d12_device.?;
 
@@ -377,50 +374,24 @@ pub const D3D12SurfaceImporter = struct {
 
         var src_desc: d3d11.D3D11_TEXTURE2D_DESC = undefined;
         decoded.GetDesc(&src_desc);
-        const is_10bit = src_desc.Format == dxgi.DXGI_FORMAT_P010;
-        if (!is_10bit and src_desc.Format != dxgi.DXGI_FORMAT_NV12) {
+        const is_10bit = wic.detectBitDepth(src_desc.Format) orelse {
             log.err("decoder texture is not NV12 or P010.", .{});
             return out;
-        }
+        };
         const width: com.UINT = src_desc.Width;
         const height: com.UINT = src_desc.Height;
         const chroma_width = width / 2;
         const chroma_height = height / 2;
 
-        const luma_format: dxgi.DXGI_FORMAT = if (is_10bit) dxgi.DXGI_FORMAT_R16_UNORM else dxgi.DXGI_FORMAT_R8_UNORM;
-        const chroma_format: dxgi.DXGI_FORMAT = if (is_10bit) dxgi.DXGI_FORMAT_R16G16_UNORM else dxgi.DXGI_FORMAT_R8G8_UNORM;
+        const luma_format = dxgiPlaneFormat(is_10bit, false);
+        const chroma_format = dxgiPlaneFormat(is_10bit, true);
 
         // --- 1. GPU-blit the decoder slice into the cached intermediate. ---
-        if (self.intermediate == null or self.intermediate_width != width or
-            self.intermediate_height != height or self.intermediate_format != src_desc.Format)
-        {
-            if (self.intermediate) |t| {
-                com.release(t);
-                self.intermediate = null;
-            }
-            var inter_desc = std.mem.zeroes(d3d11.D3D11_TEXTURE2D_DESC);
-            inter_desc.Width = width;
-            inter_desc.Height = height;
-            inter_desc.MipLevels = 1;
-            inter_desc.ArraySize = 1;
-            inter_desc.Format = src_desc.Format;
-            inter_desc.SampleDesc.Count = 1;
-            inter_desc.Usage = d3d11.D3D11_USAGE_DEFAULT;
-            inter_desc.BindFlags = d3d11.D3D11_BIND_SHADER_RESOURCE;
-            var inter_out: ?*d3d11.ID3D11Texture2D = null;
-            if (com.FAILED(device.CreateTexture2D(&inter_desc, null, &inter_out))) {
-                log.err("intermediate texture create failed.", .{});
-                self.intermediate_width = 0;
-                self.intermediate_height = 0;
-                self.intermediate_format = dxgi.DXGI_FORMAT_UNKNOWN;
-                return out;
-            }
-            self.intermediate = inter_out;
-            self.intermediate_width = width;
-            self.intermediate_height = height;
-            self.intermediate_format = src_desc.Format;
+        if (!self.intermediate.ensure(device, width, height, src_desc.Format, d3d11.D3D11_USAGE_DEFAULT, d3d11.D3D11_BIND_SHADER_RESOURCE, 0)) {
+            log.err("intermediate texture create failed.", .{});
+            return out;
         }
-        const intermediate = self.intermediate.?;
+        const intermediate = self.intermediate.texture.?;
         context.CopySubresourceRegion(intermediate.asResource(), 0, 0, 0, 0, decoded.asResource(), @intCast(plane_slice), null);
 
         // --- 2. PlaneSlice SRVs over the intermediate. ---
@@ -615,10 +586,7 @@ pub const D3D12SurfaceImporter = struct {
             com.release(p);
             self.device3 = null;
         }
-        if (self.intermediate) |p| {
-            com.release(p);
-            self.intermediate = null;
-        }
+        self.intermediate.release();
         if (self.d3d12_fence) |p| {
             com.release(p);
             self.d3d12_fence = null;
@@ -668,14 +636,21 @@ fn makeOutputTexture(device: *d3d11.ID3D11Device, format: dxgi.DXGI_FORMAT, w: c
     return com.SUCCEEDED(device.CreateTexture2D(&desc, null, out));
 }
 
+/// The DXGI_FORMAT sibling of si.planeFormat: same is_10bit x is_chroma ->
+/// r8/r16/rg8/rg16 selection, but for the DXGI enum the D3D11-side SRV/UAV
+/// views need instead of RenderingDevice.DataFormat.
+fn dxgiPlaneFormat(is_10bit: bool, is_chroma: bool) dxgi.DXGI_FORMAT {
+    return if (is_chroma)
+        (if (is_10bit) dxgi.DXGI_FORMAT_R16G16_UNORM else dxgi.DXGI_FORMAT_R8G8_UNORM)
+    else
+        (if (is_10bit) dxgi.DXGI_FORMAT_R16_UNORM else dxgi.DXGI_FORMAT_R8_UNORM);
+}
+
 /// texture_create_from_extension for one plane. `is_chroma` picks the RG format;
 /// COLOR_ATTACHMENT usage works around the D3D12 RD driver's RENDER_TARGET
 /// initial-state tracking.
 fn createFromExtension(rd: *RenderingDevice, is_10bit: bool, is_chroma: bool, resource: *d3d12.ID3D12Resource, w: com.UINT, h: com.UINT) Rid {
-    const fmt: RenderingDevice.DataFormat = if (is_chroma)
-        (if (is_10bit) .data_format_r16g16_unorm else .data_format_r8g8_unorm)
-    else
-        (if (is_10bit) .data_format_r16_unorm else .data_format_r8_unorm);
+    const fmt = si.planeFormat(is_10bit, is_chroma);
     return rd.textureCreateFromExtension(
         .texture_type_2d,
         fmt,

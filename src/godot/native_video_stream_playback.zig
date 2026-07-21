@@ -68,6 +68,7 @@ const log = std.log.scoped(.native_video);
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStreamPlayback, r.allocator, .auto);
     class.addMethod("get_color_info", .auto);
+    class.addMethod("get_cpu_copy_count", .auto);
     // output_mode (SDR,HDR) enum property, backed by set/get methods.
     class.addProperty("output_mode", .{
         .hint = .property_hint_enum,
@@ -313,4 +314,13 @@ pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     // in an HDR viewport vs a native HDR clip.
     setDict(&info, "output_mode", @intFromEnum(self.present.outputMode()));
     return info;
+}
+
+/// Frames imported through the Windows CPU-copy path so far this playback
+/// session — the one sanctioned exception to the zero-copy contract, counted
+/// honestly whether this session ran CPU-copy from the start or degraded
+/// into it mid-flight from a failed D3D12 zero-copy attempt. Always 0 on
+/// macOS (Metal is always zero-copy).
+pub fn getCpuCopyCount(self: *NativeVideoStreamPlayback) i64 {
+    return @intCast(self.present.cpuCopyCount());
 }

@@ -7,7 +7,7 @@
 //! metal_surface_importer.zig on macOS (CVPixelBuffer IOSurface -> MTLTexture
 //! via CVMetalTextureCache -> RenderingDevice.textureCreateFromExtension); on
 //! Windows, a D3D12 zero-copy importer and a CPU-copy fallback are chosen at
-//! runtime by core.importer_selector from the active RenderingDevice driver
+//! runtime by importer_selector from the active RenderingDevice driver
 //! and Godot version. A third Windows path — a Vulkan external-memory /
 //! DXGI shared-handle zero-copy importer — is a known limitation: it is not
 //! ported, blocked on an upstream Godot texture-import aspect fix (see
@@ -72,12 +72,6 @@ pub const PlaneTextures = struct {
     width: i32 = 0, // luma (frame) width
     height: i32 = 0, // luma (frame) height
 
-    /// Multiplier the present shader applies when recovering 10-bit code values
-    /// from a sampled plane texel: code = texel * 65535 * sample_scale. Every
-    /// Import Path that materialises its planes right-justified leaves this at
-    /// 1.0; the Windows DXGI P010 import (out of scope here) is the exception.
-    sample_scale: f32 = 1.0,
-
     /// Optional GPU-submission-ordering hook the present pipeline calls once,
     /// BEFORE the compute dispatch that samples the planes. Empty (a no-op) for
     /// importers that share one device with the decoder (Metal) or copy through
@@ -108,4 +102,36 @@ pub const PlaneTextures = struct {
 pub fn freePlaneRids(rd: *RenderingDevice, luma: Rid, chroma: Rid) void {
     if (luma.isValid()) rd.freeRid(luma);
     if (chroma.isValid()) rd.freeRid(chroma);
+}
+
+/// The RD plane-texture DataFormat for one plane: r8/r16 for luma, rg8/rg16
+/// for chroma, selected by bit depth. Every importer that materialises
+/// ordinary right-justified R/RG plane textures (CPU-copy, D3D12, Metal)
+/// picks its formats through here.
+pub fn planeFormat(is_10bit: bool, is_chroma: bool) RenderingDevice.DataFormat {
+    return if (is_chroma)
+        (if (is_10bit) .data_format_r16g16_unorm else .data_format_r8g8_unorm)
+    else
+        (if (is_10bit) .data_format_r16_unorm else .data_format_r8_unorm);
+}
+
+/// Release payload for the common case: two RD plane RIDs and nothing else
+/// (no native import wrapper to tear down). Importers with extra teardown
+/// work (D3D12's shared resources, Metal's CVMetalTexture wrappers) box
+/// their own richer release value instead.
+const PlaneReleaseValue = struct {
+    rd: *RenderingDevice,
+    luma: Rid,
+    chroma: Rid,
+};
+
+fn planeReleaseTeardown(v: *PlaneReleaseValue) void {
+    freePlaneRids(v.rd, v.luma, v.chroma);
+}
+
+/// Box a release Closure that just frees the two plane RIDs via
+/// freePlaneRids. Shared by every importer whose plane textures need no
+/// other teardown.
+pub fn boxPlaneRelease(allocator: std.mem.Allocator, rd: *RenderingDevice, luma: Rid, chroma: Rid) !Closure {
+    return boxClosure(allocator, PlaneReleaseValue{ .rd = rd, .luma = luma, .chroma = chroma }, planeReleaseTeardown);
 }

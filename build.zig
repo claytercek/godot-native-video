@@ -25,6 +25,18 @@ pub fn build(b: *Build) !void {
     const test_step = b.step("test", "Run core unit tests (no Godot needed)");
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Windows import-path selector: lives in src/godot/ (it picks between the
+    // D3D12 zero-copy and CPU-copy surface importers) but is a pure function
+    // with zero Godot dependencies, so its tests run standalone here rather
+    // than needing the full extension build.
+    const importer_selector_mod = b.createModule(.{
+        .root_source_file = b.path("src/godot/importer_selector.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const importer_selector_tests = b.addTest(.{ .root_module = importer_selector_mod });
+    test_step.dependOn(&b.addRunArtifact(importer_selector_tests).step);
+
     // --- Media Foundation Windows bindings (Windows only). ---
     // Hand-written OS bindings layer that the eventual MF decoder backend and
     // the D3D11/D3D12 surface importers build on. Its own module so the future

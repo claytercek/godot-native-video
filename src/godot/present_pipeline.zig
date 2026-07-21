@@ -158,6 +158,14 @@ pub const PresentPipeline = struct {
         return self.output_mode;
     }
 
+    /// Frames imported through the CPU-copy path so far this session (always
+    /// 0 on macOS, and on Windows until/unless the importer is or degrades to
+    /// CPU-copy). See WindowsSurfaceImporter.cpuCopyCount / CpuCopySurfaceImporter.
+    pub fn cpuCopyCount(self: *const PresentPipeline) u64 {
+        if (self.importer) |*importer| return importer.cpuCopyCount();
+        return 0;
+    }
+
     /// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
     /// next ensureReady() call — the ring texture format changes (rgba8 vs
     /// rgba16f), so buildResources() rebuilds everything, shader included.
@@ -386,11 +394,10 @@ pub const PresentPipeline = struct {
             return false;
         }
 
-        // Push constant: output dimensions + colorimetry + bit depth + the
-        // importer's 10-bit sample scale (std430, push_constant_size bytes).
-        // Repacked into the reusable, pre-sized scratch buffer — no per-frame
-        // alloc.
-        self.packPushConstants(frame, planes.sample_scale);
+        // Push constant: output dimensions + colorimetry + bit depth (std430,
+        // push_constant_size bytes). Repacked into the reusable, pre-sized
+        // scratch buffer — no per-frame alloc.
+        self.packPushConstants(frame);
 
         // --- ONE compute dispatch: NV12 -> RGBA into the engine-owned slot. ---
         const gx: u32 = @intCast(@divTrunc(self.width + 7, 8));
@@ -464,10 +471,10 @@ pub const PresentPipeline = struct {
     }
 
     /// Repack the compute shader's push constants (output dimensions +
-    /// colorimetry + bit depth + the importer's 10-bit sample scale) into the
-    /// reusable push_scratch buffer (sized once in buildResources), ready for
-    /// rd.computeListSetPushConstant(). No allocation.
-    fn packPushConstants(self: *PresentPipeline, frame: VideoFrame, sample_scale: f32) void {
+    /// colorimetry + bit depth) into the reusable push_scratch buffer (sized
+    /// once in buildResources), ready for rd.computeListSetPushConstant(). No
+    /// allocation.
+    fn packPushConstants(self: *PresentPipeline, frame: VideoFrame) void {
         // Pack into a stack buffer, then copy into push_scratch's own storage.
         var buf: [push_constants.push_constant_size]u8 = undefined;
         push_constants.packPushConstants(
@@ -475,7 +482,6 @@ pub const PresentPipeline = struct {
             @intCast(self.width),
             @intCast(self.height),
             frame.color,
-            sample_scale,
         );
         // index(0) detaches push_scratch's CoW storage and hands back its
         // unique buffer (same idiom as the audio mix path), so the memcpy

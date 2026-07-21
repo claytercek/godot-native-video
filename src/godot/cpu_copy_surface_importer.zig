@@ -54,6 +54,9 @@ const d3d11 = win.d3d11;
 const si = @import("surface_importer.zig");
 const PlaneTextures = si.PlaneTextures;
 
+const wic = @import("windows_import_common.zig");
+const CachedTex2D = wic.CachedTex2D;
+
 const log = std.log.scoped(.native_video_cpu_copy_import);
 
 /// Ring depth matches PresentPipeline's frame latency: the same number of
@@ -62,32 +65,9 @@ const log = std.log.scoped(.native_video_cpu_copy_import);
 const readback_ring_depth: usize = 3;
 
 const ReadbackSlot = struct {
-    staging: ?*d3d11.ID3D11Texture2D = null,
-    width: i32 = 0,
-    height: i32 = 0,
-    format: dxgi.DXGI_FORMAT = dxgi.DXGI_FORMAT_UNKNOWN,
+    staging: CachedTex2D = .{},
     has_data: bool = false, // true once a CopySubresourceRegion has targeted it
-
-    fn releaseStaging(self: *ReadbackSlot) void {
-        if (self.staging) |t| {
-            com.release(t);
-            self.staging = null;
-        }
-    }
 };
-
-/// Per-frame release payload: the two RD plane RIDs. No native wrappers to
-/// release — the CPU-copy path aliases nothing (its planes are ordinary RD
-/// textures), so teardown is just free_plane_rids.
-const ReleaseValue = struct {
-    rd: *RenderingDevice,
-    luma: Rid,
-    chroma: Rid,
-};
-
-fn releaseTeardown(v: *ReleaseValue) void {
-    si.freePlaneRids(v.rd, v.luma, v.chroma);
-}
 
 pub const CpuCopySurfaceImporter = struct {
     allocator: std.mem.Allocator,
@@ -102,6 +82,13 @@ pub const CpuCopySurfaceImporter = struct {
     ring: [readback_ring_depth]ReadbackSlot = @splat(.{}),
     frame_index: u64 = 0,
     initialized: bool = false,
+
+    // Session-scoped: every frame actually imported through this path, honest
+    // accounting for the one importer allowed to violate the zero-copy
+    // contract. Persists across a mid-flight D3D12->CPU-copy degrade, since
+    // the WindowsSurfaceImporter wrapper keeps reusing the same instance for
+    // the rest of the session once it switches over.
+    cpu_copy_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) CpuCopySurfaceImporter {
         return .{ .allocator = allocator };
@@ -131,26 +118,22 @@ pub const CpuCopySurfaceImporter = struct {
 
         // Lazily bind to the SAME device the decoder texture lives on.
         if (self.device == null) {
-            var dev: ?*d3d11.ID3D11Device = null;
-            decoded.GetDevice(&dev);
-            self.device = dev orelse {
+            const bound = wic.bindDecoderDevice(decoded) orelse {
                 log.err("CPU-copy importer: ID3D11Texture2D.GetDevice failed.", .{});
                 return out;
             };
-            var ctx: ?*d3d11.ID3D11DeviceContext = null;
-            self.device.?.GetImmediateContext(&ctx);
-            self.context = ctx;
+            self.device = bound.device;
+            self.context = bound.context;
         }
         const device = self.device.?;
         const context = self.context.?;
 
         var src_desc: d3d11.D3D11_TEXTURE2D_DESC = undefined;
         decoded.GetDesc(&src_desc);
-        const is_10bit = src_desc.Format == dxgi.DXGI_FORMAT_P010;
-        if (!is_10bit and src_desc.Format != dxgi.DXGI_FORMAT_NV12) {
+        const is_10bit = wic.detectBitDepth(src_desc.Format) orelse {
             log.err("CPU-copy importer: decoder texture is not NV12 or P010.", .{});
             return out;
-        }
+        };
         const width: com.UINT = src_desc.Width;
         const height: com.UINT = src_desc.Height;
 
@@ -162,31 +145,12 @@ pub const CpuCopySurfaceImporter = struct {
         // --- Queue this frame's GPU-side readback into the ring slot with the
         // most time left before it is read. No CPU copy here.
         const write = &self.ring[write_slot];
-        if (write.staging == null or write.width != @as(i32, @intCast(width)) or
-            write.height != @as(i32, @intCast(height)) or write.format != src_desc.Format)
-        {
-            write.releaseStaging();
-            var desc = std.mem.zeroes(d3d11.D3D11_TEXTURE2D_DESC);
-            desc.Width = width;
-            desc.Height = height;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.Format = src_desc.Format;
-            desc.SampleDesc.Count = 1;
-            desc.Usage = d3d11.D3D11_USAGE_STAGING;
-            desc.CPUAccessFlags = d3d11.D3D11_CPU_ACCESS_READ;
-            var tex: ?*d3d11.ID3D11Texture2D = null;
-            if (com.FAILED(device.CreateTexture2D(&desc, null, &tex))) {
-                log.err("CPU-copy importer: staging texture create failed.", .{});
-                return out;
-            }
-            write.staging = tex;
-            write.width = @intCast(width);
-            write.height = @intCast(height);
-            write.format = src_desc.Format;
+        if (!write.staging.ensure(device, width, height, src_desc.Format, d3d11.D3D11_USAGE_STAGING, 0, d3d11.D3D11_CPU_ACCESS_READ)) {
+            log.err("CPU-copy importer: staging texture create failed.", .{});
+            return out;
         }
         context.CopySubresourceRegion(
-            write.staging.?.asResource(),
+            write.staging.texture.?.asResource(),
             0,
             0,
             0,
@@ -202,13 +166,13 @@ pub const CpuCopySurfaceImporter = struct {
         if (!read.has_data) return out;
 
         var mapped = std.mem.zeroes(d3d11.D3D11_MAPPED_SUBRESOURCE);
-        if (com.FAILED(context.Map(read.staging.?.asResource(), 0, d3d11.D3D11_MAP_READ, 0, &mapped))) {
+        if (com.FAILED(context.Map(read.staging.texture.?.asResource(), 0, d3d11.D3D11_MAP_READ, 0, &mapped))) {
             log.err("CPU-copy importer: staging texture Map failed.", .{});
             return out;
         }
 
-        const luma_width: usize = @intCast(read.width);
-        const luma_height: usize = @intCast(read.height);
+        const luma_width: usize = @intCast(read.staging.width);
+        const luma_height: usize = @intCast(read.staging.height);
         const chroma_width = luma_width / 2;
         const chroma_height = luma_height / 2;
         const row_pitch: usize = mapped.RowPitch;
@@ -230,12 +194,12 @@ pub const CpuCopySurfaceImporter = struct {
         defer luma_bytes.deinit();
         defer chroma_bytes.deinit();
 
-        context.Unmap(read.staging.?.asResource(), 0);
+        context.Unmap(read.staging.texture.?.asResource(), 0);
 
         // --- Ordinary texture_create + texture_update — no aliased import.
         const rd = self.rd.?;
-        const luma_fmt: RenderingDevice.DataFormat = if (is_10bit) .data_format_r16_unorm else .data_format_r8_unorm;
-        const chroma_fmt: RenderingDevice.DataFormat = if (is_10bit) .data_format_r16g16_unorm else .data_format_r8g8_unorm;
+        const luma_fmt = si.planeFormat(is_10bit, false);
+        const chroma_fmt = si.planeFormat(is_10bit, true);
 
         const luma = createPlane(rd, luma_fmt, @intCast(luma_width), @intCast(luma_height));
         const chroma = createPlane(rd, chroma_fmt, @intCast(chroma_width), @intCast(chroma_height));
@@ -250,11 +214,7 @@ pub const CpuCopySurfaceImporter = struct {
             return out;
         }
 
-        const release = si.boxClosure(self.allocator, ReleaseValue{
-            .rd = rd,
-            .luma = luma,
-            .chroma = chroma,
-        }, releaseTeardown) catch {
+        const release = si.boxPlaneRelease(self.allocator, rd, luma, chroma) catch {
             si.freePlaneRids(rd, luma, chroma);
             return out;
         };
@@ -264,11 +224,19 @@ pub const CpuCopySurfaceImporter = struct {
         out.width = @intCast(luma_width);
         out.height = @intCast(luma_height);
         out.release = release;
+        // Honest accounting: this is the one import path allowed to violate
+        // the zero-copy contract, so every frame it actually hands back counts.
+        self.cpu_copy_count += 1;
         return out;
     }
 
+    /// Frames imported through this CPU-copy path so far this session.
+    pub fn cpuCopyCount(self: *const CpuCopySurfaceImporter) u64 {
+        return self.cpu_copy_count;
+    }
+
     pub fn deinit(self: *CpuCopySurfaceImporter) void {
-        for (&self.ring) |*slot| slot.releaseStaging();
+        for (&self.ring) |*slot| slot.staging.release();
         if (self.context) |c| {
             com.release(c);
             self.context = null;

@@ -6,7 +6,7 @@
 //! fallback. The choice depends only on the active RD driver name and the Godot
 //! version, so at initialize() this thin wrapper reads both from Godot's
 //! singletons (RenderingServer + Engine), asks the pure
-//! core.importer_selector.selectImporter which path to take, instantiates that
+//! importer_selector.selectImporter which path to take, instantiates that
 //! concrete importer, and delegates every later call to it. This is the ONE
 //! place the driver/version selection happens — the present pipeline stays
 //! platform- and driver-agnostic.
@@ -25,9 +25,9 @@ const String = godot.builtin.String;
 const Dictionary = godot.builtin.Dictionary;
 const Variant = godot.builtin.Variant;
 
-const core = @import("core");
-const selectImporter = core.importer_selector.selectImporter;
-const ImporterKind = core.importer_selector.ImporterKind;
+const importer_selector = @import("importer_selector.zig");
+const selectImporter = importer_selector.selectImporter;
+const ImporterKind = importer_selector.ImporterKind;
 
 const si = @import("surface_importer.zig");
 const PlaneTextures = si.PlaneTextures;
@@ -80,9 +80,7 @@ pub const WindowsSurfaceImporter = struct {
                 if (self.concrete.?.d3d12.initialize(rd)) return true;
                 // Could not bind Godot's D3D12 device; fall back permanently.
                 log.warn("D3D12 importer failed to initialize; falling back to CPU-copy import.", .{});
-                self.concrete.?.d3d12.deinit();
-                self.concrete = .{ .cpu_copy = CpuCopySurfaceImporter.init(self.allocator) };
-                return self.concrete.?.cpu_copy.initialize(rd);
+                return self.degradeToCpuCopy(rd);
             },
             .cpu_copy => {
                 self.concrete = .{ .cpu_copy = CpuCopySurfaceImporter.init(self.allocator) };
@@ -110,23 +108,49 @@ pub const WindowsSurfaceImporter = struct {
                 // OpenSharedHandle), degrade to CPU-copy permanently.
                 self.d3d12_probed = true;
                 if (result.valid()) return result;
-                return self.fallbackToCpuCopy(native_handle, plane_slice);
+                log.warn("D3D12 zero-copy import failed on first frame (cross-adapter setup?); falling back to CPU-copy import permanently.", .{});
+                const rd = self.rd orelse return .{};
+                if (!self.degradeToCpuCopy(rd)) return .{};
+                return self.concrete.?.cpu_copy.import(native_handle, plane_slice);
             },
             .cpu_copy => |*imp| return imp.import(native_handle, plane_slice),
         }
     }
 
-    /// Tear down the failed D3D12 importer and switch to the CPU-copy path for
-    /// the rest of this importer's life, then import this frame through it.
-    fn fallbackToCpuCopy(self: *WindowsSurfaceImporter, native_handle: ?*anyopaque, plane_slice: u32) PlaneTextures {
-        log.warn("D3D12 zero-copy import failed on first frame (cross-adapter setup?); falling back to CPU-copy import permanently.", .{});
-        const rd = self.rd orelse return .{};
+    /// Tear down the current D3D12 importer and switch `self.concrete` to a
+    /// freshly constructed CPU-copy importer bound to `rd`, for the rest of
+    /// this importer's life. Called both when initialize() can't bind a D3D12
+    /// device and when the first import() finds the zero-copy pipeline can't
+    /// come up (cross-adapter OpenSharedHandle failure).
+    ///
+    /// Atomic in the sense that matters: `self.concrete` never holds the
+    /// torn-down D3D12 importer once this returns. On failure (cpu_copy itself
+    /// won't initialize — should not happen; texture_create/texture_update
+    /// need no particular RD driver) `self.concrete` is left null rather than
+    /// pointing at an importer that lies about being usable, so callers must
+    /// go through isInitialized()/import(), both of which treat a null
+    /// concrete as "not ready" rather than crashing.
+    fn degradeToCpuCopy(self: *WindowsSurfaceImporter, rd: *RenderingDevice) bool {
         if (self.concrete) |*c| {
             if (c.* == .d3d12) c.d3d12.deinit();
         }
-        self.concrete = .{ .cpu_copy = CpuCopySurfaceImporter.init(self.allocator) };
-        if (!self.concrete.?.cpu_copy.initialize(rd)) return .{};
-        return self.concrete.?.cpu_copy.import(native_handle, plane_slice);
+        self.concrete = null;
+        var cpu_copy = CpuCopySurfaceImporter.init(self.allocator);
+        if (!cpu_copy.initialize(rd)) return false;
+        self.concrete = .{ .cpu_copy = cpu_copy };
+        return true;
+    }
+
+    /// Frames imported through the CPU-copy path so far this session — the
+    /// one sanctioned exception to the zero-copy contract, counted honestly
+    /// whether this session ran CPU-copy from the start or degraded into it
+    /// mid-flight from a failed D3D12 zero-copy attempt.
+    pub fn cpuCopyCount(self: *const WindowsSurfaceImporter) u64 {
+        const c = &(self.concrete orelse return 0);
+        return switch (c.*) {
+            .d3d12 => 0,
+            .cpu_copy => |*imp| imp.cpu_copy_count,
+        };
     }
 
     pub fn deinit(self: *WindowsSurfaceImporter) void {

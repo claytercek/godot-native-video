@@ -6,8 +6,10 @@
 //! only on the active RenderingDevice driver name and the Godot engine
 //! version, so it is expressed here as a pure function with zero Godot
 //! dependencies — selectable and testable on any host, no RenderingDevice
-//! or platform SDK required. The singleton-reading factory shell that calls
-//! this from live Godot/RenderingServer state lives in the Godot layer.
+//! or platform SDK required, even though it lives alongside the Godot-layer
+//! importers it chooses between. windows_surface_importer.zig is the
+//! singleton-reading factory shell that calls this from live Godot/
+//! RenderingServer state.
 //!
 //! main's C++ port also carried a third importer, a Vulkan external-memory
 //! path through DXGI shared handles (zero-copy from the Vulkan driver). It
