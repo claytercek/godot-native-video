@@ -25,6 +25,29 @@ pub fn build(b: *Build) !void {
     const test_step = b.step("test", "Run core unit tests (no Godot needed)");
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // --- Media Foundation Windows bindings (Windows only). ---
+    // Hand-written OS bindings layer that the eventual MF decoder backend and
+    // the D3D11/D3D12 surface importers build on. Its own module so the future
+    // backend can import "core" without escaping a module root, mirroring how
+    // avf_mod is wired below. The runtime bindings test is folded into the main
+    // `test` step; it exercises real MF + D3D11 objects, so it needs Windows and
+    // a D3D11-capable GPU (it SkipZigTests when no device is available).
+    if (target.result.os.tag == .windows) {
+        const mf_mod = b.createModule(.{
+            .root_source_file = b.path("src/mf/win.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        for ([_][]const u8{
+            "mfplat", "mfreadwrite", "mf",    "d3d11",
+            "dxgi",   "d3d12",       "ole32", "d3dcompiler_47",
+        }) |lib| {
+            mf_mod.linkSystemLibrary(lib, .{});
+        }
+        const mf_tests = b.addTest(.{ .root_module = mf_mod });
+        test_step.dependOn(&b.addRunArtifact(mf_tests).step);
+    }
+
     // --- Godot extension: gdzig glue + AVFoundation backend. ---
     // Explicit path > explicit version > downloaded default version.
     const gdzig_dep = if (opt_godot_path) |p| b.dependency("gdzig", .{
