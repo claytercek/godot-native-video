@@ -228,12 +228,6 @@ pub const ID3D11Device = extern struct {
         GetExceptionMode: *const anyopaque,
     };
 
-    pub inline fn QueryInterface(self: *Self, riid: *const GUID, out: *?*anyopaque) HRESULT {
-        return self.lpVtbl.QueryInterface(self, riid, out);
-    }
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn CreateBuffer(self: *Self, desc: *const D3D11_BUFFER_DESC, init: ?*const D3D11_SUBRESOURCE_DATA, out: *?*ID3D11Buffer) HRESULT {
         return self.lpVtbl.CreateBuffer(self, desc, init, out);
     }
@@ -289,9 +283,6 @@ pub const ID3D11Device3 = extern struct {
         ReadFromSubresource: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return @as(*ID3D11Device, @ptrCast(self)).Release();
-    }
     pub inline fn CreateShaderResourceView1(self: *Self, res: *ID3D11Resource, desc: ?*const D3D11_SHADER_RESOURCE_VIEW_DESC1, out: *?*ID3D11ShaderResourceView) HRESULT {
         return self.lpVtbl.CreateShaderResourceView1(self, res, desc, out);
     }
@@ -316,9 +307,6 @@ pub const ID3D11Device5 = extern struct {
         CreateFence: *const fn (*Self, UINT64, UINT, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return @as(*ID3D11Device, @ptrCast(self)).Release();
-    }
     pub inline fn CreateFence(self: *Self, initial_value: UINT64, flags: UINT, riid: *const GUID, out: *?*anyopaque) HRESULT {
         return self.lpVtbl.CreateFence(self, initial_value, flags, riid, out);
     }
@@ -450,12 +438,6 @@ pub const ID3D11DeviceContext = extern struct {
         FinishCommandList: *const anyopaque,
     };
 
-    pub inline fn QueryInterface(self: *Self, riid: *const GUID, out: *?*anyopaque) HRESULT {
-        return self.lpVtbl.QueryInterface(self, riid, out);
-    }
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn Map(self: *Self, res: *ID3D11Resource, subresource: UINT, map_type: D3D11_MAP, flags: UINT, out: *D3D11_MAPPED_SUBRESOURCE) HRESULT {
         return self.lpVtbl.Map(self, res, subresource, map_type, flags, out);
     }
@@ -539,9 +521,6 @@ pub const ID3D11DeviceContext4 = extern struct {
         Wait: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return @as(*ID3D11DeviceContext, @ptrCast(self)).Release();
-    }
     pub inline fn Signal(self: *Self, fence: *ID3D11Fence, value: UINT64) HRESULT {
         return self.lpVtbl.Signal(self, fence, value);
     }
@@ -569,12 +548,6 @@ pub const ID3D11Texture2D = extern struct {
         GetDesc: *const fn (*Self, *D3D11_TEXTURE2D_DESC) callconv(.winapi) void,
     };
 
-    pub inline fn QueryInterface(self: *Self, riid: *const GUID, out: *?*anyopaque) HRESULT {
-        return self.lpVtbl.QueryInterface(self, riid, out);
-    }
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn GetDevice(self: *Self, out: *?*ID3D11Device) void {
         return self.lpVtbl.GetDevice(self, out);
     }
@@ -607,9 +580,6 @@ pub const ID3D10Multithread = extern struct {
         GetMultithreadProtected: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn SetMultithreadProtected(self: *Self, protect: WINBOOL) WINBOOL {
         return self.lpVtbl.SetMultithreadProtected(self, protect);
     }
@@ -636,9 +606,6 @@ pub const ID3D11Fence = extern struct {
         SetEventOnCompletion: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn CreateSharedHandle(self: *Self, attrs: ?*anyopaque, access: DWORD, name: LPCWSTR, handle: *HANDLE) HRESULT {
         return self.lpVtbl.CreateSharedHandle(self, attrs, access, name, handle);
     }

@@ -15,8 +15,10 @@ pub const create = backend.create;
 
 test {
     // Pull in the bindings-layer tests (win.zig's vtable-slot / runtime
-    // round-trip decls) and the backend's comptime layout asserts so both run
-    // under `zig build test`.
+    // round-trip decls), the colorimetry parser unit tests, and the backend +
+    // pipeline decls so all run under `zig build test`.
     _ = @import("win.zig");
+    _ = @import("colorimetry.zig");
+    _ = @import("pipeline.zig");
     _ = @import("mf_backend.zig");
 }

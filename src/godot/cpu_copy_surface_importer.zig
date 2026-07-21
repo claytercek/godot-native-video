@@ -70,7 +70,7 @@ const ReadbackSlot = struct {
 
     fn releaseStaging(self: *ReadbackSlot) void {
         if (self.staging) |t| {
-            _ = t.Release();
+            com.release(t);
             self.staging = null;
         }
     }
@@ -270,11 +270,11 @@ pub const CpuCopySurfaceImporter = struct {
     pub fn deinit(self: *CpuCopySurfaceImporter) void {
         for (&self.ring) |*slot| slot.releaseStaging();
         if (self.context) |c| {
-            _ = c.Release();
+            com.release(c);
             self.context = null;
         }
         if (self.device) |d| {
-            _ = d.Release();
+            com.release(d);
             self.device = null;
         }
         self.initialized = false;

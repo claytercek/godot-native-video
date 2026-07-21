@@ -159,9 +159,6 @@ pub const IMFAttributes = extern struct {
         CopyAllItems: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn GetItem(self: *Self, key: *const GUID, value: ?*PROPVARIANT) HRESULT {
         return self.lpVtbl.GetItem(self, key, value);
     }
@@ -223,9 +220,6 @@ pub const IMFMediaType = extern struct {
     pub inline fn asAttributes(self: *Self) *IMFAttributes {
         return @ptrCast(self);
     }
-    pub inline fn Release(self: *Self) ULONG {
-        return self.asAttributes().Release();
-    }
 };
 
 // ===========================================================================
@@ -255,9 +249,6 @@ pub const IMFSample = extern struct {
         CopyToBuffer: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return @as(*IUnknown, @ptrCast(self)).Release();
-    }
     pub inline fn GetSampleTime(self: *Self, time: *LONGLONG) HRESULT {
         return self.lpVtbl.GetSampleTime(self, time);
     }
@@ -288,12 +279,6 @@ pub const IMFMediaBuffer = extern struct {
         GetMaxLength: *const anyopaque,
     };
 
-    pub inline fn QueryInterface(self: *Self, riid: *const GUID, out: *?*anyopaque) HRESULT {
-        return self.lpVtbl.QueryInterface(self, riid, out);
-    }
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn Lock(self: *Self, data: *?[*]u8, max_len: ?*DWORD, cur_len: ?*DWORD) HRESULT {
         return self.lpVtbl.Lock(self, data, max_len, cur_len);
     }
@@ -323,9 +308,6 @@ pub const IMFDXGIBuffer = extern struct {
         SetUnknown: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn GetResource(self: *Self, riid: *const GUID, out: *?*anyopaque) HRESULT {
         return self.lpVtbl.GetResource(self, riid, out);
     }
@@ -358,9 +340,6 @@ pub const IMFSourceReader = extern struct {
         GetPresentationAttribute: *const fn (*Self, DWORD, *const GUID, *PROPVARIANT) callconv(.winapi) HRESULT,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn SetStreamSelection(self: *Self, stream: DWORD, selected: BOOL) HRESULT {
         return self.lpVtbl.SetStreamSelection(self, stream, selected);
     }
@@ -413,9 +392,6 @@ pub const IMFDXGIDeviceManager = extern struct {
         UnlockDevice: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn ResetDevice(self: *Self, device: ?*IUnknown, reset_token: UINT) HRESULT {
         return self.lpVtbl.ResetDevice(self, device, reset_token);
     }

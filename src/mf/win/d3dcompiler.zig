@@ -28,9 +28,6 @@ pub const ID3DBlob = extern struct {
         GetBufferSize: *const fn (*Self) callconv(.winapi) usize,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn GetBufferPointer(self: *Self) ?*anyopaque {
         return self.lpVtbl.GetBufferPointer(self);
     }

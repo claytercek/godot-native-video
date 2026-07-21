@@ -51,12 +51,15 @@ pub inline fn FAILED(hr: HRESULT) bool {
     return hr < 0;
 }
 
+/// Canonical HRESULT check: turns a failed HRESULT into `error.ComFailure`.
+pub fn check(hr: HRESULT) error{ComFailure}!void {
+    if (FAILED(hr)) return error.ComFailure;
+}
+
 pub const S_OK: HRESULT = 0;
 // S_FALSE: CoInitializeEx returns this when COM is already initialised on the
 // calling thread — treated as success by the port.
 pub const S_FALSE: HRESULT = 1;
-// _HRESULT_TYPEDEF_(0x887A0002): EnumAdapters1 terminator.
-pub const DXGI_ERROR_NOT_FOUND: HRESULT = @bitCast(@as(u32, 0x887A0002));
 // _HRESULT_TYPEDEF_(0xC00D36B3): source-reader stream-enumeration terminator.
 pub const MF_E_INVALIDSTREAMNUMBER: HRESULT = @bitCast(@as(u32, 0xC00D36B3));
 
@@ -74,14 +77,8 @@ pub const IUnknown = extern struct {
         Release: *const fn (*Self) callconv(.winapi) ULONG,
     };
 
-    pub inline fn QueryInterface(self: *Self, riid: *const GUID, out: *?*anyopaque) HRESULT {
-        return self.lpVtbl.QueryInterface(self, riid, out);
-    }
     pub inline fn AddRef(self: *Self) ULONG {
         return self.lpVtbl.AddRef(self);
-    }
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
     }
 };
 
@@ -92,8 +89,21 @@ pub const IUnknown = extern struct {
 pub fn queryInterface(comptime T: type, src: anytype) ?*T {
     var out: ?*anyopaque = null;
     const unk: *IUnknown = @ptrCast(src);
-    if (FAILED(unk.QueryInterface(&T.IID, &out))) return null;
+    if (FAILED(unk.lpVtbl.QueryInterface(unk, &T.IID, &out))) return null;
     return @ptrCast(@alignCast(out));
+}
+
+/// Release any COM interface pointer through its IUnknown identity. Every COM
+/// interface in this port begins with `lpVtbl`, so casting to `*IUnknown` and
+/// calling the vtable's Release slot is always sound (mirrors ComPtr.reset,
+/// which used to inline this before every per-type Release wrapper collapsed
+/// into this one function).
+pub fn release(p: anytype) void {
+    // @alignCast: opaque interface types (ID3D12Resource, the D3D11
+    // view/buffer/shader handles) have alignment 1, but a live COM pointer is
+    // really vtable-aligned, so the upcast to *IUnknown is sound.
+    const unk: *IUnknown = @ptrCast(@alignCast(p));
+    _ = unk.lpVtbl.Release(unk);
 }
 
 /// Move-only owner of a COM interface pointer. `deinit`/`reset` release once.
@@ -124,11 +134,7 @@ pub fn ComPtr(comptime T: type) type {
         }
         pub fn reset(self: *Self) void {
             if (self.ptr) |p| {
-                // @alignCast: opaque interface types (ID3D12Resource, the D3D11
-                // view/buffer/shader handles) have alignment 1, but a live COM
-                // pointer is really vtable-aligned, so the upcast to *IUnknown
-                // is sound.
-                _ = @as(*IUnknown, @ptrCast(@alignCast(p))).Release();
+                release(p);
                 self.ptr = null;
             }
         }

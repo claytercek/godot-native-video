@@ -14,8 +14,8 @@
 //!  - mf.zig          — Media Foundation: MFStartup/Shutdown, the source
 //!                      reader/media-type/sample/buffer interfaces, the DXGI
 //!                      device manager, and every MF GUID constant.
-//!  - dxgi.zig        — factory/adapter/resource interfaces + the DXGI_FORMAT
-//!                      subset, for LUID matching and shared-handle export.
+//!  - dxgi.zig        — the DXGI resource interface + DXGI_FORMAT subset, for
+//!                      shared-handle export.
 //!  - d3d11.zig       — the D3D11 device/context/texture/fence surface and the
 //!                      descriptor structs the interop + compute path fills.
 //!  - d3d12.zig       — the three D3D12 interfaces the zero-copy importer opens
@@ -81,6 +81,9 @@ test "vtable slot counts match the C headers" {
     try t.expectEqual(149 * ptr, @sizeOf(d3d11.ID3D11DeviceContext4.Vtbl));
     // ID3D12Device: 44 slots.
     try t.expectEqual(44 * ptr, @sizeOf(d3d12.ID3D12Device.Vtbl));
+    // IDXGIResource1: 3 IUnknown + 4 IDXGIObject + 1 IDXGIDeviceSubObject +
+    // 4 IDXGIResource + 2 own = 14.
+    try t.expectEqual(14 * ptr, @sizeOf(dxgi.IDXGIResource1.Vtbl));
 
     // CreateFence must be the very last (69th) slot of ID3D11Device5.
     try t.expectEqual(68 * ptr, @offsetOf(d3d11.ID3D11Device5.Vtbl, "CreateFence"));
@@ -88,6 +91,8 @@ test "vtable slot counts match the C headers" {
     try t.expectEqual(147 * ptr, @offsetOf(d3d11.ID3D11DeviceContext4.Vtbl, "Signal"));
     // GetAdapterLuid is the 44th (last) slot of ID3D12Device.
     try t.expectEqual(43 * ptr, @offsetOf(d3d12.ID3D12Device.Vtbl, "GetAdapterLuid"));
+    // CreateSharedHandle is the 14th (last) slot of IDXGIResource1.
+    try t.expectEqual(13 * ptr, @offsetOf(dxgi.IDXGIResource1.Vtbl, "CreateSharedHandle"));
 }
 
 test "MF_VERSION is 0x00020070" {
@@ -122,7 +127,7 @@ test "runtime: MF + D3D11 device manager round-trip" {
     // and GetUINT32 slot 7, and the MFCreateAttributes export). ---
     var attrs: ?*mf.IMFAttributes = null;
     try t.expect(com.SUCCEEDED(mf.MFCreateAttributes(&attrs, 1)));
-    defer _ = attrs.?.Release();
+    defer com.release(attrs.?);
     try t.expect(com.SUCCEEDED(attrs.?.SetUINT32(&mf.MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)));
     var got: u32 = 0;
     try t.expect(com.SUCCEEDED(attrs.?.GetUINT32(&mf.MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, &got)));
@@ -178,19 +183,19 @@ test "runtime: MF + D3D11 device manager round-trip" {
         );
     }
     if (com.FAILED(hr_dev)) return error.SkipZigTest; // no D3D11 device available (hardware or WARP)
-    defer _ = device.?.Release();
-    defer _ = context.?.Release();
+    defer com.release(device.?);
+    defer com.release(context.?);
 
     // --- QI ID3D10Multithread and enable protection (slot 5 = SetMultithreadProtected). ---
     const mt = com.queryInterface(d3d11.ID3D10Multithread, device.?) orelse return error.QueryMultithread;
-    defer _ = mt.Release();
+    defer com.release(mt);
     _ = mt.SetMultithreadProtected(com.TRUE);
 
     // --- DXGI device manager + ResetDevice (slot 8). ---
     var reset_token: u32 = 0;
     var manager: ?*mf.IMFDXGIDeviceManager = null;
     try t.expect(com.SUCCEEDED(mf.MFCreateDXGIDeviceManager(&reset_token, &manager)));
-    defer _ = manager.?.Release();
+    defer com.release(manager.?);
     const dev_unk: *com.IUnknown = @ptrCast(device.?);
     try t.expect(com.SUCCEEDED(manager.?.ResetDevice(dev_unk, reset_token)));
 }

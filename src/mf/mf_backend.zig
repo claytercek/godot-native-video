@@ -8,10 +8,14 @@
 //! single +1 reference is released via VideoFrame.release. No Godot /
 //! RenderingDevice symbols appear here — this is a decode pump only.
 //!
-//! This is a straight port of src/backends/mf/{mf_backend,mf_audio}.cpp; the
-//! two C++ translation units are fused into this one file because Zig cannot
-//! split a struct's methods across files the way the shared MfBackend::Impl
-//! did. Structural mirror of avf_backend.zig; policy decisions (bit-depth
+//! This file owns policy only, exactly as avf_backend.zig does: the reader
+//! state machine, track selection/clamping, EOS/error interpretation, and the
+//! translation of MF results into VideoFrame / AudioChunk. The COM/D3D object
+//! graph (device, DXGI manager, source readers) lives behind `pipeline.MfPipeline`,
+//! composed in as a field — the Windows counterpart to AVF's C-ABI shim. Zig
+//! splits a struct across files by composition, not by scattering one struct's
+//! methods; that seam is what keeps this core small. The pure colorimetry /
+//! time-base parsers live in colorimetry.zig. Policy decisions (bit-depth
 //! negotiation, colorimetry-from-native-type, reversed audio enumeration,
 //! dedicated-reader reselect) match the C++ exactly — each is a
 //! verified-on-Windows-11 workaround, noted inline where it matters.
@@ -41,107 +45,10 @@ const com = win.com;
 const mf = win.mf;
 const d3d11 = win.d3d11;
 
+const pipe = @import("pipeline.zig");
+const colorimetry = @import("colorimetry.zig");
+
 const log = std.log.scoped(.mf_backend);
-
-// MF sample/duration times are in 100-nanosecond units (10^7 per second), the
-// Media Foundation time base. PTS in seconds = ticks / 1e7.
-const ticks_per_second: f64 = 10_000_000.0;
-
-fn ticksToSeconds(ticks: i64) f64 {
-    return @as(f64, @floatFromInt(ticks)) / ticks_per_second;
-}
-fn secondsToTicks(seconds: f64) i64 {
-    return @intFromFloat(seconds * ticks_per_second + 0.5);
-}
-
-fn guidEql(a: com.GUID, b: com.GUID) bool {
-    return std.meta.eql(a, b);
-}
-
-// ---------------------------------------------------------------------------
-// Colorimetry translation — map MF_MT_YUV_MATRIX / _VIDEO_PRIMARIES /
-// _TRANSFER_FUNCTION / _VIDEO_NOMINAL_RANGE attribute values to the core enums.
-// Unrecognised/absent values map to Unspecified so the caller's BT.709
-// video-range defaults stay in effect. Structural mirror of the C++ parsers.
-// ---------------------------------------------------------------------------
-fn parseMatrix(v: u32) core.ColorMatrix {
-    return switch (v) {
-        mf.MFVideoTransferMatrix_BT709 => .bt709,
-        mf.MFVideoTransferMatrix_BT601 => .bt601,
-        mf.MFVideoTransferMatrix_BT2020_10, mf.MFVideoTransferMatrix_BT2020_12 => .bt2020,
-        else => .unspecified,
-    };
-}
-
-fn parsePrimaries(v: u32) core.ColorPrimaries {
-    return switch (v) {
-        mf.MFVideoPrimaries_BT709 => .bt709,
-        mf.MFVideoPrimaries_BT470_2_SysBG, mf.MFVideoPrimaries_EBU3213 => .bt601_625,
-        mf.MFVideoPrimaries_SMPTE170M, mf.MFVideoPrimaries_SMPTE_C => .bt601_525,
-        mf.MFVideoPrimaries_BT2020 => .bt2020,
-        mf.MFVideoPrimaries_DCI_P3 => .dci_p3,
-        else => .unspecified,
-    };
-}
-
-fn parseTransfer(v: u32) core.TransferFunction {
-    return switch (v) {
-        mf.MFVideoTransFunc_709, mf.MFVideoTransFunc_sRGB => .bt709,
-        mf.MFVideoTransFunc_2084 => .pq,
-        mf.MFVideoTransFunc_HLG => .hlg,
-        else => .unspecified,
-    };
-}
-
-fn parseRange(v: u32) core.ColorRange {
-    return switch (v) {
-        mf.MFNominalRange_0_255 => .full,
-        mf.MFNominalRange_16_235 => .video,
-        else => .unspecified,
-    };
-}
-
-// The core enums' integer values are load-bearing here (frame color is passed
-// straight to the present shader): pin the ones the parsers above depend on so
-// either side moving out of step is a compile error, not a silently wrong
-// colour on screen. Mirrors avf_backend.zig's assertion block.
-comptime {
-    std.debug.assert(@intFromEnum(core.ColorMatrix.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.ColorMatrix.bt709) == 1);
-    std.debug.assert(@intFromEnum(core.ColorMatrix.bt601) == 2);
-    std.debug.assert(@intFromEnum(core.ColorMatrix.bt2020) == 3);
-
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt709) == 1);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt601_625) == 2);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt601_525) == 3);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt2020) == 4);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.dci_p3) == 5);
-
-    std.debug.assert(@intFromEnum(core.TransferFunction.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.TransferFunction.bt709) == 1);
-    std.debug.assert(@intFromEnum(core.TransferFunction.pq) == 2);
-    std.debug.assert(@intFromEnum(core.TransferFunction.hlg) == 3);
-
-    std.debug.assert(@intFromEnum(core.ColorRange.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.ColorRange.video) == 1);
-    std.debug.assert(@intFromEnum(core.ColorRange.full) == 2);
-
-    std.debug.assert(@intFromEnum(core.PixelFormat.nv12) == 1);
-    std.debug.assert(@intFromEnum(core.PixelFormat.x420) == 2);
-}
-
-// Detect the source's bit depth from the native (pre-conversion) video media
-// type. MF_MT_MPEG2_PROFILE carries the demuxer-parsed HEVC general_profile_idc;
-// profile 2 (eAVEncH265VProfile_Main_420_10) identifies a 10-bit 4:2:0 source.
-// Absent or any other value defaults to 8-bit.
-fn detectBitDepth(native: *mf.IMFMediaType) i32 {
-    var profile: u32 = 0;
-    if (com.SUCCEEDED(native.asAttributes().GetUINT32(&mf.MF_MT_MPEG2_PROFILE, &profile))) {
-        if (profile == mf.eAVEncH265VProfile_Main_420_10) return 10;
-    }
-    return 8;
-}
 
 // ---------------------------------------------------------------------------
 // MfBackend — the concrete implementation behind the Backend vtable.
@@ -149,20 +56,9 @@ fn detectBitDepth(native: *mf.IMFMediaType) i32 {
 pub const MfBackend = struct {
     allocator: std.mem.Allocator,
 
-    // D3D11 device + the DXGI device manager the source reader uses to
-    // hardware-decode into D3D11 NV12/P010 textures. Created once per open(),
-    // torn down in close().
-    d3d_device: ?*d3d11.ID3D11Device = null,
-    d3d_context: ?*d3d11.ID3D11DeviceContext = null,
-    dxgi_manager: ?*mf.IMFDXGIDeviceManager = null,
-    reader: ?*mf.IMFSourceReader = null,
-
-    // Non-null only after reselectAudioTrack(); reset by open()/seek(). A
-    // dedicated audio-only reader so a mid-decode track switch can prime the
-    // new track at the requested position without repositioning (and thus
-    // disturbing) the shared reader's video stream. nextAudioChunk() reads from
-    // this when it is non-null.
-    audio_reader: ?*mf.IMFSourceReader = null,
+    // The COM/D3D object graph: device, DXGI manager, shared reader, optional
+    // dedicated audio-only reader. Created per open(), torn down in close().
+    pipeline: pipe.MfPipeline = .{},
 
     // UTF-16, NUL-terminated source path for MFCreateSourceReaderFromURL.
     path16: ?[:0]u16 = null,
@@ -182,10 +78,6 @@ pub const MfBackend = struct {
     // 10 when P010 negotiation succeeds.
     color: core.Colorimetry = core.Colorimetry.bt709_defaults,
 
-    // Set true when a decode pump / seek hits a FAILED HRESULT (vs. a clean
-    // EOS). Mirrors the C++ error flag; the vtable boundary reports it as
-    // null/false coarsely.
-    err_flag: bool = false,
     com_initialized: bool = false,
     mf_started: bool = false,
 
@@ -232,64 +124,7 @@ pub const MfBackend = struct {
         return @ptrCast(@alignCast(p));
     }
 
-    // ---- MF/D3D setup helpers (per-open) ----
-
-    // Create a hardware D3D11 device with BGRA + video support, mark it
-    // multithread-protected (shared across MF's decoder thread and our pump),
-    // and wrap it in an IMFDXGIDeviceManager keyed by a reset token.
-    fn createDevice(self: *MfBackend) !void {
-        const flags = d3d11.D3D11_CREATE_DEVICE_BGRA_SUPPORT | d3d11.D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-        var got_level: d3d11.D3D_FEATURE_LEVEL = d3d11.D3D_FEATURE_LEVEL_11_0;
-        var device: ?*d3d11.ID3D11Device = null;
-        var context: ?*d3d11.ID3D11DeviceContext = null;
-        const hr = d3d11.D3D11CreateDevice(
-            null, // default adapter
-            d3d11.D3D_DRIVER_TYPE_HARDWARE,
-            null,
-            flags,
-            null,
-            0, // default feature levels
-            d3d11.D3D11_SDK_VERSION,
-            &device,
-            &got_level,
-            &context,
-        );
-        if (com.FAILED(hr) or device == null) return error.DeviceCreate;
-        self.d3d_device = device;
-        self.d3d_context = context;
-
-        if (com.queryInterface(d3d11.ID3D10Multithread, device.?)) |mt| {
-            _ = mt.SetMultithreadProtected(com.TRUE);
-            _ = mt.Release();
-        }
-
-        var reset_token: com.UINT = 0;
-        var manager: ?*mf.IMFDXGIDeviceManager = null;
-        if (com.FAILED(mf.MFCreateDXGIDeviceManager(&reset_token, &manager)) or manager == null) {
-            return error.DxgiManager;
-        }
-        self.dxgi_manager = manager;
-        const dev_unk: *com.IUnknown = @ptrCast(device.?);
-        if (com.FAILED(manager.?.ResetDevice(dev_unk, reset_token))) return error.ResetDevice;
-    }
-
-    // Build the source reader bound to the DXGI device manager so decode output
-    // is D3D11-backed. Enables advanced video processing + hardware transforms.
-    fn createReader(self: *MfBackend) !void {
-        var attrs: ?*mf.IMFAttributes = null;
-        if (com.FAILED(mf.MFCreateAttributes(&attrs, 4)) or attrs == null) return error.Attributes;
-        defer _ = attrs.?.Release();
-        const a = attrs.?;
-        _ = a.SetUnknown(&mf.MF_SOURCE_READER_D3D_MANAGER, @ptrCast(self.dxgi_manager.?));
-        _ = a.SetUINT32(&mf.MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1);
-        _ = a.SetUINT32(&mf.MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1);
-
-        var reader: ?*mf.IMFSourceReader = null;
-        if (com.FAILED(mf.MFCreateSourceReaderFromURL(self.path16.?.ptr, a, &reader)) or reader == null) {
-            return error.Reader;
-        }
-        self.reader = reader;
-    }
+    // ---- open-time stream configuration (policy) ----
 
     // Scan every stream: pick the first video stream (reading colorimetry + bit
     // depth off its NATIVE type), and collect audio-track metadata. Then
@@ -298,7 +133,7 @@ pub const MfBackend = struct {
     // frame dimensions. Returns false when there is no usable video stream (the
     // caller decides whether that's fatal).
     fn configureVideoStream(self: *MfBackend) !bool {
-        const reader = self.reader.?;
+        const reader = self.pipeline.reader.?;
         var i: com.DWORD = 0;
         while (true) : (i += 1) {
             var native: ?*mf.IMFMediaType = null;
@@ -306,18 +141,18 @@ pub const MfBackend = struct {
             if (hr == com.MF_E_INVALIDSTREAMNUMBER) break; // no more streams
             if (com.FAILED(hr) or native == null) continue;
             const nt = native.?;
-            defer _ = nt.Release();
+            defer com.release(nt);
 
             var major: com.GUID = std.mem.zeroes(com.GUID);
             _ = nt.asAttributes().GetGUID(&mf.MF_MT_MAJOR_TYPE, &major);
 
-            if (guidEql(major, mf.MFMediaType_Video) and self.video_stream_index < 0) {
+            if (std.meta.eql(major, mf.MFMediaType_Video) and self.video_stream_index < 0) {
                 self.video_stream_index = @intCast(i);
                 // Colorimetry + bit depth live on the native (pre-conversion)
                 // type; the NV12/P010 output type does not carry them forward.
                 self.readColorimetry(nt);
-                self.color.bit_depth = detectBitDepth(nt);
-            } else if (guidEql(major, mf.MFMediaType_Audio)) {
+                self.color.bit_depth = colorimetry.detectBitDepth(nt);
+            } else if (std.meta.eql(major, mf.MFMediaType_Audio)) {
                 var ch: u32 = 0;
                 var rate: u32 = 0;
                 _ = nt.asAttributes().GetUINT32(&mf.MF_MT_AUDIO_NUM_CHANNELS, &ch);
@@ -355,10 +190,10 @@ pub const MfBackend = struct {
         const vidx: com.DWORD = @intCast(self.video_stream_index);
         // Request the output subtype matching detected bit depth; fall back to
         // NV12 (correcting bit_depth) if the P010 request fails.
-        var ok = self.requestSubtype(vidx, if (self.color.bit_depth >= 10) mf.MFVideoFormat_P010 else mf.MFVideoFormat_NV12);
+        var ok = self.pipeline.requestSubtype(vidx, if (self.color.bit_depth >= 10) mf.MFVideoFormat_P010 else mf.MFVideoFormat_NV12);
         if (!ok and self.color.bit_depth >= 10) {
             self.color.bit_depth = 8;
-            ok = self.requestSubtype(vidx, mf.MFVideoFormat_NV12);
+            ok = self.pipeline.requestSubtype(vidx, mf.MFVideoFormat_NV12);
         }
         if (!ok) return false;
 
@@ -366,7 +201,7 @@ pub const MfBackend = struct {
 
         var current: ?*mf.IMFMediaType = null;
         if (com.SUCCEEDED(reader.GetCurrentMediaType(vidx, &current)) and current != null) {
-            defer _ = current.?.Release();
+            defer com.release(current.?);
             var w: u32 = 0;
             var h: u32 = 0;
             if (com.SUCCEEDED(current.?.asAttributes().getFrameSize(&w, &h))) {
@@ -377,55 +212,15 @@ pub const MfBackend = struct {
         return true;
     }
 
-    // Create an output media type of `subtype` and set it on the video stream.
-    // Returns true on success. The reader inserts a video-processor MFT if the
-    // decoder can't natively output that subtype.
-    fn requestSubtype(self: *MfBackend, vidx: com.DWORD, subtype: com.GUID) bool {
-        var out_type: ?*mf.IMFMediaType = null;
-        if (com.FAILED(mf.MFCreateMediaType(&out_type)) or out_type == null) return false;
-        defer _ = out_type.?.Release();
-        const ot = out_type.?.asAttributes();
-        _ = ot.SetGUID(&mf.MF_MT_MAJOR_TYPE, &mf.MFMediaType_Video);
-        _ = ot.SetGUID(&mf.MF_MT_SUBTYPE, &subtype);
-        return com.SUCCEEDED(self.reader.?.SetCurrentMediaType(vidx, null, out_type.?));
-    }
-
     // Read colorimetry attributes off a video media type. Absent attributes
     // leave the existing default untouched.
     fn readColorimetry(self: *MfBackend, t: *mf.IMFMediaType) void {
         const attrs = t.asAttributes();
         var val: u32 = 0;
-        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_YUV_MATRIX, &val))) self.color.matrix = parseMatrix(val);
-        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_VIDEO_PRIMARIES, &val))) self.color.primaries = parsePrimaries(val);
-        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_TRANSFER_FUNCTION, &val))) self.color.transfer = parseTransfer(val);
-        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_VIDEO_NOMINAL_RANGE, &val))) self.color.range = parseRange(val);
-    }
-
-    // Select `aidx` on `target` and negotiate interleaved float32 PCM, updating
-    // audio_channels/audio_rate from the negotiated type. Shared by the combined
-    // reader and the dedicated audio-only reader.
-    fn configurePcmOutput(self: *MfBackend, target: *mf.IMFSourceReader, aidx: com.DWORD) bool {
-        _ = target.SetStreamSelection(aidx, com.TRUE);
-
-        var pcm: ?*mf.IMFMediaType = null;
-        if (com.FAILED(mf.MFCreateMediaType(&pcm)) or pcm == null) return false;
-        defer _ = pcm.?.Release();
-        const pa = pcm.?.asAttributes();
-        _ = pa.SetGUID(&mf.MF_MT_MAJOR_TYPE, &mf.MFMediaType_Audio);
-        _ = pa.SetGUID(&mf.MF_MT_SUBTYPE, &mf.MFAudioFormat_Float);
-        if (com.FAILED(target.SetCurrentMediaType(aidx, null, pcm.?))) return false;
-
-        var current: ?*mf.IMFMediaType = null;
-        if (com.SUCCEEDED(target.GetCurrentMediaType(aidx, &current)) and current != null) {
-            defer _ = current.?.Release();
-            var ch: u32 = 0;
-            var rate: u32 = 0;
-            _ = current.?.asAttributes().GetUINT32(&mf.MF_MT_AUDIO_NUM_CHANNELS, &ch);
-            _ = current.?.asAttributes().GetUINT32(&mf.MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
-            self.audio_channels = @intCast(ch);
-            self.audio_rate = @intCast(rate);
-        }
-        return true;
+        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_YUV_MATRIX, &val))) self.color.matrix = colorimetry.parseMatrix(val);
+        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_VIDEO_PRIMARIES, &val))) self.color.primaries = colorimetry.parsePrimaries(val);
+        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_TRANSFER_FUNCTION, &val))) self.color.transfer = colorimetry.parseTransfer(val);
+        if (com.SUCCEEDED(attrs.GetUINT32(&mf.MF_MT_VIDEO_NOMINAL_RANGE, &val))) self.color.range = colorimetry.parseRange(val);
     }
 
     // Configure the open-time audio stream to float32 PCM. Non-fatal: on
@@ -433,7 +228,10 @@ pub const MfBackend = struct {
     fn configureAudioStream(self: *MfBackend) void {
         if (self.audio_stream_index < 0) return;
         const aidx: com.DWORD = @intCast(self.audio_stream_index);
-        if (!self.configurePcmOutput(self.reader.?, aidx)) {
+        if (pipe.configurePcmOutput(self.pipeline.reader.?, aidx)) |fmt| {
+            self.audio_channels = fmt.channels;
+            self.audio_rate = fmt.rate;
+        } else {
             self.audio_stream_index = -1;
         }
     }
@@ -441,9 +239,9 @@ pub const MfBackend = struct {
     // Read total duration from the presentation descriptor (100ns -> seconds).
     fn readDuration(self: *MfBackend) void {
         var pv = com.PROPVARIANT.zeroed();
-        const hr = self.reader.?.GetPresentationAttribute(mf.MF_SOURCE_READER_MEDIASOURCE, &mf.MF_PD_DURATION, &pv);
+        const hr = self.pipeline.reader.?.GetPresentationAttribute(mf.MF_SOURCE_READER_MEDIASOURCE, &mf.MF_PD_DURATION, &pv);
         if (com.SUCCEEDED(hr) and pv.vt == com.VT_UI8) {
-            self.duration = ticksToSeconds(@intCast(pv.val.uhVal));
+            self.duration = colorimetry.ticksToSeconds(@intCast(pv.val.uhVal));
         }
         _ = com.PropVariantClear(&pv);
     }
@@ -453,7 +251,7 @@ pub const MfBackend = struct {
     // absent/empty. Caller owns the returned slice.
     fn readStreamString(self: *MfBackend, stream_index: com.DWORD, guid: *const com.GUID) !?[]u8 {
         var pv = com.PROPVARIANT.zeroed();
-        const hr = self.reader.?.GetPresentationAttribute(stream_index, guid, &pv);
+        const hr = self.pipeline.reader.?.GetPresentationAttribute(stream_index, guid, &pv);
         defer _ = com.PropVariantClear(&pv);
         if (com.SUCCEEDED(hr) and pv.vt == com.VT_LPWSTR) {
             if (pv.val.pwszVal) |w| {
@@ -502,59 +300,46 @@ pub const MfBackend = struct {
         self.audio_stream_index = self.audio_stream_indices.items[0];
     }
 
-    // Deselect the old audio stream, select track_index, renegotiate PCM. This
-    // IS the application of a selection, so selected/applied both converge.
+    // ---- audio track selection (policy) ----
+
+    // Clamp `index` to the valid track range, record it as the selected track,
+    // and refresh audio_channels/audio_rate from the cached track table. Callers
+    // must guarantee at least one audio track exists. Returns the clamped index.
+    // The single home for the clamp + metadata refresh, shared by select and
+    // reselect so the two stay symmetric (mirrors avf_backend.zig).
+    fn applyTrackSelection(self: *MfBackend, index: i32) i32 {
+        const count: i32 = @intCast(self.audio_tracks.items.len);
+        const clamped = std.math.clamp(index, 0, count - 1);
+        self.selected_audio_track = clamped;
+        const meta = self.audio_tracks.items[@intCast(clamped)];
+        self.audio_channels = meta.channels;
+        self.audio_rate = meta.sample_rate;
+        return clamped;
+    }
+
+    // Deselect the old audio stream, select track_index on the shared reader,
+    // renegotiate PCM. This IS the application of a selection, so selected and
+    // applied both converge here.
     fn switchAudioTrack(self: *MfBackend, track_index: i32) bool {
-        if (self.audio_stream_indices.items.len == 0) return false;
         if (track_index < 0 or track_index >= @as(i32, @intCast(self.audio_stream_indices.items.len))) return false;
 
         if (self.audio_stream_index >= 0) {
-            _ = self.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE);
+            _ = self.pipeline.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE);
         }
         const new_mf_index = self.audio_stream_indices.items[@intCast(track_index)];
         self.audio_stream_index = new_mf_index;
         const aidx: com.DWORD = @intCast(new_mf_index);
-        if (!self.configurePcmOutput(self.reader.?, aidx)) {
-            _ = self.reader.?.SetStreamSelection(aidx, com.FALSE);
+        if (pipe.configurePcmOutput(self.pipeline.reader.?, aidx)) |fmt| {
+            self.audio_channels = fmt.channels;
+            self.audio_rate = fmt.rate;
+        } else {
+            _ = self.pipeline.reader.?.SetStreamSelection(aidx, com.FALSE);
             self.audio_stream_index = -1;
             return false;
         }
         self.selected_audio_track = track_index;
         self.applied_audio_track = track_index;
         return true;
-    }
-
-    // Build a dedicated audio-only source reader for track_index, primed at
-    // start_time. No DXGI device manager needed — audio decodes on the CPU.
-    fn buildAudioReader(self: *MfBackend, track_index: i32, start_time: f64) bool {
-        self.resetAudioReader();
-
-        var ar: ?*mf.IMFSourceReader = null;
-        if (com.FAILED(mf.MFCreateSourceReaderFromURL(self.path16.?.ptr, null, &ar)) or ar == null) return false;
-        _ = ar.?.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE);
-
-        const aidx: com.DWORD = @intCast(self.audio_stream_indices.items[@intCast(track_index)]);
-        if (!self.configurePcmOutput(ar.?, aidx)) {
-            _ = ar.?.Release();
-            return false;
-        }
-
-        var pos = com.initPropVariantFromInt64(secondsToTicks(start_time));
-        const hr = ar.?.SetCurrentPosition(&mf.GUID_NULL, &pos);
-        _ = com.PropVariantClear(&pos);
-        if (com.FAILED(hr)) {
-            _ = ar.?.Release();
-            return false;
-        }
-        self.audio_reader = ar;
-        return true;
-    }
-
-    fn resetAudioReader(self: *MfBackend) void {
-        if (self.audio_reader) |ar| {
-            _ = ar.Release();
-            self.audio_reader = null;
-        }
     }
 
     // ---- lifecycle ----
@@ -577,16 +362,16 @@ pub const MfBackend = struct {
         const hr_co = com.CoInitializeEx(null, com.COINIT_MULTITHREADED);
         if (com.SUCCEEDED(hr_co) or hr_co == com.S_FALSE) self.com_initialized = true;
 
-        if (com.FAILED(mf.MFStartup(mf.MF_VERSION, mf.MFSTARTUP_LITE))) return error.MFStartup;
+        try com.check(mf.MFStartup(mf.MF_VERSION, mf.MFSTARTUP_LITE));
         self.mf_started = true;
 
         self.path16 = try std.unicode.utf8ToUtf16LeAllocZ(self.allocator, url_or_path);
 
-        try self.createDevice();
-        try self.createReader();
+        try self.pipeline.createDevice();
+        try self.pipeline.createReader(self.path16.?);
 
         // Deselect all streams, then enable just the ones we configure.
-        _ = self.reader.?.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE);
+        _ = self.pipeline.reader.?.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE);
 
         const has_video = try self.configureVideoStream();
         // Match AVF: fail only if there is neither audio nor video.
@@ -597,25 +382,9 @@ pub const MfBackend = struct {
     }
 
     fn closeImpl(self: *MfBackend) void {
-        // Teardown order mirrors the C++ Impl::teardown: dependents before the
-        // device, then MF then COM.
-        self.resetAudioReader();
-        if (self.reader) |p| {
-            _ = p.Release();
-            self.reader = null;
-        }
-        if (self.dxgi_manager) |p| {
-            _ = p.Release();
-            self.dxgi_manager = null;
-        }
-        if (self.d3d_context) |p| {
-            _ = p.Release();
-            self.d3d_context = null;
-        }
-        if (self.d3d_device) |p| {
-            _ = p.Release();
-            self.d3d_device = null;
-        }
+        // Release the COM object graph (readers before device), then MF then COM
+        // — mirrors the C++ Impl::teardown order.
+        self.pipeline.teardown();
         if (self.mf_started) {
             _ = mf.MFShutdown();
             self.mf_started = false;
@@ -644,20 +413,16 @@ pub const MfBackend = struct {
         self.selected_audio_track = 0;
         self.applied_audio_track = 0;
         self.color = core.Colorimetry.bt709_defaults;
-        self.err_flag = false;
     }
 
     fn seekImpl(self: *MfBackend, pts_seconds: f64) bool {
-        if (self.reader == null) return false;
+        if (self.pipeline.reader == null) return false;
         const target = @max(pts_seconds, 0.0);
 
         // Tear down any dedicated audio-only reader and re-home audio on the
         // shared reader.
-        var audio_reader_torn = false;
-        if (self.audio_reader != null) {
-            self.resetAudioReader();
-            audio_reader_torn = true;
-        }
+        const audio_reader_torn = self.pipeline.audio_reader != null;
+        if (audio_reader_torn) self.pipeline.resetAudioReader();
         // Catch the shared reader up to a pending selectAudioTrack(), and/or
         // re-home audio after a dedicated reselect reader. Safe here because
         // SetCurrentPosition below restarts the media source, which is what
@@ -666,92 +431,72 @@ pub const MfBackend = struct {
             _ = self.switchAudioTrack(self.selected_audio_track);
         }
 
-        var pos = com.initPropVariantFromInt64(secondsToTicks(target));
-        const hr = self.reader.?.SetCurrentPosition(&mf.GUID_NULL, &pos);
+        var pos = com.initPropVariantFromInt64(colorimetry.secondsToTicks(target));
+        const hr = self.pipeline.reader.?.SetCurrentPosition(&mf.GUID_NULL, &pos);
         _ = com.PropVariantClear(&pos);
-        if (com.FAILED(hr)) {
-            self.err_flag = true;
-            return false;
-        }
-        return true;
+        return com.SUCCEEDED(hr);
     }
 
     fn selectAudioTrackImpl(self: *MfBackend, index: i32) void {
-        if (self.audio_stream_indices.items.len == 0) return;
-        const count: i32 = @intCast(self.audio_tracks.items.len);
-        if (count == 0) return;
-        const clamped = std.math.clamp(index, 0, count - 1);
-        self.selected_audio_track = clamped;
-        // Selection takes effect on the next seek()/open(); update channel/rate
-        // metadata immediately so a caller inspecting them pre-playback sees the
-        // selected track's format.
-        const meta = self.audio_tracks.items[@intCast(clamped)];
-        self.audio_channels = meta.channels;
-        self.audio_rate = meta.sample_rate;
+        if (self.audio_tracks.items.len == 0) return;
+        // Selection takes effect on the next seek()/open(); applyTrackSelection
+        // updates channel/rate metadata immediately so a caller inspecting them
+        // pre-playback sees the selected track's format.
+        _ = self.applyTrackSelection(index);
     }
 
     fn reselectAudioTrackImpl(self: *MfBackend, index: i32, pts_seconds: f64) bool {
-        if (self.audio_stream_indices.items.len == 0) return false;
-        const count: i32 = @intCast(self.audio_tracks.items.len);
-        if (count == 0) return false;
-        const clamped = std.math.clamp(index, 0, count - 1);
+        if (self.audio_tracks.items.len == 0) return false;
+        const clamped = self.applyTrackSelection(index);
         const target = @max(pts_seconds, 0.0);
+        const mf_index = self.audio_stream_indices.items[@intCast(clamped)];
 
         // Dedicated audio-only reader for the new track, primed at target, while
-        // the shared reader keeps decoding video from its current position.
-        if (!self.buildAudioReader(clamped, target)) return false;
+        // the shared reader keeps decoding video from its current position. The
+        // pipeline builds it into a local and swaps only on success, so a
+        // failure here leaves any existing dedicated reader intact.
+        if (!self.pipeline.buildAudioReader(self.path16.?, mf_index, colorimetry.secondsToTicks(target))) return false;
 
         // Stop the shared reader from queueing the old track's audio.
         if (self.audio_stream_index >= 0) {
-            _ = self.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE);
+            _ = self.pipeline.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE);
         }
-        self.audio_stream_index = self.audio_stream_indices.items[@intCast(clamped)];
-        self.selected_audio_track = clamped;
+        self.audio_stream_index = mf_index;
         self.applied_audio_track = clamped;
         return true;
     }
 
     fn nextVideoFrameImpl(self: *MfBackend) ?core.VideoFrame {
-        if (self.reader == null or self.video_stream_index < 0) return null;
+        if (self.pipeline.reader == null or self.video_stream_index < 0) return null;
         const vidx: com.DWORD = @intCast(self.video_stream_index);
 
         while (true) {
             var stream_flags: com.DWORD = 0;
             var timestamp: mf.LONGLONG = 0;
             var sample: ?*mf.IMFSample = null;
-            const hr = self.reader.?.ReadSample(vidx, 0, null, &stream_flags, &timestamp, &sample);
-            if (com.FAILED(hr)) {
-                self.err_flag = true;
-                return null;
-            }
+            const hr = self.pipeline.reader.?.ReadSample(vidx, 0, null, &stream_flags, &timestamp, &sample);
+            if (com.FAILED(hr)) return null;
             if ((stream_flags & mf.MF_SOURCE_READERF_ENDOFSTREAM) != 0) return null; // clean EOS
             // No sample this call (stream tick / native-type change): loop.
             // Known limitation preserved from the C++: a mid-stream native type
             // change does not re-probe colorimetry.
             const s = sample orelse continue;
-            defer _ = s.Release();
+            defer com.release(s);
 
             var media_buffer: ?*mf.IMFMediaBuffer = null;
-            if (com.FAILED(s.GetBufferByIndex(0, &media_buffer)) or media_buffer == null) {
-                self.err_flag = true;
-                return null;
-            }
+            if (com.FAILED(s.GetBufferByIndex(0, &media_buffer)) or media_buffer == null) return null;
             const mb = media_buffer.?;
-            defer _ = mb.Release();
+            defer com.release(mb);
 
             const dxgi_buffer = com.queryInterface(mf.IMFDXGIBuffer, mb) orelse {
                 // Not a D3D11-backed sample — the DXGI device manager wasn't honored.
-                self.err_flag = true;
                 return null;
             };
-            defer _ = dxgi_buffer.Release();
+            defer com.release(dxgi_buffer);
 
             // GetResource returns a +1 reference we adopt into native_handle.
             var raw: ?*anyopaque = null;
-            if (com.FAILED(dxgi_buffer.GetResource(&d3d11.ID3D11Texture2D.IID, &raw)) or raw == null) {
-                self.err_flag = true;
-                return null;
-            }
+            if (com.FAILED(dxgi_buffer.GetResource(&d3d11.ID3D11Texture2D.IID, &raw)) or raw == null) return null;
             const tex: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(raw.?));
 
             // The decoder packs frames as slices of one texture array; the
@@ -760,7 +505,7 @@ pub const MfBackend = struct {
             _ = dxgi_buffer.GetSubresourceIndex(&subresource);
 
             return .{
-                .pts_seconds = ticksToSeconds(timestamp),
+                .pts_seconds = colorimetry.ticksToSeconds(timestamp),
                 .native_handle = @ptrCast(tex),
                 .plane_slice = subresource,
                 .width = self.width,
@@ -777,46 +522,45 @@ pub const MfBackend = struct {
     fn frameRelease(ctx: ?*anyopaque) void {
         if (ctx) |p| {
             const tex: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(p));
-            _ = tex.Release();
+            com.release(tex);
         }
     }
 
     fn nextAudioChunkImpl(self: *MfBackend) ?core.AudioChunk {
-        if (self.reader == null or self.audio_stream_index < 0) return null;
+        if (self.pipeline.reader == null) return null;
         // When a dedicated audio-only reader is active (from reselect), read
-        // from it; otherwise the shared reader. Both enumerate the same source,
-        // so the stream index matches.
-        const active = if (self.audio_reader) |ar| ar else self.reader.?;
-        const aidx: com.DWORD = @intCast(self.audio_stream_index);
+        // from it at its OWN stored stream index; otherwise read the shared
+        // reader at the shared audio stream index.
+        var active: *mf.IMFSourceReader = undefined;
+        var aidx: com.DWORD = undefined;
+        if (self.pipeline.audio_reader) |ar| {
+            active = ar;
+            aidx = @intCast(self.pipeline.audio_reader_stream_index);
+        } else {
+            if (self.audio_stream_index < 0) return null;
+            active = self.pipeline.reader.?;
+            aidx = @intCast(self.audio_stream_index);
+        }
 
         while (true) {
             var stream_flags: com.DWORD = 0;
             var timestamp: mf.LONGLONG = 0;
             var sample: ?*mf.IMFSample = null;
             const hr = active.ReadSample(aidx, 0, null, &stream_flags, &timestamp, &sample);
-            if (com.FAILED(hr)) {
-                self.err_flag = true;
-                return null;
-            }
+            if (com.FAILED(hr)) return null;
             if ((stream_flags & mf.MF_SOURCE_READERF_ENDOFSTREAM) != 0) return null; // clean EOS
             const s = sample orelse continue;
-            defer _ = s.Release();
+            defer com.release(s);
 
             // Flatten into one contiguous block and lock it.
             var media_buffer: ?*mf.IMFMediaBuffer = null;
-            if (com.FAILED(s.ConvertToContiguousBuffer(&media_buffer)) or media_buffer == null) {
-                self.err_flag = true;
-                return null;
-            }
+            if (com.FAILED(s.ConvertToContiguousBuffer(&media_buffer)) or media_buffer == null) return null;
             const mb = media_buffer.?;
-            defer _ = mb.Release();
+            defer com.release(mb);
 
             var data: ?[*]u8 = null;
             var cur_len: com.DWORD = 0;
-            if (com.FAILED(mb.Lock(&data, null, &cur_len)) or data == null) {
-                self.err_flag = true;
-                return null;
-            }
+            if (com.FAILED(mb.Lock(&data, null, &cur_len)) or data == null) return null;
 
             const channels: i32 = if (self.audio_channels > 0) self.audio_channels else 1;
             const float_count: usize = cur_len / @sizeOf(f32);
@@ -825,7 +569,6 @@ pub const MfBackend = struct {
             // buffer (unlocked before we return).
             self.audio_scratch.resize(self.allocator, float_count) catch {
                 _ = mb.Unlock();
-                self.err_flag = true;
                 return null;
             };
             const src: [*]const f32 = @ptrCast(@alignCast(data.?));
@@ -835,7 +578,7 @@ pub const MfBackend = struct {
             const frame_count: i32 = @intCast(float_count / @as(usize, @intCast(channels)));
 
             return .{
-                .pts_seconds = ticksToSeconds(timestamp),
+                .pts_seconds = colorimetry.ticksToSeconds(timestamp),
                 .samples = self.audio_scratch.items[0..float_count],
                 .frame_count = frame_count,
                 .channel_count = channels,

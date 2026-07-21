@@ -2,21 +2,19 @@
 //! Transcribed from d3d12.h.
 //!
 //! The D3D12 device is not created here — Godot's RenderingDevice hands it to
-//! the importer. All the port does on the D3D12 side is match the adapter LUID,
-//! open shared NT handles exported from D3D11 (textures and a fence), and wait
-//! on the fence. So only three interfaces appear, each with almost every slot
-//! collapsed to an opaque placeholder.
+//! the importer. All the port does on the D3D12 side is open shared NT handles
+//! exported from D3D11 (textures and a fence) and wait on the fence. So only
+//! three interfaces appear, each with almost every slot collapsed to an opaque
+//! placeholder.
 
 const std = @import("std");
 const com = @import("com.zig");
-const dxgi = @import("dxgi.zig");
 
 const GUID = com.GUID;
 const HRESULT = com.HRESULT;
 const ULONG = com.ULONG;
 const UINT64 = u64;
 const HANDLE = com.HANDLE;
-const LUID = dxgi.LUID;
 
 // ID3D12Resource is only ever held and handed back to Godot as a raw handle;
 // no method is called on it.
@@ -24,10 +22,7 @@ pub const ID3D12Resource = opaque {};
 
 // ---------------------------------------------------------------------------
 // ID3D12Device : ID3D12Object : IUnknown (44 slots). Typed: OpenSharedHandle
-// (slot 32) and GetAdapterLuid (slot 43).
-//
-// GetAdapterLuid returns a struct by value; the mingw C vtable lowers that to a
-// hidden `LUID* __ret` out-param and echoes it back as the return value.
+// (slot 32).
 // ---------------------------------------------------------------------------
 pub const ID3D12Device = extern struct {
     lpVtbl: *const Vtbl,
@@ -78,19 +73,11 @@ pub const ID3D12Device = extern struct {
         SetStablePowerState: *const anyopaque,
         CreateCommandSignature: *const anyopaque,
         GetResourceTiling: *const anyopaque,
-        GetAdapterLuid: *const fn (*Self, *LUID) callconv(.winapi) *LUID,
+        GetAdapterLuid: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn OpenSharedHandle(self: *Self, handle: HANDLE, riid: *const GUID, out: *?*anyopaque) HRESULT {
         return self.lpVtbl.OpenSharedHandle(self, handle, riid, out);
-    }
-    pub inline fn GetAdapterLuid(self: *Self) LUID {
-        var out: LUID = undefined;
-        _ = self.lpVtbl.GetAdapterLuid(self, &out);
-        return out;
     }
 };
 
@@ -117,9 +104,6 @@ pub const ID3D12Fence = extern struct {
         Signal: *const anyopaque,
     };
 
-    pub inline fn Release(self: *Self) ULONG {
-        return self.lpVtbl.Release(self);
-    }
     pub inline fn GetCompletedValue(self: *Self) UINT64 {
         return self.lpVtbl.GetCompletedValue(self);
     }

@@ -149,8 +149,8 @@ fn releaseTeardown(v: *ReleaseValue) void {
     si.freePlaneRids(v.rd, v.luma, v.chroma);
     // @alignCast: ID3D12Resource is an opaque (align-1) handle, but a live COM
     // pointer is vtable-aligned, so the upcast to *IUnknown is sound.
-    _ = @as(*com.IUnknown, @ptrCast(@alignCast(v.d3d12_luma))).Release();
-    _ = @as(*com.IUnknown, @ptrCast(@alignCast(v.d3d12_chroma))).Release();
+    com.release(@as(*com.IUnknown, @ptrCast(@alignCast(v.d3d12_luma))));
+    com.release(@as(*com.IUnknown, @ptrCast(@alignCast(v.d3d12_chroma))));
 }
 
 /// Per-frame acquire payload: CPU-wait on the D3D12 fence for this frame's
@@ -267,7 +267,7 @@ pub const D3D12SurfaceImporter = struct {
             log.err("init: ID3D11Device5 not available (needs Windows 10 1809+).", .{});
             return false;
         };
-        defer _ = device5.Release();
+        defer com.release(device5);
 
         var fence_out: ?*anyopaque = null;
         if (com.FAILED(device5.CreateFence(0, d3d11.D3D11_FENCE_FLAG_SHARED, &d3d11.ID3D11Fence.IID, &fence_out))) {
@@ -323,13 +323,13 @@ pub const D3D12SurfaceImporter = struct {
             &compile_errors,
         );
         defer if (compile_errors) |e| {
-            _ = e.Release();
+            com.release(e);
         };
         if (com.FAILED(compile_hr) or bytecode == null) {
             log.err("init: plane-split shader compile failed.", .{});
             return false;
         }
-        defer _ = bytecode.?.Release();
+        defer com.release(bytecode.?);
 
         var cs_out: ?*d3d11.ID3D11ComputeShader = null;
         if (com.FAILED(dev11.CreateComputeShader(bytecode.?.GetBufferPointer().?, bytecode.?.GetBufferSize(), null, &cs_out))) {
@@ -395,7 +395,7 @@ pub const D3D12SurfaceImporter = struct {
             self.intermediate_height != height or self.intermediate_format != src_desc.Format)
         {
             if (self.intermediate) |t| {
-                _ = t.Release();
+                com.release(t);
                 self.intermediate = null;
             }
             var inter_desc = std.mem.zeroes(d3d11.D3D11_TEXTURE2D_DESC);
@@ -576,7 +576,7 @@ pub const D3D12SurfaceImporter = struct {
     /// open it as an ID3D12Resource on Godot's D3D12 device.
     fn exportAndOpen(self: *D3D12SurfaceImporter, tex: *d3d11.ID3D11Texture2D, out: *?*d3d12.ID3D12Resource) bool {
         const dxgi_res = com.queryInterface(dxgi.IDXGIResource1, tex) orelse return false;
-        defer _ = dxgi_res.Release();
+        defer com.release(dxgi_res);
         var handle: com.HANDLE = null;
         if (com.FAILED(dxgi_res.CreateSharedHandle(null, dxgi.DXGI_SHARED_RESOURCE_READ | dxgi.DXGI_SHARED_RESOURCE_WRITE, null, &handle)) or handle == null) {
             return false;
@@ -600,31 +600,31 @@ pub const D3D12SurfaceImporter = struct {
             // @alignCast: ID3D11Buffer/ComputeShader are opaque (align-1)
             // handles; a live COM pointer is vtable-aligned, so the upcast is
             // sound.
-            _ = @as(*com.IUnknown, @ptrCast(@alignCast(p))).Release();
+            com.release(@as(*com.IUnknown, @ptrCast(@alignCast(p))));
             self.params_cb = null;
         }
         if (self.plane_split_cs) |p| {
-            _ = @as(*com.IUnknown, @ptrCast(@alignCast(p))).Release();
+            com.release(@as(*com.IUnknown, @ptrCast(@alignCast(p))));
             self.plane_split_cs = null;
         }
         if (self.context4) |p| {
-            _ = p.Release();
+            com.release(p);
             self.context4 = null;
         }
         if (self.device3) |p| {
-            _ = p.Release();
+            com.release(p);
             self.device3 = null;
         }
         if (self.intermediate) |p| {
-            _ = p.Release();
+            com.release(p);
             self.intermediate = null;
         }
         if (self.d3d12_fence) |p| {
-            _ = p.Release();
+            com.release(p);
             self.d3d12_fence = null;
         }
         if (self.d3d11_fence) |p| {
-            _ = p.Release();
+            com.release(p);
             self.d3d11_fence = null;
         }
         if (self.fence_event) |e| {
@@ -632,15 +632,15 @@ pub const D3D12SurfaceImporter = struct {
             self.fence_event = null;
         }
         if (self.context) |c| {
-            _ = c.Release();
+            com.release(c);
             self.context = null;
         }
         if (self.device) |d| {
-            _ = d.Release();
+            com.release(d);
             self.device = null;
         }
         if (self.d3d12_device) |p| {
-            _ = p.Release();
+            com.release(p);
             self.d3d12_device = null;
         }
         self.pipeline_ready = false;
