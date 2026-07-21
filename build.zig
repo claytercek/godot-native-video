@@ -32,8 +32,12 @@ pub fn build(b: *Build) !void {
     // avf_mod is wired below. The runtime bindings test is folded into the main
     // `test` step; it exercises real MF + D3D11 objects, so it needs Windows and
     // a D3D11-capable GPU (it SkipZigTests when no device is available).
+    // Held past the Windows block so the Godot extension below can wire it into
+    // ext_mod as the "mf" import (the D3D11/D3D12 surface importers reach the
+    // bindings through `@import("mf").win`). Null off Windows.
+    var mf_mod: ?*Build.Module = null;
     if (target.result.os.tag == .windows) {
-        const mf_mod = b.createModule(.{
+        const m = b.createModule(.{
             .root_source_file = b.path("src/mf/mf.zig"),
             .target = target,
             .optimize = optimize,
@@ -41,8 +45,9 @@ pub fn build(b: *Build) !void {
                 .{ .name = "core", .module = core_mod },
             },
         });
-        linkMfLibs(mf_mod);
-        const mf_tests = b.addTest(.{ .root_module = mf_mod });
+        linkMfLibs(m);
+        mf_mod = m;
+        const mf_tests = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(mf_tests).step);
 
         // Standalone decode harness: pumps the MF backend without Godot. Mirrors
@@ -75,8 +80,10 @@ pub fn build(b: *Build) !void {
     });
 
     // AVFoundation backend as its own module so src/avf can import "core"
-    // without escaping a module root.
-    const avf_mod = b.createModule(.{
+    // without escaping a module root. Off Windows only — the extension's backend
+    // seam picks `mf` on Windows and `avf` elsewhere at comptime, and a named
+    // module import must exist for exactly the platform that imports it.
+    const avf_mod = if (target.result.os.tag == .windows) null else b.createModule(.{
         .root_source_file = b.path("src/avf/avf_backend.zig"),
         .target = target,
         .optimize = optimize,
@@ -92,9 +99,14 @@ pub fn build(b: *Build) !void {
         .imports = &.{
             .{ .name = "godot", .module = gdzig_dep.module("gdzig") },
             .{ .name = "core", .module = core_mod },
-            .{ .name = "avf", .module = avf_mod },
         },
     });
+
+    // Backend seam: the surface importers and backend-open path resolve their
+    // platform module by name. Wire exactly the one the target uses so the
+    // comptime switch in native_video_stream_playback.zig has its import.
+    if (mf_mod) |m| ext_mod.addImport("mf", m);
+    if (avf_mod) |m| ext_mod.addImport("avf", m);
 
     const extension = gdzig.addExtension(b, .{
         .name = "native_video",

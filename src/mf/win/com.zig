@@ -124,7 +124,11 @@ pub fn ComPtr(comptime T: type) type {
         }
         pub fn reset(self: *Self) void {
             if (self.ptr) |p| {
-                _ = @as(*IUnknown, @ptrCast(p)).Release();
+                // @alignCast: opaque interface types (ID3D12Resource, the D3D11
+                // view/buffer/shader handles) have alignment 1, but a live COM
+                // pointer is really vtable-aligned, so the upcast to *IUnknown
+                // is sound.
+                _ = @as(*IUnknown, @ptrCast(@alignCast(p))).Release();
                 self.ptr = null;
             }
         }

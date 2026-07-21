@@ -23,6 +23,7 @@
 const NativeVideoStreamPlayback = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const godot = @import("godot");
@@ -35,7 +36,14 @@ const String = godot.builtin.String;
 const Dictionary = godot.builtin.Dictionary;
 const PackedFloat32Array = godot.builtin.PackedFloat32Array;
 
-const avf = @import("avf");
+// Platform decode backend, resolved at comptime: Media Foundation on Windows,
+// AVFoundation elsewhere. Both expose `create(allocator) !Backend`. build.zig
+// wires exactly one of these named module imports per target, so the branch not
+// taken never references a module that isn't present for this platform.
+const platform_backend = if (builtin.os.tag == .windows)
+    @import("mf")
+else
+    @import("avf");
 
 // Core types come through the "core" named module (build.zig-wired) so they
 // match the PlaybackController's module instance. A module's root restricts
@@ -163,7 +171,7 @@ fn flushWarnings(self: *NativeVideoStreamPlayback) void {
 /// Returns null if the backend can't be constructed or open() fails; on
 /// success the caller owns the (already open) backend and must deinit() it.
 pub fn openBackendForPath(allocator: Allocator, path: String) ?Backend {
-    var backend = avf.create(allocator) catch return null;
+    var backend = platform_backend.create(allocator) catch return null;
 
     var os_path = ProjectSettings.globalizePath(path);
     defer os_path.deinit();

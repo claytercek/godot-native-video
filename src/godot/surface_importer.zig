@@ -78,6 +78,21 @@ pub const PlaneTextures = struct {
     /// 1.0; the Windows DXGI P010 import (out of scope here) is the exception.
     sample_scale: f32 = 1.0,
 
+    /// Optional GPU-submission-ordering hook the present pipeline calls once,
+    /// BEFORE the compute dispatch that samples the planes. Empty (a no-op) for
+    /// importers that share one device with the decoder (Metal) or copy through
+    /// the CPU (Windows CPU-copy): no cross-device sync object exists there. The
+    /// Windows D3D12 zero-copy importer sets it to a CPU-blocking fence wait that
+    /// does not return until the D3D11 plane-split pass it depends on has
+    /// finished on the GPU — so callers must not assume acquire returns quickly.
+    ///
+    /// This is a submission-ordering hook, distinct from `release` below (which
+    /// frees the wrappers). There is no matching release-sync hook: the only
+    /// path that would have needed one is the DXGI keyed-mutex import, which is
+    /// not ported (see importer_selector's module doc comment); the D3D12 path's
+    /// plane textures are single-use, so nothing hands access back.
+    acquire: Closure = .{},
+
     /// Frees the RD texture RIDs and releases the native import wrappers. Call
     /// exactly once (the retire-ring does this after N frames).
     release: Closure = .{},
