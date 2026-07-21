@@ -34,18 +34,32 @@ pub fn build(b: *Build) !void {
     // a D3D11-capable GPU (it SkipZigTests when no device is available).
     if (target.result.os.tag == .windows) {
         const mf_mod = b.createModule(.{
-            .root_source_file = b.path("src/mf/win.zig"),
+            .root_source_file = b.path("src/mf/mf.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+            },
         });
-        for ([_][]const u8{
-            "mfplat", "mfreadwrite", "mf",    "d3d11",
-            "dxgi",   "d3d12",       "ole32", "d3dcompiler_47",
-        }) |lib| {
-            mf_mod.linkSystemLibrary(lib, .{});
-        }
+        linkMfLibs(mf_mod);
         const mf_tests = b.addTest(.{ .root_module = mf_mod });
         test_step.dependOn(&b.addRunArtifact(mf_tests).step);
+
+        // Standalone decode harness: pumps the MF backend without Godot. Mirrors
+        // the macOS decode-smoke step below.
+        const smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/mf/decode_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+            },
+        });
+        linkMfLibs(smoke_mod);
+        const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
+        const smoke_run = b.addRunArtifact(smoke_exe);
+        if (b.args) |args| smoke_run.addArgs(args);
+        b.step("decode-smoke", "Pump the MF backend without Godot (pass a media path via -- <path>)").dependOn(&smoke_run.step);
     }
 
     // --- Godot extension: gdzig glue + AVFoundation backend. ---
@@ -129,6 +143,18 @@ pub fn build(b: *Build) !void {
     run.addDirectoryArg(b.path("./project"));
     run.step.dependOn(&install.step);
     b.step("run", "Run the demo project in Godot").dependOn(&run.step);
+}
+
+/// Link the Windows system libraries the Media Foundation backend needs.
+/// Shared by the bindings/backend test module and the decode-smoke harness so
+/// the list lives in exactly one place.
+fn linkMfLibs(mod: *Build.Module) void {
+    for ([_][]const u8{
+        "mfplat", "mfreadwrite", "mf",    "d3d11",
+        "dxgi",   "d3d12",       "ole32", "d3dcompiler_47",
+    }) |lib| {
+        mod.linkSystemLibrary(lib, .{});
+    }
 }
 
 /// Compile the AVFoundation ObjC shim into `mod` and link the frameworks it
