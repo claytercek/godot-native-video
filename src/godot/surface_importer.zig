@@ -4,10 +4,14 @@
 //! Y'CbCr surface (NV12 8-bit, or P010/x420 10-bit) into Godot's
 //! RenderingDevice as two plane textures WITHOUT any CPU copy, then runs
 //! the single NV12->RGB compute pass. The concrete importer lives in
-//! metal_surface_importer.zig (CVPixelBuffer IOSurface -> MTLTexture via
-//! CVMetalTextureCache -> RenderingDevice.textureCreateFromExtension);
-//! Windows import paths (DXGI/D3D12/CPU-Copy) are a non-goal on this
-//! macOS-only build.
+//! metal_surface_importer.zig on macOS (CVPixelBuffer IOSurface -> MTLTexture
+//! via CVMetalTextureCache -> RenderingDevice.textureCreateFromExtension); on
+//! Windows, a D3D12 zero-copy importer and a CPU-copy fallback are chosen at
+//! runtime by core.importer_selector from the active RenderingDevice driver
+//! and Godot version. A third Windows path — a Vulkan external-memory /
+//! DXGI shared-handle zero-copy importer — is a known limitation: it is not
+//! ported, blocked on an upstream Godot texture-import aspect fix (see
+//! importer_selector's module doc comment).
 //!
 //! This module holds the types shared across that module boundary — the
 //! PlaneTextures import result and the small RID/closure helpers — so the
