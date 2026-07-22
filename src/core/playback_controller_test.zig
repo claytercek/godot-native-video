@@ -387,6 +387,47 @@ test "stop() resets transport state and tick() is a no-op before load()" {
     controller.shutdown();
 }
 
+test "6-channel back-pressure never races the source reader ahead (bounded backlog)" {
+    // Regression for the cross-platform "audio too fast + choppy" bug on
+    // multi-channel clips. A back-pressured sink accepts far fewer frames than
+    // driveAudio() offers (Godot's downstream buffer holds ~1/channels as many
+    // frames as we push). The old code drained the whole offered block from the
+    // ring but advanced only by `accepted`, discarding the surplus; fillAudio()
+    // then refilled the over-drained ring, pulling the reader ~channels× real
+    // time. The fix consumes only the accepted frames, so the reader is pulled
+    // at playback rate and the decoded-vs-served backlog stays within one ring.
+    const sched = makeSched();
+    defer sched.deinit();
+    var controller = PlaybackController.init();
+    defer controller.deinit();
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(
+        alloc,
+        &.{.{ .channels = 6, .sample_rate = 48000 }},
+        1024, // 1024-frame chunks, as real AAC delivers
+    ).backend(), 0.0);
+    controller.play(WallClockMs.init(0.0));
+
+    var sink = CappedMixSink{ .accept_cap = 170 }; // ~1024/6: heavy back-pressure
+
+    var t: f64 = 0.0;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        t += 16.6;
+        _ = controller.tick(1.0 / 60.0, WallClockMs.init(t), sink.sink());
+    }
+
+    // Every decoded frame is either served to the sink or still buffered in the
+    // ring, so the backlog can never exceed one ring's worth. Under the old
+    // drop-the-surplus code this gap grew without bound (the reader raced ~6×
+    // ahead), reaching hundreds of thousands of frames over 300 ticks.
+    const decoded = controller.audio_telemetry.decoded_frames_in;
+    const served = controller.audio_telemetry.frames_served;
+    const ring_capacity: u64 = 48000 / 2;
+    try std.testing.expect(decoded - served <= ring_capacity + 1024);
+
+    controller.shutdown();
+}
+
 // =======================================================================
 // Track switch reconcile
 // =======================================================================

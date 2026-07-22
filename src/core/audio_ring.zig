@@ -101,12 +101,15 @@ pub const AudioRing = struct {
         return n;
     }
 
-    /// Drain up to `frame_count` frames into `out` (frame_count * channels
-    /// floats). Frames not available are written as silence (0.0). Returns
-    /// the number of REAL (non-silence) frames produced — the caller uses
-    /// this to advance the master clock by exactly what the listener will
-    /// hear.
-    pub fn readFrames(self: *AudioRing, out: []f32, frame_count: usize) usize {
+    /// Copy up to `frame_count` frames into `out` (frame_count * channels
+    /// floats) WITHOUT consuming them — the read cursor is left untouched.
+    /// Frames not available are written as silence (0.0). Returns the number
+    /// of REAL (non-silence) frames copied.
+    ///
+    /// Pairs with consume(): a caller offers the peeked frames to a
+    /// back-pressured sink, then consumes exactly the count the sink accepted,
+    /// so frames the sink rejects stay buffered instead of being dropped.
+    pub fn peekFrames(self: *AudioRing, out: []f32, frame_count: usize) usize {
         const ch: usize = @intCast(self.channels);
         const real = @min(frame_count, self.availableFrames());
         const floats = real * ch;
@@ -114,9 +117,28 @@ pub const AudioRing = struct {
         const first = @min(floats, self.capacity_floats - self.head);
         @memcpy(out[0..first], self.buffer[self.head..][0..first]);
         @memcpy(out[first..floats], self.buffer[0 .. floats - first]);
-        self.head = (self.head + floats) % self.capacity_floats;
         // Zero-fill the underrun tail.
         @memset(out[floats .. frame_count * ch], 0.0);
+        return real;
+    }
+
+    /// Advance the read cursor by up to `frame_count` frames, dropping them
+    /// from the ring. Returns the number of frames actually consumed
+    /// (min(frame_count, availableFrames)).
+    pub fn consume(self: *AudioRing, frame_count: usize) usize {
+        const ch: usize = @intCast(self.channels);
+        const n = @min(frame_count, self.availableFrames());
+        self.head = (self.head + n * ch) % self.capacity_floats;
+        return n;
+    }
+
+    /// Drain up to `frame_count` frames into `out` (frame_count * channels
+    /// floats): a peekFrames() followed by consuming every real frame it
+    /// produced. Frames not available are written as silence (0.0). Returns
+    /// the number of REAL (non-silence) frames produced.
+    pub fn readFrames(self: *AudioRing, out: []f32, frame_count: usize) usize {
+        const real = self.peekFrames(out, frame_count);
+        _ = self.consume(real);
         return real;
     }
 };
@@ -247,6 +269,95 @@ fn fuzzAudioRing(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expectEqual(model_frames, ring.availableFrames());
         try std.testing.expectEqual(model_frames == 0, ring.empty());
     }
+}
+
+test "AudioRing peekFrames copies without consuming; consume advances exactly" {
+    var r = try AudioRing.init(std.testing.allocator, 6, 64);
+    defer r.deinit();
+    // 2 six-channel frames.
+    const in = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    try std.testing.expectEqual(2, r.write(&in, 2));
+
+    // Peek both frames — the cursor must not move.
+    var out = [_]f32{-1.0} ** 12;
+    try std.testing.expectEqual(2, r.peekFrames(&out, 2));
+    try std.testing.expectEqualSlices(f32, &in, &out);
+    try std.testing.expectEqual(2, r.availableFrames());
+
+    // A second peek returns identical data (proves non-destructive).
+    var out2 = [_]f32{0.0} ** 12;
+    try std.testing.expectEqual(2, r.peekFrames(&out2, 2));
+    try std.testing.expectEqualSlices(f32, &in, &out2);
+
+    // Consume ONE frame; the second must remain buffered and readable.
+    try std.testing.expectEqual(1, r.consume(1));
+    try std.testing.expectEqual(1, r.availableFrames());
+    var out3 = [_]f32{0.0} ** 6;
+    try std.testing.expectEqual(1, r.peekFrames(&out3, 1));
+    try std.testing.expectEqualSlices(f32, in[6..12], &out3);
+}
+
+test "AudioRing consume never advances past what is available" {
+    var r = try AudioRing.init(std.testing.allocator, 2, 16);
+    defer r.deinit();
+    const in = [_]f32{ 1, 2, 3, 4 }; // 2 stereo frames
+    _ = r.write(&in, 2);
+    // Asking to consume more than buffered drains only the 2 available.
+    try std.testing.expectEqual(2, r.consume(100));
+    try std.testing.expect(r.empty());
+    try std.testing.expectEqual(0, r.consume(10)); // nothing left
+}
+
+test "AudioRing 6ch chunked fill + back-pressure conserves every decoded frame" {
+    // Ring-level reproduction of the cross-platform "audio too fast + choppy"
+    // bug. A 6-channel ring is topped up to a half-fill target in 1024-frame
+    // chunks (exactly fillAudioClosure's `while freeFrames() > availableFrames()`
+    // loop), then a back-pressured sink accepts only ~1/6 of the offered frames
+    // each round (the 6-channel case). The fixed drain path — peekFrames() then
+    // consume() ONLY the accepted count — must never drop a decoded frame:
+    // everything pulled is stored, and everything stored is either consumed or
+    // still buffered. The ring must also stay bounded and the fill loop must
+    // stop below capacity.
+    const channels = 6;
+    const capacity_frames = 24000; // canonical_sample_rate/2, as sized in load()
+    var r = try AudioRing.init(std.testing.allocator, channels, capacity_frames);
+    defer r.deinit();
+
+    const chunk_frames = 1024;
+    const chunk: [chunk_frames * channels]f32 = @splat(0.25);
+
+    var total_pulled: usize = 0; // frames the "reader" produced (== stored, no drops)
+    var total_consumed: usize = 0; // frames the sink accepted
+
+    var drain: [4096 * channels]f32 = undefined;
+
+    var round: usize = 0;
+    while (round < 500) : (round += 1) {
+        // Fill side: top up to the half-fill target in whole chunks. The loop
+        // stops before the ring is full, so every chunk is stored intact — the
+        // fill loop never pulls more than the ring can hold.
+        while (r.freeFrames() > r.availableFrames()) {
+            const stored = r.write(&chunk, chunk_frames);
+            try std.testing.expectEqual(chunk_frames, stored); // no partial/dropped chunk
+            total_pulled += stored;
+        }
+        // Stopped at the half-fill target: bounded, and below capacity.
+        try std.testing.expect(r.availableFrames() <= capacity_frames);
+        try std.testing.expect(r.freeFrames() <= r.availableFrames());
+
+        // Drive side: offer up to 4096 frames; the sink accepts only ~1/6.
+        // Consume ONLY the accepted count — the surplus stays buffered.
+        const request = @min(r.availableFrames(), 4096);
+        const real = r.peekFrames(drain[0 .. request * channels], request);
+        try std.testing.expectEqual(request, real);
+        const accepted = real / 6; // per-channel back-pressure
+        try std.testing.expectEqual(accepted, r.consume(accepted));
+        total_consumed += accepted;
+    }
+
+    // Conservation: every pulled frame is accounted for — consumed or buffered.
+    // Nothing vanished (the defect dropped ~5/6 of every offered block here).
+    try std.testing.expectEqual(total_pulled, total_consumed + r.availableFrames());
 }
 
 test "AudioRing wraps around correctly" {

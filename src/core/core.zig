@@ -13,6 +13,7 @@ pub const decode_scheduler = @import("decode_scheduler.zig");
 pub const playback_controller = @import("playback_controller.zig");
 pub const shaders = @import("shaders.zig");
 pub const clock = @import("clock.zig");
+pub const sink_latency = @import("sink_latency.zig");
 pub const scrubber = @import("scrubber.zig");
 pub const present_selector = @import("present_selector.zig");
 pub const hdr_color_math = @import("hdr_color_math.zig");
