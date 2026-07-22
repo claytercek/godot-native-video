@@ -114,7 +114,6 @@ extern fn nv_avf_get_audio_track_info(h: *Shim, index: c_int, out: *c_audio_trac
 extern fn nv_avf_build_reader(h: *Shim, start_time: f64, audio_track_index: c_int) Result;
 // Produces .ok, .none, or .fail.
 extern fn nv_avf_reselect_audio_track(h: *Shim, track_index: c_int, start_time: f64) Result;
-extern fn nv_avf_teardown_audio_reader(h: *Shim) void;
 // Produces .ok, .none, or .fail.
 extern fn nv_avf_next_video_frame(h: *Shim, out: *c_video_frame) Result;
 // Produces .ok, .none, or .fail.
@@ -224,6 +223,7 @@ pub const AvfBackend = struct {
     audio_tracks: std.ArrayList(core.AudioTrackInfo) = .empty,
 
     selected_audio_index: i32 = 0,
+    applied_audio_index: i32 = 0,
     audio_channels: i32 = 0,
     audio_rate: i32 = 0,
 
@@ -305,6 +305,7 @@ pub const AvfBackend = struct {
 
         // Initialise selection to the first (default) track at open.
         self.selected_audio_index = 0;
+        self.applied_audio_index = 0;
         if (self.audio_tracks.items.len > 0) {
             self.audio_channels = self.audio_tracks.items[0].channels;
             self.audio_rate = self.audio_tracks.items[0].sample_rate;
@@ -332,9 +333,11 @@ pub const AvfBackend = struct {
         self.duration = 0.0;
         self.width = 0;
         self.height = 0;
+        self.color = core.Colorimetry.bt709_defaults;
         self.audio_channels = 0;
         self.audio_rate = 0;
         self.selected_audio_index = 0;
+        self.applied_audio_index = 0;
         self.logged_audio_negotiation = false;
     }
 
@@ -343,6 +346,7 @@ pub const AvfBackend = struct {
     fn applyTrackSelection(self: *AvfBackend, i: i32) bool {
         if (i < 0 or i >= @as(i32, @intCast(self.audio_tracks.items.len))) return false;
         self.selected_audio_index = i;
+        self.applied_audio_index = i;
         self.audio_channels = self.audio_tracks.items[@intCast(i)].channels;
         self.audio_rate = self.audio_tracks.items[@intCast(i)].sample_rate;
         return true;
@@ -351,22 +355,19 @@ pub const AvfBackend = struct {
     fn seekImpl(self: *AvfBackend, pts_seconds: f64) bool {
         if (!self.opened) return false;
         const target = @max(pts_seconds, 0.0);
-        // Tear down any dedicated audio-only reader so seek builds a fresh
-        // combined reader with both video and the selected audio track.
-        nv_avf_teardown_audio_reader(self.shim);
         const audio_idx: c_int = if (self.audio_tracks.items.len > 0)
             self.selected_audio_index
         else
             -1;
         if (nv_avf_build_reader(self.shim, target, audio_idx) != .ok) return false;
+        if (audio_idx >= 0) _ = self.applyTrackSelection(audio_idx);
         return true;
     }
 
     fn selectAudioTrackImpl(self: *AvfBackend, index: i32) void {
         const count: i32 = @intCast(self.audio_tracks.items.len);
         if (count == 0) return; // no audio tracks to select from
-        const clamped = std.math.clamp(index, 0, count - 1);
-        _ = self.applyTrackSelection(clamped);
+        self.selected_audio_index = std.math.clamp(index, 0, count - 1);
     }
 
     fn reselectAudioTrackImpl(self: *AvfBackend, index: i32, pts_seconds: f64) bool {
@@ -376,9 +377,9 @@ pub const AvfBackend = struct {
         const clamped = std.math.clamp(index, 0, count - 1);
         const target = @max(pts_seconds, 0.0);
 
-        // The shim builds the dedicated audio-only reader and rebuilds the
-        // combined reader as video-only in one atomic step, rolling back on
-        // partial failure — the reader lifecycle stays shim-side.
+        // The shim builds the dedicated audio-only reader and, when the asset
+        // has video, rebuilds a video-only reader in one atomic step. It rolls
+        // back partial construction; the reader lifecycle stays shim-side.
         if (nv_avf_reselect_audio_track(self.shim, clamped, target) != .ok) return false;
         _ = self.applyTrackSelection(clamped);
         return true;
@@ -407,14 +408,29 @@ pub const AvfBackend = struct {
     fn nextAudioChunkImpl(self: *AvfBackend) ?core.AudioChunk {
         var cc: c_audio_chunk = undefined;
         if (nv_avf_next_audio_chunk(self.shim, &cc) != .ok) return null;
+
         if (!self.logged_audio_negotiation) {
             self.logged_audio_negotiation = true;
-            logAudioNegotiation(self.selected_audio_index, self.audio_channels, self.audio_rate, cc);
+            logAudioNegotiation(self.applied_audio_index, self.audio_channels, self.audio_rate, cc);
+        }
+
+        // The delivered sample format is the authoritative boundary. AVF is
+        // asked for the declared rate/channel layout, but this readback guards
+        // against a converter choosing a different valid PCM layout.
+        if (cc.channels <= 0 or cc.sample_rate <= 0) return null;
+        self.audio_channels = @intCast(cc.channels);
+        self.audio_rate = @intCast(cc.sample_rate);
+        if (self.applied_audio_index >= 0 and
+            self.applied_audio_index < @as(i32, @intCast(self.audio_tracks.items.len)))
+        {
+            const track = &self.audio_tracks.items[@intCast(self.applied_audio_index)];
+            track.channels = self.audio_channels;
+            track.sample_rate = self.audio_rate;
         }
         const float_count: usize = @intCast(cc.float_count);
         const samples: []const f32 = if (cc.samples) |p| p[0..float_count] else &.{};
         // channel_count is the selected track's channel count, min 1.
-        const channels: i32 = if (self.audio_channels > 0) self.audio_channels else 1;
+        const channels = self.audio_channels;
         return .{
             .pts_seconds = cc.pts_seconds,
             .samples = samples,

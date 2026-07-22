@@ -54,9 +54,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         "open ok: {d}x{d} {d:.2}s | color: matrix={s} transfer={s} range={s} bit_depth={d}\n",
         .{
-            backend.videoWidth(),          backend.videoHeight(),
-            backend.durationSeconds(),     matrixName(color.matrix),
-            transferName(color.transfer),  rangeName(color.range),
+            backend.videoWidth(),         backend.videoHeight(),
+            backend.durationSeconds(),    matrixName(color.matrix),
+            transferName(color.transfer), rangeName(color.range),
             color.bit_depth,
         },
     );

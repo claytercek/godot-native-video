@@ -25,6 +25,26 @@ pub const PcmFormat = struct {
     rate: i32,
 };
 
+pub const PreparedAudioReader = struct {
+    reader: *mf.IMFSourceReader,
+    stream_index: i32,
+    format: PcmFormat,
+
+    pub fn discard(self: *PreparedAudioReader) void {
+        com.release(self.reader);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedReader = struct {
+    reader: *mf.IMFSourceReader,
+
+    pub fn discard(self: *PreparedReader) void {
+        com.release(self.reader);
+        self.* = undefined;
+    }
+};
+
 pub const MfPipeline = struct {
     // D3D11 device + the DXGI device manager the source reader uses to
     // hardware-decode into D3D11 NV12/P010 textures. Created once per open(),
@@ -88,7 +108,7 @@ pub const MfPipeline = struct {
     // Build the shared source reader bound to the DXGI device manager so decode
     // output is D3D11-backed. Enables advanced video processing + hardware
     // transforms. `path16` is the UTF-16, NUL-terminated source path.
-    pub fn createReader(self: *MfPipeline, path16: [:0]const u16) !void {
+    pub fn prepareReader(self: *MfPipeline, path16: [:0]const u16) !PreparedReader {
         var attrs: ?*mf.IMFAttributes = null;
         if (com.FAILED(mf.MFCreateAttributes(&attrs, 4)) or attrs == null) return error.Attributes;
         defer com.release(attrs.?);
@@ -101,52 +121,74 @@ pub const MfPipeline = struct {
         if (com.FAILED(mf.MFCreateSourceReaderFromURL(path16.ptr, a, &reader)) or reader == null) {
             return error.Reader;
         }
-        self.reader = reader;
+        return .{ .reader = reader.? };
+    }
+
+    pub fn createReader(self: *MfPipeline, path16: [:0]const u16) !void {
+        const prepared = try self.prepareReader(path16);
+        self.reader = prepared.reader;
+    }
+
+    pub fn commitReader(self: *MfPipeline, prepared: *PreparedReader) void {
+        const old_reader = self.reader;
+        self.reader = prepared.reader;
+        prepared.* = undefined;
+        self.resetAudioReader();
+        if (old_reader) |reader| com.release(reader);
     }
 
     // Create an output media type of `subtype` and set it on the video stream.
     // Returns true on success. The reader inserts a video-processor MFT if the
     // decoder can't natively output that subtype.
     pub fn requestSubtype(self: *MfPipeline, vidx: com.DWORD, subtype: com.GUID) bool {
+        return requestSubtypeOn(self.reader.?, vidx, subtype);
+    }
+
+    pub fn requestSubtypeOn(reader: *mf.IMFSourceReader, vidx: com.DWORD, subtype: com.GUID) bool {
         var out_type: ?*mf.IMFMediaType = null;
         if (com.FAILED(mf.MFCreateMediaType(&out_type)) or out_type == null) return false;
         defer com.release(out_type.?);
         const ot = out_type.?.asAttributes();
         _ = ot.SetGUID(&mf.MF_MT_MAJOR_TYPE, &mf.MFMediaType_Video);
         _ = ot.SetGUID(&mf.MF_MT_SUBTYPE, &subtype);
-        return com.SUCCEEDED(self.reader.?.SetCurrentMediaType(vidx, null, out_type.?));
+        return com.SUCCEEDED(reader.SetCurrentMediaType(vidx, null, out_type.?));
     }
 
     // Build a dedicated audio-only source reader for `mf_stream_index`, primed
     // at `start_ticks` (100ns units). No DXGI device manager — audio decodes on
-    // the CPU. The replacement is built and validated into a local first; only
-    // once it is known-good does this retire any previous dedicated reader and
-    // swap the new one in, so a failure leaves the existing reader untouched.
-    pub fn buildAudioReader(self: *MfPipeline, path16: [:0]const u16, mf_stream_index: i32, start_ticks: i64) bool {
+    // the CPU. Returns a validated candidate without touching the active
+    // reader; the backend commits it with the corresponding selection state.
+    pub fn prepareAudioReader(_: *MfPipeline, path16: [:0]const u16, mf_stream_index: i32, start_ticks: i64) ?PreparedAudioReader {
         const aidx: com.DWORD = @intCast(mf_stream_index);
 
         var ar: ?*mf.IMFSourceReader = null;
-        if (com.FAILED(mf.MFCreateSourceReaderFromURL(path16.ptr, null, &ar)) or ar == null) return false;
-        _ = ar.?.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE);
-
-        if (configurePcmOutput(ar.?, aidx) == null) {
+        if (com.FAILED(mf.MFCreateSourceReaderFromURL(path16.ptr, null, &ar)) or ar == null) return null;
+        if (com.FAILED(ar.?.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE))) {
             com.release(ar.?);
-            return false;
+            return null;
         }
+
+        const format = configurePcmOutput(ar.?, aidx) orelse {
+            com.release(ar.?);
+            return null;
+        };
 
         var pos = com.initPropVariantFromInt64(start_ticks);
         const hr = ar.?.SetCurrentPosition(&mf.GUID_NULL, &pos);
         _ = com.PropVariantClear(&pos);
         if (com.FAILED(hr)) {
             com.release(ar.?);
-            return false;
+            return null;
         }
 
-        // Known-good: swap only now.
+        return .{ .reader = ar.?, .stream_index = mf_stream_index, .format = format };
+    }
+
+    pub fn commitAudioReader(self: *MfPipeline, prepared: *PreparedAudioReader) void {
         self.resetAudioReader();
-        self.audio_reader = ar;
-        self.audio_reader_stream_index = mf_stream_index;
-        return true;
+        self.audio_reader = prepared.reader;
+        self.audio_reader_stream_index = prepared.stream_index;
+        prepared.* = undefined;
     }
 
     pub fn resetAudioReader(self: *MfPipeline) void {
@@ -186,26 +228,29 @@ pub const MfPipeline = struct {
 // failure. Free-standing (touches no MfPipeline state) so it serves both the
 // shared reader and the dedicated audio-only reader.
 pub fn configurePcmOutput(target: *mf.IMFSourceReader, aidx: com.DWORD) ?PcmFormat {
-    _ = target.SetStreamSelection(aidx, com.TRUE);
+    if (com.FAILED(target.SetStreamSelection(aidx, com.TRUE))) return null;
+    var configured = false;
+    defer if (!configured) {
+        _ = target.SetStreamSelection(aidx, com.FALSE);
+    };
 
     var pcm: ?*mf.IMFMediaType = null;
     if (com.FAILED(mf.MFCreateMediaType(&pcm)) or pcm == null) return null;
     defer com.release(pcm.?);
     const pa = pcm.?.asAttributes();
-    _ = pa.SetGUID(&mf.MF_MT_MAJOR_TYPE, &mf.MFMediaType_Audio);
-    _ = pa.SetGUID(&mf.MF_MT_SUBTYPE, &mf.MFAudioFormat_Float);
+    if (com.FAILED(pa.SetGUID(&mf.MF_MT_MAJOR_TYPE, &mf.MFMediaType_Audio))) return null;
+    if (com.FAILED(pa.SetGUID(&mf.MF_MT_SUBTYPE, &mf.MFAudioFormat_Float))) return null;
     if (com.FAILED(target.SetCurrentMediaType(aidx, null, pcm.?))) return null;
 
-    var fmt: PcmFormat = .{ .channels = 0, .rate = 0 };
     var current: ?*mf.IMFMediaType = null;
-    if (com.SUCCEEDED(target.GetCurrentMediaType(aidx, &current)) and current != null) {
-        defer com.release(current.?);
-        var ch: u32 = 0;
-        var rate: u32 = 0;
-        _ = current.?.asAttributes().GetUINT32(&mf.MF_MT_AUDIO_NUM_CHANNELS, &ch);
-        _ = current.?.asAttributes().GetUINT32(&mf.MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate);
-        fmt.channels = @intCast(ch);
-        fmt.rate = @intCast(rate);
-    }
-    return fmt;
+    if (com.FAILED(target.GetCurrentMediaType(aidx, &current)) or current == null) return null;
+    defer com.release(current.?);
+    var ch: u32 = 0;
+    var rate: u32 = 0;
+    const attrs = current.?.asAttributes();
+    if (com.FAILED(attrs.GetUINT32(&mf.MF_MT_AUDIO_NUM_CHANNELS, &ch))) return null;
+    if (com.FAILED(attrs.GetUINT32(&mf.MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate))) return null;
+    if (ch == 0 or rate == 0) return null;
+    configured = true;
+    return .{ .channels = @intCast(ch), .rate = @intCast(rate) };
 }

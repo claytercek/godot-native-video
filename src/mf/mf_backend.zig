@@ -112,7 +112,7 @@ pub const MfBackend = struct {
     owned_strings: std.ArrayList([]u8) = .empty,
 
     // Desired vs. actually-applied audio track. A selectAudioTrack() call only
-    // records `selected`; the shared reader is caught up (switchAudioTrack) on
+    // records `selected`; the shared reader is caught up on
     // the next seek(), which is when `applied` reconverges.
     selected_audio_track: i32 = 0,
     applied_audio_track: i32 = 0,
@@ -147,13 +147,10 @@ pub const MfBackend = struct {
 
     // ---- open-time stream configuration (policy) ----
 
-    // Scan every stream: pick the first video stream (reading colorimetry + bit
-    // depth off its NATIVE type), and collect audio-track metadata. Then
-    // reorder audio tracks to container order, negotiate the video output
-    // subtype matched to bit depth (P010 with NV12 fallback), and read back
-    // frame dimensions. Returns false when there is no usable video stream (the
-    // caller decides whether that's fatal).
-    fn configureVideoStream(self: *MfBackend) !bool {
+    // Discover stream metadata without configuring either decode path. Keeping
+    // this independent is what makes audio-only media follow the same track
+    // ordering and metadata rules as audio+video assets.
+    fn discoverStreams(self: *MfBackend) !void {
         const reader = self.pipeline.reader.?;
         var i: com.DWORD = 0;
         while (true) : (i += 1) {
@@ -204,10 +201,15 @@ pub const MfBackend = struct {
             }
         }
 
+        self.reorderAudioTracksByContainerOrder();
+    }
+
+    // Negotiate the first discovered video stream's output subtype and display
+    // geometry. Returns false for audio-only media or an unusable video stream.
+    fn configureVideoStream(self: *MfBackend) bool {
         if (self.video_stream_index < 0) return false;
 
-        self.reorderAudioTracksByContainerOrder();
-
+        const reader = self.pipeline.reader.?;
         const vidx: com.DWORD = @intCast(self.video_stream_index);
         // Request the output subtype matching detected bit depth; fall back to
         // NV12 (correcting bit_depth) if the P010 request fails.
@@ -216,9 +218,15 @@ pub const MfBackend = struct {
             self.color.bit_depth = 8;
             ok = self.pipeline.requestSubtype(vidx, mf.MFVideoFormat_NV12);
         }
-        if (!ok) return false;
+        if (!ok) {
+            self.video_stream_index = -1;
+            return false;
+        }
 
-        _ = reader.SetStreamSelection(vidx, com.TRUE);
+        if (com.FAILED(reader.SetStreamSelection(vidx, com.TRUE))) {
+            self.video_stream_index = -1;
+            return false;
+        }
 
         var current: ?*mf.IMFMediaType = null;
         if (com.SUCCEEDED(reader.GetCurrentMediaType(vidx, &current)) and current != null) {
@@ -247,14 +255,14 @@ pub const MfBackend = struct {
         const attrs = t.asAttributes();
         const area = attrs.getVideoArea(&mf.MF_MT_MINIMUM_DISPLAY_APERTURE) orelse
             attrs.getVideoArea(&mf.MF_MT_GEOMETRIC_APERTURE) orelse {
-                self.crop = .{
-                    .x = 0,
-                    .y = 0,
-                    .width = @intCast(self.width),
-                    .height = @intCast(self.height),
-                };
-                return;
+            self.crop = .{
+                .x = 0,
+                .y = 0,
+                .width = @intCast(self.width),
+                .height = @intCast(self.height),
             };
+            return;
+        };
         self.crop = .{
             .x = if (area.offset_x > 0) @intCast(area.offset_x) else 0,
             .y = if (area.offset_y > 0) @intCast(area.offset_y) else 0,
@@ -276,18 +284,18 @@ pub const MfBackend = struct {
 
     // Configure the open-time audio stream to float32 PCM. Non-fatal: on
     // failure, audio is simply left unselected (silent clip / audio-less pump).
-    fn configureAudioStream(self: *MfBackend) void {
-        if (self.audio_stream_index < 0) return;
+    fn configureAudioStream(self: *MfBackend) bool {
+        if (self.audio_stream_index < 0) return false;
         const aidx: com.DWORD = @intCast(self.audio_stream_index);
         if (pipe.configurePcmOutput(self.pipeline.reader.?, aidx)) |fmt| {
-            self.audio_channels = fmt.channels;
-            self.audio_rate = fmt.rate;
             if (self.trackIndexForStream(self.audio_stream_index)) |ti| {
                 logAudioNegotiation(ti, self.audio_tracks.items[@intCast(ti)], fmt);
+                self.commitAudioFormat(ti, fmt);
+                return true;
             }
-        } else {
-            self.audio_stream_index = -1;
         }
+        self.audio_stream_index = -1;
+        return false;
     }
 
     // Map an MF source-reader stream index back to its position in
@@ -367,55 +375,101 @@ pub const MfBackend = struct {
 
     // ---- audio track selection (policy) ----
 
-    // Clamp `index` to the valid track range, record it as the selected track,
-    // and refresh audio_channels/audio_rate from the cached track table. Callers
-    // must guarantee at least one audio track exists. Returns the clamped index.
-    // The single home for the clamp + metadata refresh, shared by select and
-    // reselect so the two stay symmetric (mirrors avf_backend.zig).
-    fn applyTrackSelection(self: *MfBackend, index: i32) i32 {
+    // Clamp `index` to the valid track range and record the desired track.
+    // Negotiated channel/rate metadata changes only after a successful commit.
+    fn selectTrack(self: *MfBackend, index: i32) i32 {
         const count: i32 = @intCast(self.audio_tracks.items.len);
         const clamped = std.math.clamp(index, 0, count - 1);
         self.selected_audio_track = clamped;
-        const meta = self.audio_tracks.items[@intCast(clamped)];
-        self.audio_channels = meta.channels;
-        self.audio_rate = meta.sample_rate;
         return clamped;
     }
 
-    // Select track_index on the shared reader and renegotiate PCM, deselecting
-    // the old audio stream only once the new one is known-good. This IS the
-    // application of a selection, so selected and applied both converge here.
-    //
-    // Select-then-negotiate happens entirely on the new stream before the old
-    // one is touched, mirroring the build-then-swap pattern buildAudioReader
-    // uses for the dedicated reader: on failure, the old stream's selection
-    // and media type are exactly as they were before the call, so audio keeps
-    // playing on the old track. configurePcmOutput selects `aidx` as a side
-    // effect regardless of outcome, so a failed negotiation still needs the
-    // new stream explicitly deselected again.
-    fn switchAudioTrack(self: *MfBackend, track_index: i32) bool {
-        if (track_index < 0 or track_index >= @as(i32, @intCast(self.audio_stream_indices.items.len))) return false;
-
-        const new_mf_index = self.audio_stream_indices.items[@intCast(track_index)];
-        const aidx: com.DWORD = @intCast(new_mf_index);
-
-        const fmt = pipe.configurePcmOutput(self.pipeline.reader.?, aidx) orelse {
-            _ = self.pipeline.reader.?.SetStreamSelection(aidx, com.FALSE);
-            return false;
-        };
-
-        // Known-good: retire the old stream now, then commit.
-        if (self.audio_stream_index >= 0 and self.audio_stream_index != new_mf_index) {
-            _ = self.pipeline.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE);
-        }
-        self.audio_stream_index = new_mf_index;
-        _ = self.applyTrackSelection(track_index);
-        self.audio_channels = fmt.channels;
-        self.audio_rate = fmt.rate;
-        logAudioNegotiation(track_index, self.audio_tracks.items[@intCast(track_index)], fmt);
-        self.applied_audio_track = track_index;
-        return true;
+    fn commitAudioFormat(self: *MfBackend, track_index: i32, format: pipe.PcmFormat) void {
+        self.audio_channels = format.channels;
+        self.audio_rate = format.rate;
+        const track = &self.audio_tracks.items[@intCast(track_index)];
+        track.channels = format.channels;
+        track.sample_rate = format.rate;
     }
+
+    const PreparedSeek = struct {
+        reader: pipe.PreparedReader,
+        audio_track_index: ?i32,
+        audio_stream_index: i32,
+        audio_format: ?pipe.PcmFormat,
+    };
+
+    // Build and position a complete replacement generation without touching
+    // either live reader. Stream indices are stable for readers opened from the
+    // same URL, so the candidate reuses the discovery table established by
+    // open(). Every requested output is required before the candidate can be
+    // committed.
+    fn prepareSeek(self: *MfBackend, target: f64) ?PreparedSeek {
+        var reader = self.pipeline.prepareReader(self.path16.?) catch return null;
+        var keep_reader = false;
+        defer if (!keep_reader) reader.discard();
+        const candidate = reader.reader;
+
+        if (com.FAILED(candidate.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE))) return null;
+
+        if (self.video_stream_index >= 0) {
+            const vidx: com.DWORD = @intCast(self.video_stream_index);
+            const subtype = if (self.color.bit_depth >= 10) mf.MFVideoFormat_P010 else mf.MFVideoFormat_NV12;
+            if (!pipe.MfPipeline.requestSubtypeOn(candidate, vidx, subtype)) return null;
+            if (com.FAILED(candidate.SetStreamSelection(vidx, com.TRUE))) return null;
+        }
+
+        var audio_track_index: ?i32 = null;
+        var audio_stream_index: i32 = -1;
+        var audio_format: ?pipe.PcmFormat = null;
+        // A discovered descriptor is not necessarily a usable output. Preserve
+        // open-time capability decisions: if PCM negotiation originally failed
+        // and audio_stream_index was cleared, a video-only seek must remain
+        // valid instead of promoting that unusable descriptor to a requirement.
+        if (self.audio_stream_index >= 0) {
+            const track_index = self.selected_audio_track;
+            if (track_index < 0 or track_index >= @as(i32, @intCast(self.audio_stream_indices.items.len))) return null;
+            audio_stream_index = self.audio_stream_indices.items[@intCast(track_index)];
+            audio_format = pipe.configurePcmOutput(candidate, @intCast(audio_stream_index)) orelse return null;
+            audio_track_index = track_index;
+        }
+
+        var pos = com.initPropVariantFromInt64(colorimetry.secondsToTicks(target));
+        const hr = candidate.SetCurrentPosition(&mf.GUID_NULL, &pos);
+        _ = com.PropVariantClear(&pos);
+        if (com.FAILED(hr)) return null;
+
+        keep_reader = true;
+        return .{
+            .reader = reader,
+            .audio_track_index = audio_track_index,
+            .audio_stream_index = audio_stream_index,
+            .audio_format = audio_format,
+        };
+    }
+
+    fn commitSeek(self: *MfBackend, prepared: *PreparedSeek) void {
+        self.pipeline.commitReader(&prepared.reader);
+        self.audio_stream_index = prepared.audio_stream_index;
+        if (prepared.audio_track_index) |track_index| {
+            const format = prepared.audio_format.?;
+            logAudioNegotiation(track_index, self.audio_tracks.items[@intCast(track_index)], format);
+            self.commitAudioFormat(track_index, format);
+            self.applied_audio_track = track_index;
+        }
+        prepared.* = undefined;
+    }
+
+    const PrepareSeekJob = struct {
+        self: *MfBackend,
+        target: f64,
+        prepared: ?PreparedSeek = null,
+
+        fn thunk(p: *anyopaque) void {
+            const job: *PrepareSeekJob = @ptrCast(@alignCast(p));
+            job.prepared = job.self.prepareSeek(job.target);
+        }
+    };
 
     // ---- lifecycle ----
 
@@ -474,11 +528,11 @@ pub const MfBackend = struct {
         // Deselect all streams, then enable just the ones we configure.
         _ = self.pipeline.reader.?.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE);
 
-        const has_video = try self.configureVideoStream();
-        // Match AVF: fail only if there is neither audio nor video.
-        if (!has_video and self.audio_stream_index < 0) return error.NoStreams;
-
-        self.configureAudioStream();
+        try self.discoverStreams();
+        const has_video = self.configureVideoStream();
+        const has_audio = self.configureAudioStream();
+        // Match AVF: fail only if there is neither usable audio nor video.
+        if (!has_video and !has_audio) return error.NoStreams;
         self.readDuration();
     }
 
@@ -500,7 +554,7 @@ pub const MfBackend = struct {
         // that built them, then stop that thread (its CoUninitialize pairs the
         // CoInitializeEx it made when it started). Every COM object this backend
         // owns — the shared reader/device built in openInner and the dedicated
-        // audio reader built in buildAudioReader — is created only inside an
+        // audio reader built in prepareAudioReader — is created only inside an
         // executor job, so there is nothing to release when the executor was
         // never started.
         if (self.executor.isRunning()) {
@@ -532,31 +586,18 @@ pub const MfBackend = struct {
     fn seekImpl(self: *MfBackend, pts_seconds: f64) bool {
         if (self.pipeline.reader == null) return false;
         const target = @max(pts_seconds, 0.0);
-
-        // Tear down any dedicated audio-only reader and re-home audio on the
-        // shared reader.
-        const audio_reader_torn = self.pipeline.audio_reader != null;
-        if (audio_reader_torn) self.pipeline.resetAudioReader();
-        // Catch the shared reader up to a pending selectAudioTrack(), and/or
-        // re-home audio after a dedicated reselect reader. Safe here because
-        // SetCurrentPosition below restarts the media source, which is what
-        // makes a newly (re)selected stream actually deliver samples.
-        if (audio_reader_torn or self.applied_audio_track != self.selected_audio_track) {
-            _ = self.switchAudioTrack(self.selected_audio_track);
-        }
-
-        var pos = com.initPropVariantFromInt64(colorimetry.secondsToTicks(target));
-        const hr = self.pipeline.reader.?.SetCurrentPosition(&mf.GUID_NULL, &pos);
-        _ = com.PropVariantClear(&pos);
-        return com.SUCCEEDED(hr);
+        var job: PrepareSeekJob = .{ .self = self, .target = target };
+        self.executor.run(PrepareSeekJob.thunk, &job);
+        var prepared = job.prepared orelse return false;
+        self.commitSeek(&prepared);
+        return true;
     }
 
     fn selectAudioTrackImpl(self: *MfBackend, index: i32) void {
         if (self.audio_tracks.items.len == 0) return;
-        // Selection takes effect on the next seek()/open(); applyTrackSelection
-        // updates channel/rate metadata immediately so a caller inspecting them
-        // pre-playback sees the selected track's format.
-        _ = self.applyTrackSelection(index);
+        // Selection takes effect on the next seek. Until commit, expose the
+        // current stream's negotiated format rather than speculative metadata.
+        _ = self.selectTrack(index);
     }
 
     // Building the dedicated audio reader dispatched onto the executor thread —
@@ -567,17 +608,18 @@ pub const MfBackend = struct {
         self: *MfBackend,
         mf_index: i32,
         start_ticks: i64,
-        ok: bool = false,
+        prepared: ?pipe.PreparedAudioReader = null,
 
         fn thunk(p: *anyopaque) void {
             const job: *BuildAudioReaderJob = @ptrCast(@alignCast(p));
-            job.ok = job.self.pipeline.buildAudioReader(job.self.path16.?, job.mf_index, job.start_ticks);
+            job.prepared = job.self.pipeline.prepareAudioReader(job.self.path16.?, job.mf_index, job.start_ticks);
         }
     };
 
     fn reselectAudioTrackImpl(self: *MfBackend, index: i32, pts_seconds: f64) bool {
         if (self.audio_tracks.items.len == 0) return false;
-        const clamped = self.applyTrackSelection(index);
+        const count: i32 = @intCast(self.audio_tracks.items.len);
+        const clamped = std.math.clamp(index, 0, count - 1);
         const target = @max(pts_seconds, 0.0);
         const mf_index = self.audio_stream_indices.items[@intCast(clamped)];
 
@@ -602,14 +644,22 @@ pub const MfBackend = struct {
         // executor round-trip for no correctness gain.
         var job: BuildAudioReaderJob = .{ .self = self, .mf_index = mf_index, .start_ticks = colorimetry.secondsToTicks(target) };
         self.executor.run(BuildAudioReaderJob.thunk, &job);
-        if (!job.ok) return false;
+        var prepared = job.prepared orelse return false;
 
         // Stop the shared reader from queueing the old track's audio.
         if (self.audio_stream_index >= 0) {
-            _ = self.pipeline.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE);
+            if (com.FAILED(self.pipeline.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE))) {
+                prepared.discard();
+                return false;
+            }
         }
+
+        const negotiated = prepared.format;
+        self.pipeline.commitAudioReader(&prepared);
         self.audio_stream_index = mf_index;
+        self.selected_audio_track = clamped;
         self.applied_audio_track = clamped;
+        self.commitAudioFormat(clamped, negotiated);
         return true;
     }
 
@@ -869,141 +919,9 @@ pub fn create(allocator: std.mem.Allocator) !core.Backend {
     self.* = .{ .allocator = allocator };
     return .{ .ptr = self, .vtable = &MfBackend.vtable };
 }
-
-// Hash the Y-plane bytes of an NV12/P010 decoder texture via a staging readback,
-// so a queued frame's pixel content can be compared before and after further
-// decoding. Returns null if the device/readback is unavailable.
-fn hashFrameTexture(tex: *d3d11.ID3D11Texture2D) ?u64 {
-    var dev: ?*d3d11.ID3D11Device = null;
-    tex.GetDevice(&dev);
-    const device = dev orelse return null;
-    defer com.release(device);
-    var ctx: ?*d3d11.ID3D11DeviceContext = null;
-    device.GetImmediateContext(&ctx);
-    const context = ctx orelse return null;
-    defer com.release(context);
-
-    var desc: d3d11.D3D11_TEXTURE2D_DESC = undefined;
-    tex.GetDesc(&desc);
-
-    var sdesc = desc;
-    sdesc.ArraySize = 1;
-    sdesc.MipLevels = 1;
-    sdesc.Usage = d3d11.D3D11_USAGE_STAGING;
-    sdesc.BindFlags = 0;
-    sdesc.CPUAccessFlags = d3d11.D3D11_CPU_ACCESS_READ;
-    sdesc.MiscFlags = 0;
-    var stage: ?*d3d11.ID3D11Texture2D = null;
-    if (com.FAILED(device.CreateTexture2D(&sdesc, null, &stage)) or stage == null) return null;
-    defer com.release(stage.?);
-
-    context.CopySubresourceRegion(stage.?.asResource(), 0, 0, 0, 0, tex.asResource(), 0, null);
-
-    var mapped = std.mem.zeroes(d3d11.D3D11_MAPPED_SUBRESOURCE);
-    if (com.FAILED(context.Map(stage.?.asResource(), 0, d3d11.D3D11_MAP_READ, 0, &mapped))) return null;
-    defer context.Unmap(stage.?.asResource(), 0);
-
-    // Hash the Y plane row by row (RowPitch may exceed the tight row width).
-    const base: [*]const u8 = @ptrCast(mapped.pData.?);
-    const row_bytes: usize = if (desc.Format == win.dxgi.DXGI_FORMAT_P010) @as(usize, desc.Width) * 2 else desc.Width;
-    var hasher = std.hash.Wyhash.init(0);
-    var y: usize = 0;
-    while (y < desc.Height) : (y += 1) {
-        hasher.update(base[y * mapped.RowPitch ..][0..row_bytes]);
-    }
-    return hasher.final();
-}
-
-// A real-decode test skips -- never fails -- when its fixture asset is absent
-// (the CI runners don't carry the generated media). Probe the file up front:
-// backend.open() logs an error on failure, and a single logged error fails the
-// whole `zig build test` step, so a missing-asset skip must return before ever
-// reaching open().
-fn skipUnlessFixture(path: []const u8) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-}
-
-// Regression guard for the decode-order overwrite bug: a queued VideoFrame must
-// keep its OWN immutable pixel content no matter how much the decoder recycles
-// its sample pool afterward. On a B-frame clip (decode order != display order)
-// the decoder reuses the pooled texture slice as soon as the sample is released,
-// so before the snapshot fix the first frame's pixels turned into a
-// later-decoded frame's the moment the pump ran ahead. We decode the first
-// frame, fingerprint it, pump several more frames (past the pool depth) to force
-// recycling, then re-fingerprint the first frame and require it unchanged.
-//
-// Needs a hardware MF/D3D11 decode path and the bframes.mp4 asset; skips (never
-// fails) when either is absent, matching the win.zig device round-trip test.
 test "queued video frame content survives later decoding (no pool recycle)" {
-    const t = std.testing;
-    // Resolved relative to the repo root, where `zig build test` runs the binary.
-    try skipUnlessFixture("project/bframes.mp4");
-
-    const backend = create(t.allocator) catch return error.SkipZigTest;
-    defer backend.deinit();
-
-    if (!backend.open("project/bframes.mp4")) return error.SkipZigTest;
-
-    var frames: std.ArrayList(core.VideoFrame) = .empty;
-    defer {
-        for (frames.items) |f| f.release();
-        frames.deinit(t.allocator);
-    }
-
-    const first = backend.nextVideoFrame() orelse return error.SkipZigTest;
-    try frames.append(t.allocator, first);
-    // The snapshot is a standalone single-slice texture -> slice 0.
-    try t.expectEqual(@as(u32, 0), first.plane_slice);
-
-    const first_tex: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(first.native_handle.?));
-    const before = hashFrameTexture(first_tex) orelse return error.SkipZigTest;
-
-    // Pump well past requiredPoolDepth so the decoder is forced to recycle the
-    // slice the first frame originally decoded into.
-    var pumped: usize = 0;
-    while (pumped < 14) : (pumped += 1) {
-        const f = backend.nextVideoFrame() orelse break;
-        try frames.append(t.allocator, f);
-    }
-    // Meaningful only if we actually decoded ahead of the first frame.
-    if (frames.items.len < 3) return error.SkipZigTest;
-
-    const after = hashFrameTexture(first_tex) orelse return error.SkipZigTest;
-    try t.expectEqual(before, after);
+    try @import("mf_backend_tests.zig").queuedVideoFrames(create);
 }
-
-// Regression guard for the H.264 clean/display-aperture defect: MF's hardware
-// decoder MFTs allocate their backing D3D11 texture macroblock-aligned (width
-// rounded up to a multiple of 16), independent of the container's declared
-// display size. A non-mod-16-width clip (854, not a multiple of 16) makes the
-// two diverge -- the decoder's backing texture is 864 wide while the frame's
-// declared/crop width stays 854 -- so a regression that lets the aligned
-// texture leak through as the display size fails this assertion outright.
-// Needs a hardware MF/D3D11 decode path and the generated non-mod-16 fixture
-// (tools/gen_stress_media.sh); skips (never fails) when either is
-// unavailable, matching the other real-decode tests in this file.
 test "video frame crop tracks the display aperture, not the macroblock-aligned decoder texture" {
-    const t = std.testing;
-    try skipUnlessFixture("tests/fixtures/stress/nonmod16_854x480.mp4");
-
-    const backend = create(t.allocator) catch return error.SkipZigTest;
-    defer backend.deinit();
-
-    if (!backend.open("tests/fixtures/stress/nonmod16_854x480.mp4")) return error.SkipZigTest;
-
-    const frame = backend.nextVideoFrame() orelse return error.SkipZigTest;
-    defer frame.release();
-
-    const tex: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(frame.native_handle.?));
-    var desc: d3d11.D3D11_TEXTURE2D_DESC = undefined;
-    tex.GetDesc(&desc);
-
-    // The decoder's backing texture is macroblock-aligned...
-    try t.expectEqual(@as(com.UINT, 864), desc.Width);
-    // ...but the frame's declared size and crop rect both report the true
-    // display width, not the padded texture width.
-    try t.expectEqual(@as(i32, 854), frame.width);
-    try t.expectEqual(@as(u32, 854), frame.crop.width);
-    try t.expectEqual(@as(u32, 0), frame.crop.x);
+    try @import("mf_backend_tests.zig").displayAperture(create);
 }
