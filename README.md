@@ -55,6 +55,32 @@ Highlights:
   [gdzig](https://github.com/gdzig/gdzig), a pre-1.0 binding generator
   pinned to a specific commit and Zig version.
 
+## Releases
+
+Each GitHub Release attaches a `native_video-<tag>.zip` containing an
+`addons/native_video/` folder — a self-contained Godot addon: drop it into
+a project's `addons/` directory and Godot picks up `native_video.gdextension`
+automatically. It bundles:
+
+| Platform | Arch | Files |
+| --- | --- | --- |
+| macOS | universal (arm64 + x86_64, via `lipo`) | `libnative_video.macos.debug.dylib`, `libnative_video.macos.release.dylib` |
+| Windows | x86_64 | `native_video.windows.debug.x86_64.dll`, `native_video.windows.release.x86_64.dll` |
+| Windows | x86 (32-bit) | `native_video.windows.debug.x86_32.dll`, `native_video.windows.release.x86_32.dll` |
+| Windows | arm64 | `native_video.windows.debug.arm64.dll`, `native_video.windows.release.arm64.dll` |
+
+Both a debug and a release binary ship for every platform/arch, matching
+Godot's `template_debug`/`template_release` export split — the `.gdextension`
+routes each automatically based on how the exported project was built.
+Debug binaries are built with `-Doptimize=ReleaseSafe` (safety checks kept
+in, unstripped); release binaries with `-Doptimize=ReleaseFast` (stripped).
+
+**iOS** builds and links (produces a valid iOS Mach-O `dylib`), but is not
+shipped in releases: Godot's iOS export conventionally expects a static
+library / `.xcframework` rather than a plain dylib, and only link-time (not
+on-device runtime) has been verified. Follow-up work; not currently
+tracked for a specific release.
+
 ## Windows present path
 
 Windows can run Godot's Vulkan or D3D12 `RenderingDevice` driver, and this
@@ -170,16 +196,25 @@ track with a differing rate is refused.
    zig build test
    ```
 
-4. Run the end-to-end smoke test (builds the extension, launches Godot,
-   plays `project/synthetic.mp4` through the real `ResourceLoader` /
-   `VideoStreamPlayer` path, and self-quits):
+4. Run the demo project (builds the extension, launches Godot, and opens
+   the interactive playback UI against `project/synthetic.mp4` or a clip
+   passed after `--`):
 
    ```bash
    zig build run
    ```
 
-   This looks for Godot at the path hardcoded as `default_godot` in
-   `build.zig`; override it with `-Dgodot-path=/path/to/Godot`.
+   For a headless pass/fail check instead — loads a clip, plays it, polls
+   for a presented video texture, does a pixel-content sanity check, and
+   quits with exit 0 (PASS) / 1 (FAIL) — use the dedicated smoke step:
+
+   ```bash
+   zig build smoke
+   ```
+
+   (equivalent to `zig build run -- --smoke`, but headless). Both steps
+   download a matching Godot build for bindgen/running if `GODOT_PATH` or
+   `-Dgodot-path=/path/to/Godot` isn't set.
 
 ## Project layout
 
@@ -202,8 +237,14 @@ track with a differing rate is refused.
   importers it selects between — Metal on macOS; on Windows, the pure
   `importer_selector` function plus the D3D12 zero-copy and CPU-copy
   importers it chooses between.
-- `project/` — the example/verification Godot project. Its
-  `smoke.gd` script is what `zig build run` executes.
+- `project/` — the example/verification Godot project and dev harness.
+  `main.gd`/`main.tscn` are a single entry point with two modes selected by
+  CLI flag: interactive playback UI (`zig build run`, the default) or
+  headless pass/fail verification (`zig build smoke`, `--smoke`).
+- `addon/` — the shipped `.gdextension` template packaged into release
+  zips (see [Releases](#releases) below). Not used by `zig build`; the dev
+  harness in `project/` has its own `native_video.gdextension` pointing at
+  local build output.
 
 For the historical record of how this implementation was chosen —
 benchmarks and rationale — see [EVALUATION.md](EVALUATION.md).
