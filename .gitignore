@@ -15,6 +15,9 @@ zig-out/
 # Built extension library — keep the .gdextension manifest.
 project/lib/
 
+# Generated test media — regenerate with tools/gen_*.sh, never committed.
+tests/fixtures/
+
 # Other stuff
 *.log
 
