@@ -35,6 +35,7 @@ const ProjectSettings = godot.class.ProjectSettings;
 const String = godot.builtin.String;
 const Dictionary = godot.builtin.Dictionary;
 const PackedFloat32Array = godot.builtin.PackedFloat32Array;
+const Variant = godot.builtin.Variant;
 
 // Platform decode backend, resolved at comptime: Media Foundation on Windows,
 // AVFoundation elsewhere. Both expose `create(allocator) !Backend`. build.zig
@@ -169,10 +170,10 @@ fn flushWarnings(self: *NativeVideoStreamPlayback) void {
 
 /// Resolve a Godot res:// / user:// path to an absolute OS path and open it
 /// on a fresh backend. globalizePath leaves absolute OS paths untouched.
-/// Returns null if the backend can't be constructed or open() fails; on
+/// Returns an error if the backend can't be constructed or open() fails; on
 /// success the caller owns the (already open) backend and must deinit() it.
-pub fn openBackendForPath(allocator: Allocator, path: String) ?Backend {
-    var backend = platform_backend.create(allocator) catch return null;
+pub fn openBackendForPath(allocator: Allocator, path: String) !Backend {
+    var backend = try platform_backend.create(allocator);
 
     var os_path = ProjectSettings.globalizePath(path);
     defer os_path.deinit();
@@ -181,22 +182,48 @@ pub fn openBackendForPath(allocator: Allocator, path: String) ?Backend {
 
     if (!backend.open(utf8)) {
         backend.deinit();
-        return null;
+        return error.OpenFailed;
     }
     return backend;
 }
 
+/// Reports a load() failure to Godot's own error reporting (push_error —
+/// visible in the editor's Output/errors panel, not just stderr), with the
+/// resolved OS path and the Zig error name. Open/load failures used to be
+/// swallowed silently, which made real bugs invisible.
+fn reportLoadFailure(path: String, err: anyerror) void {
+    var os_path = ProjectSettings.globalizePath(path);
+    defer os_path.deinit();
+    var buf: [4096]u8 = undefined;
+    const utf8 = os_path.toUtf8Buf(buf[0..]);
+
+    var msg_buf: [4096 + 128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "native_video: failed to load '{s}': {s}", .{ utf8, @errorName(err) }) catch utf8;
+
+    var msg_str = String.fromUtf8(msg) catch String.fromLatin1(msg);
+    defer msg_str.deinit();
+    var v = Variant.init(String, msg_str);
+    defer v.deinit();
+    godot.general.pushError(v, .{});
+}
+
 /// Open the media file. Returns true on success. Called by NativeVideoStream.
 pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
-    var backend = openBackendForPath(self.allocator, path) orelse return false;
+    var backend = openBackendForPath(self.allocator, path) catch |e| {
+        self.flushWarnings();
+        reportLoadFailure(path, e);
+        return false;
+    };
 
     // Audio-master latency compensation shifts reported media time back so it
     // reflects what the speaker is emitting now, not what was just pushed into
     // the audio buffer. Resolved once here and handed to the controller.
     const latency: f64 = AudioServer.getOutputLatency();
 
-    self.controller.load(self.allocator, extension.sharedScheduler(), backend, latency) catch {
+    self.controller.load(self.allocator, extension.sharedScheduler(), backend, latency) catch |e| {
         backend.deinit();
+        self.flushWarnings();
+        reportLoadFailure(path, e);
         return false;
     };
     self.flushWarnings();

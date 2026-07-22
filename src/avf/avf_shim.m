@@ -269,6 +269,8 @@ void nv_avf_abi_probe_fill(nv_avf_abi_probe *out) {
 	out->off_audio_chunk[1] = offsetof(nv_avf_audio_chunk, pts_seconds);
 	out->off_audio_chunk[2] = offsetof(nv_avf_audio_chunk, frame_count);
 	out->off_audio_chunk[3] = offsetof(nv_avf_audio_chunk, float_count);
+	out->off_audio_chunk[4] = offsetof(nv_avf_audio_chunk, channels);
+	out->off_audio_chunk[5] = offsetof(nv_avf_audio_chunk, sample_rate);
 }
 
 // -----------------------------------------------------------------------
@@ -734,6 +736,22 @@ nv_avf_result nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out
 		out->pts_seconds = CMTimeGetSeconds(pts);
 		out->frame_count = (int)num_frames;
 		out->float_count = (int)float_count;
+
+		// Diagnostic: the actual delivered format, off this sample buffer's
+		// own format description -- distinct from nv_avf_audio_track_info's
+		// pre-negotiation native descriptor. Cheap (no extra decode work);
+		// left 0 if unavailable, which the Zig side treats as "no readback".
+		out->channels = 0;
+		out->sample_rate = 0;
+		CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sample);
+		if (fd) {
+			const AudioStreamBasicDescription *asbd =
+					CMAudioFormatDescriptionGetStreamBasicDescription((CMAudioFormatDescriptionRef)fd);
+			if (asbd) {
+				out->channels = (int)asbd->mChannelsPerFrame;
+				out->sample_rate = (int)asbd->mSampleRate;
+			}
+		}
 
 		CFRelease(sample);
 		return NV_AVF_OK;

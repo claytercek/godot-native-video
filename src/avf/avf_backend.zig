@@ -23,6 +23,8 @@ const builtin = @import("builtin");
 // one identity across the avf backend, the engine core, and the Godot glue.
 const core = @import("core").backend;
 
+const log = std.log.scoped(.avf_backend);
+
 // -----------------------------------------------------------------------
 // Shim C ABI — mirrors avf_shim.h by hand (gdzig projects avoid @cImport).
 // -----------------------------------------------------------------------
@@ -75,6 +77,10 @@ const c_audio_chunk = extern struct {
     pts_seconds: f64,
     frame_count: c_int,
     float_count: c_int,
+    // Actual delivered format read off this sample buffer, diagnostic only;
+    // 0 when unavailable. See logAudioNegotiation.
+    channels: c_int,
+    sample_rate: c_int,
 };
 
 // Mirrors avf_shim.h's nv_avf_abi_probe: the shim's actual sizeof for each
@@ -94,7 +100,7 @@ const AbiProbe = extern struct {
     off_video_frame: [6]usize, // pixel_buffer, pts_seconds, width, height, pixel_format, color
 
     sizeof_audio_chunk: usize,
-    off_audio_chunk: [4]usize, // samples, pts_seconds, frame_count, float_count
+    off_audio_chunk: [6]usize, // samples, pts_seconds, frame_count, float_count, channels, sample_rate
 };
 extern fn nv_avf_abi_probe_fill(out: *AbiProbe) void;
 
@@ -221,6 +227,10 @@ pub const AvfBackend = struct {
     audio_channels: i32 = 0,
     audio_rate: i32 = 0,
 
+    // One-shot: whether the declared-vs-delivered divergence check has run
+    // for the current open(). Reset in closeImpl so a reopen checks again.
+    logged_audio_negotiation: bool = false,
+
     // ---- vtable glue ----
     const vtable: core.Backend.VTable = .{
         .open = vtOpen,
@@ -325,6 +335,7 @@ pub const AvfBackend = struct {
         self.audio_channels = 0;
         self.audio_rate = 0;
         self.selected_audio_index = 0;
+        self.logged_audio_negotiation = false;
     }
 
     // apply_track_selection: store the index and derive channels/rate from the
@@ -396,6 +407,10 @@ pub const AvfBackend = struct {
     fn nextAudioChunkImpl(self: *AvfBackend) ?core.AudioChunk {
         var cc: c_audio_chunk = undefined;
         if (nv_avf_next_audio_chunk(self.shim, &cc) != .ok) return null;
+        if (!self.logged_audio_negotiation) {
+            self.logged_audio_negotiation = true;
+            logAudioNegotiation(self.selected_audio_index, self.audio_channels, self.audio_rate, cc);
+        }
         const float_count: usize = @intCast(cc.float_count);
         const samples: []const f32 = if (cc.samples) |p| p[0..float_count] else &.{};
         // channel_count is the selected track's channel count, min 1.
@@ -468,6 +483,29 @@ pub const AvfBackend = struct {
         return fromPtr(p).nextAudioChunkImpl();
     }
 };
+
+// Diagnostic: compare the first delivered audio chunk's actual format
+// (read off the CMSampleBuffer's own format description in avf_shim.m --
+// `cc.channels`/`cc.sample_rate`, 0 if unavailable) against the declared
+// (pre-negotiation, native-descriptor) values already cached in
+// audio_channels/audio_rate at open/select time. CanonicalMixFormat
+// (canonical_mix_format.zig) derives the AudioMasterClock/ring sizing/
+// _getMixRate() rate from the declared values, NOT from what AVFoundation
+// actually delivers, so a mismatch means audio can play at the wrong speed.
+// Diagnostic only -- no behavior change.
+fn logAudioNegotiation(track_index: i32, declared_channels: i32, declared_rate: i32, cc: c_audio_chunk) void {
+    if (cc.channels <= 0 or cc.sample_rate <= 0) return; // no format description on this buffer
+    if (declared_rate != cc.sample_rate or declared_channels != cc.channels) {
+        log.warn(
+            "audio track {d}: delivered PCM format diverges from declared -- declared {d} Hz/{d} ch, pcm {d} Hz/{d} ch",
+            .{ track_index, declared_rate, declared_channels, cc.sample_rate, cc.channels },
+        );
+    }
+    log.info(
+        "audio negotiated: declared {d} Hz/{d} ch -> pcm {d} Hz/{d} ch",
+        .{ declared_rate, declared_channels, cc.sample_rate, cc.channels },
+    );
+}
 
 /// Construct an AVFoundation backend and return it as the core.Backend
 /// ptr+vtable interface. The returned Backend owns its heap allocation and the
