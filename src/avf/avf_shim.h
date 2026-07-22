@@ -113,6 +113,13 @@ typedef struct {
 	double pts_seconds;
 	int frame_count; // per-channel sample count
 	int float_count; // total float elements in `samples`
+	// Actual delivered format, read off this sample buffer's own format
+	// description (not the track's pre-negotiation native descriptor from
+	// nv_avf_audio_track_info). 0 if the format description was unavailable
+	// for this buffer. Diagnostic: lets the Zig side confirm whether what
+	// AVFoundation actually hands back matches what was declared at open.
+	int channels;
+	int sample_rate;
 } nv_avf_audio_chunk;
 
 // Actual sizes and per-field offsets of the five structs above, as this
@@ -136,7 +143,7 @@ typedef struct {
 	size_t off_video_frame[6]; // pixel_buffer, pts_seconds, width, height, pixel_format, color
 
 	size_t sizeof_audio_chunk;
-	size_t off_audio_chunk[4]; // samples, pts_seconds, frame_count, float_count
+	size_t off_audio_chunk[6]; // samples, pts_seconds, frame_count, float_count, channels, sample_rate
 } nv_avf_abi_probe;
 
 void nv_avf_abi_probe_fill(nv_avf_abi_probe *out);

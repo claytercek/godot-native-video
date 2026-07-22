@@ -282,9 +282,23 @@ pub const MfBackend = struct {
         if (pipe.configurePcmOutput(self.pipeline.reader.?, aidx)) |fmt| {
             self.audio_channels = fmt.channels;
             self.audio_rate = fmt.rate;
+            if (self.trackIndexForStream(self.audio_stream_index)) |ti| {
+                logAudioNegotiation(ti, self.audio_tracks.items[@intCast(ti)], fmt);
+            }
         } else {
             self.audio_stream_index = -1;
         }
+    }
+
+    // Map an MF source-reader stream index back to its position in
+    // audio_tracks (built in container order by reorderAudioTracksByContainerOrder).
+    // Used only for divergence logging, where the declared native-descriptor
+    // values live.
+    fn trackIndexForStream(self: *MfBackend, mf_stream_index: i32) ?i32 {
+        for (self.audio_stream_indices.items, 0..) |idx, i| {
+            if (idx == mf_stream_index) return @intCast(i);
+        }
+        return null;
     }
 
     // Read total duration from the presentation descriptor (100ns -> seconds).
@@ -398,6 +412,7 @@ pub const MfBackend = struct {
         _ = self.applyTrackSelection(track_index);
         self.audio_channels = fmt.channels;
         self.audio_rate = fmt.rate;
+        logAudioNegotiation(track_index, self.audio_tracks.items[@intCast(track_index)], fmt);
         self.applied_audio_track = track_index;
         return true;
     }
@@ -429,13 +444,15 @@ pub const MfBackend = struct {
         // own MTA thread and block until it finishes, so open() stays
         // synchronous and its failures still surface to the caller.
         self.executor.start() catch |e| {
-            log.debug("open failed: {s}", .{@errorName(e)});
+            log.err("open failed: {s}", .{@errorName(e)});
             return false;
         };
         var job: OpenJob = .{ .self = self, .url_or_path = url_or_path };
         self.executor.run(OpenJob.thunk, &job);
         if (job.err) |e| {
-            log.debug("open failed: {s}", .{@errorName(e)});
+            // log.err, not log.debug: this must survive the default ReleaseFast
+            // log-level filter, or open failures are invisible in release builds.
+            log.err("open failed: {s}", .{@errorName(e)});
             self.closeImpl();
             return false;
         }
@@ -823,6 +840,25 @@ pub const MfBackend = struct {
         return fromPtr(p).nextAudioChunkImpl();
     }
 };
+
+// Diagnostic: compare a just-negotiated PCM format against the track's
+// declared (pre-negotiation, native-descriptor) values and log the result.
+// CanonicalMixFormat (canonical_mix_format.zig) derives the AudioMasterClock
+// / ring sizing / _getMixRate() rate from the declared values, NOT from what
+// PCM negotiation actually delivers here, so a mismatch means audio can play
+// at the wrong speed. Diagnostic only -- no behavior change.
+fn logAudioNegotiation(track_index: i32, declared: core.AudioTrackInfo, fmt: pipe.PcmFormat) void {
+    if (declared.sample_rate != fmt.rate or declared.channels != fmt.channels) {
+        log.warn(
+            "audio track {d}: negotiated PCM format diverges from declared -- declared {d} Hz/{d} ch, pcm {d} Hz/{d} ch",
+            .{ track_index, declared.sample_rate, declared.channels, fmt.rate, fmt.channels },
+        );
+    }
+    log.info(
+        "audio negotiated: declared {d} Hz/{d} ch -> pcm {d} Hz/{d} ch",
+        .{ declared.sample_rate, declared.channels, fmt.rate, fmt.channels },
+    );
+}
 
 /// Construct a Media Foundation backend and return it as the core.Backend
 /// ptr+vtable interface. The returned Backend owns its heap allocation; the COM

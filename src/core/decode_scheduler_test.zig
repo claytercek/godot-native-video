@@ -349,6 +349,47 @@ test "force-synchronous mode: no workers, deterministic in-order decode" {
 }
 
 // -----------------------------------------------------------------------
+// Monotonicity guard at the FrameQueue producer boundary. The guard is purely
+// diagnostic (it latches a one-shot warning; it never reorders or drops), so we
+// exercise the state machine directly on a bare DecodeStream rather than through
+// the pool. NOTE: the backward-step case intentionally emits one log.warn line
+// to stderr — that is the guard doing its job, not a test failure.
+// -----------------------------------------------------------------------
+test "monotonicity guard latches once on a backward PTS, resets across a seek" {
+    var stream: ds.DecodeStream = .{};
+
+    // Ascending PTS: baseline advances, nothing latched.
+    ds.checkEnqueueMonotonic(&stream, 0.000);
+    ds.checkEnqueueMonotonic(&stream, 0.033);
+    ds.checkEnqueueMonotonic(&stream, 0.066);
+    try std.testing.expect(!stream.pts_regressed_warned);
+    try std.testing.expectEqual(@as(?f64, 0.066), stream.last_enqueued_pts);
+
+    // A backward step (0.050 < 0.066) latches the one-shot warning.
+    ds.checkEnqueueMonotonic(&stream, 0.050);
+    try std.testing.expect(stream.pts_regressed_warned);
+    try std.testing.expectEqual(@as(?f64, 0.050), stream.last_enqueued_pts);
+
+    // A seek resets the baseline (null); a legitimately lower post-seek PTS must
+    // NOT re-warn — the latch is one-shot per stream/open and already set.
+    stream.last_enqueued_pts = null;
+    ds.checkEnqueueMonotonic(&stream, 0.010);
+    try std.testing.expect(stream.pts_regressed_warned); // still just the one latch
+    try std.testing.expectEqual(@as(?f64, 0.010), stream.last_enqueued_pts);
+}
+
+test "monotonicity guard stays quiet for a clean ascending sequence" {
+    var stream: ds.DecodeStream = .{};
+    var pts: f64 = 0.0;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        ds.checkEnqueueMonotonic(&stream, pts);
+        pts += 1.0 / 30.0;
+    }
+    try std.testing.expect(!stream.pts_regressed_warned);
+}
+
+// -----------------------------------------------------------------------
 // ReselectFakeBackend — a multi-track backend for testing reselect. Two audio
 // "tracks" (0 and 1) with different sample counts per-frame. reselect switches
 // between them, and next_audio_chunk produces chunks whose frame_count

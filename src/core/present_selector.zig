@@ -123,6 +123,23 @@ test "within half-interval tolerance counts as due" {
     try std.testing.expectEqual(PresentAction.show, selectPresentAction(head, null, now, test_interval));
 }
 
+test "out-of-order queue steps backward (why presentation order is required)" {
+    // The selector compares each PTS to `now`, never head-vs-next, so a FIFO
+    // whose successor carries a LOWER PTS than the head — frames enqueued out of
+    // presentation order, as a B-frame stream would if the backend leaked decode
+    // order — makes it DROP the newer head and then Show the older successor.
+    // That is exactly the forward-then-backward step this pipeline's
+    // monotonic-order contract (and the decode_scheduler enqueue guard) exists to
+    // prevent. This test pins the contract: given non-monotonic input, the
+    // selector will misbehave, so the ordering must be guaranteed upstream.
+    const now = 1.00;
+    // head 0.90 is due; its successor 0.80 is ALSO due but earlier -> drop head.
+    try std.testing.expectEqual(PresentAction.drop, selectPresentAction(0.90, 0.80, now, test_interval));
+    // The lower-PTS 0.80 is now the head and shows -> presented position moves
+    // backward relative to the 0.90 we just dropped.
+    try std.testing.expectEqual(PresentAction.show, selectPresentAction(0.80, null, now, test_interval));
+}
+
 test "repeated drops collapse a backlog to one frame in a single tick" {
     // Simulate a queue [0.80, 0.85, 0.90, 0.95] with now = 1.00.
     // The selector should Drop until only the newest due frame (0.95) remains,

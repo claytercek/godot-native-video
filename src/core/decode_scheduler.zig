@@ -59,6 +59,8 @@ const backend_mod = @import("backend.zig");
 const frame_queue = @import("frame_queue.zig");
 const sys_clock = @import("sys_clock.zig");
 
+const log = std.log.scoped(.decode_scheduler);
+
 pub const Backend = backend_mod.Backend;
 pub const VideoFrame = backend_mod.VideoFrame;
 
@@ -135,6 +137,19 @@ pub const DecodeStream = struct {
     // release; the mutex already orders every other (mu-held) read, so those
     // use monotonic loads.
     dead: std.atomic.Value(bool) = .init(false),
+
+    // Monotonicity guard for the FrameQueue producer boundary. The present
+    // selector (present_selector.zig) assumes frames enter the queue in
+    // non-decreasing PTS order — for linear playback the backend delivers
+    // presentation order. `last_enqueued_pts` is the PTS of the most recently
+    // enqueued frame, reset to null across a seek/flush (where a backward jump
+    // is expected and legitimate). `pts_regressed_warned` is a one-shot latch,
+    // per stream = per open, so a backend that ever emits decode order surfaces
+    // once in the log instead of silently churning the selector. Both are
+    // touched only by the owning producer path (serial per stream), so they need
+    // no synchronization.
+    last_enqueued_pts: ?f64 = null,
+    pts_regressed_warned: bool = false,
 };
 
 pub const StreamHandle = *DecodeStream;
@@ -425,6 +440,9 @@ pub const DecodeScheduler = struct {
         while (stream.queue.pop()) |f| f.release();
         const backend_ptr = &stream.backend.?;
         _ = backend_ptr.seek(target);
+        // PTS jumps across the seek — reset the monotonicity baseline so the
+        // surviving frame re-establishes it (rather than tripping the guard).
+        stream.last_enqueued_pts = null;
         // Safety valve: bound the synchronous decode-forward loop so a
         // misbehaving backend whose PTS never advances past `target` and never
         // signals EOS cannot spin the calling (main) thread forever. Large
@@ -433,7 +451,10 @@ pub const DecodeScheduler = struct {
         var scrub_decoded: usize = 0;
         while (backend_ptr.nextVideoFrame()) |f| {
             if (f.pts_seconds + eps_seconds >= target) {
-                // The frame at/just before the target: keep it for present.
+                // The frame at/just before the target: keep it for present. It
+                // re-establishes the monotonicity baseline for the decode-ahead
+                // slices that follow.
+                checkEnqueueMonotonic(stream, f.pts_seconds);
                 const pushed = stream.queue.push(f);
                 std.debug.assert(pushed); // queue was flushed above
                 break;
@@ -612,6 +633,9 @@ pub const DecodeScheduler = struct {
             self.mu.lock();
             stream.eos = false;
             self.mu.unlock();
+            // PTS legitimately jumps across a seek — reset the monotonicity
+            // baseline so the new position does not trip the guard.
+            stream.last_enqueued_pts = null;
         }
 
         // Decode-ahead: fill the queue until full or EOS. We re-check dead each
@@ -627,6 +651,7 @@ pub const DecodeScheduler = struct {
                 self.mu.unlock();
                 return;
             }
+            checkEnqueueMonotonic(stream, f.?.pts_seconds);
             if (!stream.queue.push(f.?)) {
                 // Lost a race against capacity (should not happen with one
                 // producer); release the frame to stay leak-safe and stop.
@@ -636,6 +661,30 @@ pub const DecodeScheduler = struct {
         }
     }
 };
+
+// Defensive monotonicity check at the FrameQueue producer boundary. Frames are
+// expected to enter the queue in non-decreasing PTS order: the present selector
+// (present_selector.zig) drops any head whose successor is already due, so a
+// backend that emitted decode order (e.g. an MF source reader that failed to
+// reorder H.264 B-frames) would make the selector churn and the picture step
+// forward-then-backward. Rather than misbehave silently, latch a one-shot
+// warning the first time PTS regresses outside of a seek, then update the
+// running baseline. Diagnostic only — it never reorders or drops a frame; the
+// pipeline keeps whatever order the backend delivered. Caller must be the
+// stream's sole producer (the busy claim guarantees this). Public so the
+// monotonicity contract is unit-testable.
+pub fn checkEnqueueMonotonic(stream: StreamHandle, pts: f64) void {
+    if (stream.last_enqueued_pts) |prev| {
+        if (pts < prev and !stream.pts_regressed_warned) {
+            stream.pts_regressed_warned = true;
+            log.warn(
+                "video PTS regressed at the decode-queue boundary: {d:.4}s after {d:.4}s with no seek -- frames are not in presentation order; playback will stutter",
+                .{ pts, prev },
+            );
+        }
+    }
+    stream.last_enqueued_pts = pts;
+}
 
 fn removeHandle(list: *std.ArrayList(StreamHandle), stream: StreamHandle) void {
     for (list.items, 0..) |s, idx| {

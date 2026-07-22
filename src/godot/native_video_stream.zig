@@ -142,7 +142,7 @@ pub fn getAudioTracks(self: *NativeVideoStream) Array {
 
     var file = self.base.getFile();
     defer file.deinit();
-    var backend = NativeVideoStreamPlayback.openBackendForPath(self.allocator, file) orelse {
+    var backend = NativeVideoStreamPlayback.openBackendForPath(self.allocator, file) catch {
         self.cached_audio_tracks = tracks; // empty on failure
         return tracks;
     };

@@ -21,6 +21,8 @@
 const std = @import("std");
 const windows = std.os.windows;
 
+const log = std.log.scoped(.mf_com);
+
 pub const GUID = windows.GUID;
 pub const HRESULT = i32;
 pub const HANDLE = ?*anyopaque;
@@ -52,8 +54,13 @@ pub inline fn FAILED(hr: HRESULT) bool {
 }
 
 /// Canonical HRESULT check: turns a failed HRESULT into `error.ComFailure`.
+/// Zig errors can't carry a payload, so the HRESULT itself is logged here
+/// (in hex) before it's lost to the caller.
 pub fn check(hr: HRESULT) error{ComFailure}!void {
-    if (FAILED(hr)) return error.ComFailure;
+    if (FAILED(hr)) {
+        log.err("HRESULT 0x{x:0>8}", .{@as(u32, @bitCast(hr))});
+        return error.ComFailure;
+    }
 }
 
 pub const S_OK: HRESULT = 0;
@@ -62,6 +69,9 @@ pub const S_OK: HRESULT = 0;
 pub const S_FALSE: HRESULT = 1;
 // _HRESULT_TYPEDEF_(0xC00D36B3): source-reader stream-enumeration terminator.
 pub const MF_E_INVALIDSTREAMNUMBER: HRESULT = @bitCast(@as(u32, 0xC00D36B3));
+// CoInitializeEx returns this when the thread already has an incompatible
+// COM apartment (e.g. STA) set on it.
+pub const RPC_E_CHANGED_MODE: HRESULT = @bitCast(@as(u32, 0x80010106));
 
 // ---------------------------------------------------------------------------
 // IUnknown — root of every COM interface. Its three slots (QueryInterface,

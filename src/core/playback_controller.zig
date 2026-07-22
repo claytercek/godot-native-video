@@ -15,9 +15,12 @@
 
 const std = @import("std");
 
+const log = std.log.scoped(.playback_controller);
+
 const backend_mod = @import("backend.zig");
 const clock_mod = @import("clock.zig");
 const audio_ring_mod = @import("audio_ring.zig");
+const audio_telemetry_mod = @import("audio_telemetry.zig");
 const scrubber_mod = @import("scrubber.zig");
 const wall_clock_mod = @import("wall_clock.zig");
 const decode_scheduler = @import("decode_scheduler.zig");
@@ -33,6 +36,7 @@ const ClockBridge = clock_mod.ClockBridge;
 const AudioMasterClock = clock_mod.AudioMasterClock;
 const MonotonicClock = clock_mod.MonotonicClock;
 const AudioRing = audio_ring_mod.AudioRing;
+const AudioTelemetry = audio_telemetry_mod.AudioTelemetry;
 const Scrubber = scrubber_mod.Scrubber;
 const ScrubResolve = scrubber_mod.ScrubResolve;
 const ResolveMode = scrubber_mod.ResolveMode;
@@ -144,6 +148,11 @@ pub const PlaybackController = struct {
     scrubber: Scrubber = .{},
     clock: ?ClockBridge = null,
     audio_ring: ?AudioRing = null,
+    audio_telemetry: AudioTelemetry = .{},
+    // Wall-clock timestamp of the most recent tick(), cached so stop()/
+    // shutdown() (which don't take `now`) can still fire a final telemetry
+    // report with a real wall-time reading.
+    last_tick_wall_ms: WallClockMs = .{},
 
     // Scratch buffers kept as members to avoid per-call allocations on the
     // decode/mix path (resized only when a larger buffer is needed).
@@ -191,6 +200,11 @@ pub const PlaybackController = struct {
     // during mid-stream track switches.
     track_infos: std.ArrayList(AudioTrackInfo) = .empty,
 
+    // One-shot: whether the first-consumed-chunk-vs-canonical divergence
+    // check (see checkAudioChunkDivergence) has run for the current load().
+    // Diagnostic only; reset in load() so a reopen checks again.
+    checked_first_audio_chunk: bool = false,
+
     warnings: std.ArrayList([]const u8) = .empty,
 
     pub fn init() PlaybackController {
@@ -233,6 +247,10 @@ pub const PlaybackController = struct {
     /// Unregisters from the scheduler, blocking until any in-flight decode slice
     /// completes (no use-after-free). Safe to call multiple times.
     pub fn shutdown(self: *PlaybackController) void {
+        // Safety net: reportFinal() is idempotent, so this is a no-op when
+        // stop() or an EOS tick already reported (the common case) and only
+        // fires for real on a close/unload that skipped both.
+        self.audio_telemetry.reportFinal(self.last_tick_wall_ms, self.mediaTime());
         if (self.stream) |s| {
             self.sched.unregisterStream(s);
             self.stream = null;
@@ -302,6 +320,8 @@ pub const PlaybackController = struct {
         self.position = 0.0;
         self.audio_eos = false;
         self.track_switch = .{};
+        self.checked_first_audio_chunk = false;
+        self.audio_telemetry.reset();
 
         // A pre-load requestAudioTrack() selection must survive, not be
         // clobbered; validate it now that audio_track_count is known.
@@ -331,6 +351,7 @@ pub const PlaybackController = struct {
     }
 
     pub fn stop(self: *PlaybackController) void {
+        self.audio_telemetry.reportFinal(self.last_tick_wall_ms, self.mediaTime());
         self.playing = false;
         self.paused = false;
         self.audio_eos = false;
@@ -403,6 +424,7 @@ pub const PlaybackController = struct {
         const clock = self.master();
         if (!self.loaded or clock == null or self.stream == null) return null;
         const c = clock.?;
+        self.last_tick_wall_ms = now; // cached for stop()/shutdown()'s final telemetry report
 
         // Settle check runs regardless of play/pause: scrubbing commonly happens
         // while paused (dragging a timeline).
@@ -415,9 +437,10 @@ pub const PlaybackController = struct {
         if (!self.playing or self.paused) return null;
         const sched = self.sched;
 
-        const media_now = self.advanceClock(delta_seconds, sink, c);
+        const media_now = self.advanceClock(delta_seconds, now, sink, c);
+        self.audio_telemetry.maybeReportPeriodic(now, media_now);
         const chosen = self.selectPresentFrame(sched, media_now);
-        self.checkEndOfPlayback(sched);
+        self.checkEndOfPlayback(sched, now, media_now);
 
         return chosen;
     }
@@ -441,10 +464,10 @@ pub const PlaybackController = struct {
     // or the handoff window during a track switch) advance by the render
     // delta; audio is still pumped so a mid-switch track re-anchors as soon
     // as its samples flow.
-    fn advanceClock(self: *PlaybackController, delta_seconds: f64, sink: MixSink, c: *ClockBridge) f64 {
+    fn advanceClock(self: *PlaybackController, delta_seconds: f64, now: WallClockMs, sink: MixSink, c: *ClockBridge) f64 {
         if (c.isAudioMaster()) {
             self.fillAudio();
-            const advanced_from_audio = self.driveAudio(sink);
+            const advanced_from_audio = self.driveAudio(now, sink);
             if (!advanced_from_audio and self.audioExhausted()) {
                 c.setTime(c.mediaTime() + delta_seconds);
             }
@@ -452,7 +475,7 @@ pub const PlaybackController = struct {
             c.advance(delta_seconds);
             if (self.has_audio) {
                 self.fillAudio();
-                _ = self.driveAudio(sink);
+                _ = self.driveAudio(now, sink);
             }
         }
         return c.mediaTime();
@@ -499,8 +522,13 @@ pub const PlaybackController = struct {
     }
 
     // End-of-playback: video EOS (atEnd() is worker-reported) and audio drained.
-    fn checkEndOfPlayback(self: *PlaybackController, sched: *DecodeScheduler) void {
+    fn checkEndOfPlayback(self: *PlaybackController, sched: *DecodeScheduler, now: WallClockMs, media_now: f64) void {
         if (sched.atEnd(self.stream.?) and self.audioExhausted()) {
+            // This branch runs exactly once per load() on the tick that observes
+            // both conditions true (tick() no-ops on every subsequent call once
+            // self.playing is false), so reportFinal's own idempotency guard is
+            // a belt-and-suspenders, not load-bearing here.
+            self.audio_telemetry.reportFinal(now, media_now);
             self.playing = false;
         }
     }
@@ -531,6 +559,24 @@ pub const PlaybackController = struct {
         self.sched.withBackend(self.stream.?, self, fillAudioClosure);
     }
 
+    // Diagnostic, one-shot per load(): compare the first AudioChunk actually
+    // consumed against the Canonical Mix Format (canonical_mix_format.zig),
+    // which is derived from the backend's DECLARED track metadata at load
+    // time, not from what decode actually delivers. canonical_sample_rate
+    // drives the AudioMasterClock, the ring's sizing, and Godot's
+    // _getMixRate(); a mismatch here means audio plays at the wrong speed
+    // regardless of which backend (or which layer within it) introduced the
+    // divergence. Diagnostic only -- no behavior change.
+    fn checkAudioChunkDivergence(self: *PlaybackController, chunk: backend_mod.AudioChunk) void {
+        self.checked_first_audio_chunk = true;
+        if (chunk.sample_rate != self.canonical_sample_rate or chunk.channel_count != self.canonical_channels) {
+            log.warn(
+                "first audio chunk diverges from canonical mix format -- canonical {d} Hz/{d} ch, chunk {d} Hz/{d} ch",
+                .{ self.canonical_sample_rate, self.canonical_channels, chunk.sample_rate, chunk.channel_count },
+            );
+        }
+    }
+
     fn fillAudioClosure(self: *PlaybackController, backend: *Backend) void {
         var ring = &self.audio_ring.?;
         // Half-fill: cushion against decode jitter without buffering unbounded
@@ -544,6 +590,8 @@ pub const PlaybackController = struct {
                 self.audio_eos = true;
                 break;
             };
+            if (!self.checked_first_audio_chunk) self.checkAudioChunkDivergence(chunk);
+            self.audio_telemetry.recordChunk(chunk.frame_count);
             if (chunk.samples.len == 0 or chunk.frame_count <= 0) continue;
             // Mid-stream track switch: the FSM re-anchors the clock the first
             // time a genuinely-new-track chunk reaches this point (a no-op on
@@ -561,7 +609,7 @@ pub const PlaybackController = struct {
         }
     }
 
-    fn driveAudio(self: *PlaybackController, sink: MixSink) bool {
+    fn driveAudio(self: *PlaybackController, now: WallClockMs, sink: MixSink) bool {
         if (self.audio_ring == null or self.clock == null or self.canonical_channels <= 0) return false;
 
         const kMaxMixFramesPerTick: i32 = 4096; // ~85 ms @ 48k
@@ -587,6 +635,7 @@ pub const PlaybackController = struct {
         // downstream buffer), the surplus is dropped: the clock stays honest at
         // the cost of a little lost audio. Tolerable for linear playback.
         const accepted = sink.mix(self.drive_scratch.items[0..needed], ch);
+        self.audio_telemetry.recordMix(now, self.clock.?.mediaTime(), available, request, accepted);
         const advance = @min(accepted, @as(i32, @intCast(real_frames)));
         if (advance > 0) self.clock.?.onAudioMixed(advance);
         return advance > 0;

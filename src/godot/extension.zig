@@ -13,6 +13,15 @@
 //! Registry's addCallbacks mechanism — the enter callback runs AFTER all
 //! classes for that level have committed (see Registry.enter), so the loader
 //! class is already registered and instantiable when we create the singleton.
+//!
+//! `std_options` here is the whole extension binary's actual log config:
+//! gdzig's generated entrypoint root re-exports it verbatim (`pub const
+//! std_options = if (@hasDecl(extension, "std_options")) extension.std_options
+//! else .{}`), so declaring it in this module is enough to install
+//! godot_log.logFn process-wide. register()/unregister() bracket the window
+//! where gdzig's interface (and so Godot's push_error/print) is actually
+//! live; godot_log falls back to stderr-only outside it and in standalone
+//! binaries that never call register() at all.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -28,6 +37,17 @@ const DecodeScheduler = core.decode_scheduler.DecodeScheduler;
 const NativeVideoStream = @import("native_video_stream.zig");
 const NativeVideoStreamPlayback = @import("native_video_stream_playback.zig");
 const NativeVideoResourceFormatLoader = @import("native_video_resource_format_loader.zig");
+const godot_log = @import("godot_log.zig");
+
+// Pinned explicitly rather than left at Zig's build-mode default: ReleaseFast
+// already defaults to .info (only .debug is compiled out), but pinning it
+// here makes that an explicit contract instead of an accident of std.log's
+// per-mode default -- one that would silently reopen this exact bug if
+// std.log's default for ReleaseFast ever changes upstream.
+pub const std_options: std.Options = .{
+    .logFn = godot_log.logFn,
+    .log_level = .info,
+};
 
 // -----------------------------------------------------------------------
 // Process-wide decode pool. Every playback instance registers with this one
@@ -53,6 +73,12 @@ pub fn sharedScheduler() *DecodeScheduler {
 }
 
 pub fn register(r: *Registry) void {
+    // gdzig's raw interface is already live by the time the generated
+    // entrypoint calls register() (see entrypoint.zig), so push_error/print
+    // are safe to call from here on -- flip the gate before anything below
+    // has a chance to log.
+    godot_log.setAvailable(true);
+
     // Playback must be registered before the stream so the stream's
     // _instantiatePlayback return type resolves.
     r.addModule(NativeVideoStreamPlayback);
@@ -67,6 +93,11 @@ pub fn unregister(r: *Registry) void {
     r.removeModule(NativeVideoResourceFormatLoader);
     r.removeModule(NativeVideoStream);
     r.removeModule(NativeVideoStreamPlayback);
+
+    // Last thing before the generated entrypoint tears down gdzig's
+    // interface (see entrypoint.zig's exit()) -- nothing after this point
+    // may reach for Godot's utility functions.
+    godot_log.setAvailable(false);
 }
 
 // -----------------------------------------------------------------------
