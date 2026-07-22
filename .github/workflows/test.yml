@@ -60,6 +60,9 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Setup FFmpeg
+        run: choco install ffmpeg --yes --no-progress
+
       - name: Generate mandatory decode fixtures
         shell: bash
         run: |
