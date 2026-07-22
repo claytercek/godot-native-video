@@ -5,6 +5,7 @@ pub const backend = @import("backend.zig");
 pub const wall_clock = @import("wall_clock.zig");
 pub const frame_queue = @import("frame_queue.zig");
 pub const audio_ring = @import("audio_ring.zig");
+pub const audio_delivery = @import("audio_delivery.zig");
 pub const audio_telemetry = @import("audio_telemetry.zig");
 pub const retire_ring = @import("retire_ring.zig");
 pub const channel_mixer = @import("channel_mixer.zig");

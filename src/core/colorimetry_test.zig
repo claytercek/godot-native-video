@@ -38,4 +38,3 @@ test "Colorimetry.bt709_defaults returns the negotiated-default convention" {
     try std.testing.expectEqual(ColorRange.video, color.range);
     try std.testing.expectEqual(8, color.bit_depth);
 }
-

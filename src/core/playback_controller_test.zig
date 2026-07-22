@@ -57,6 +57,7 @@ const MultiTrackFakeBackend = struct {
     next_index: i32 = 0,
     live_track: i32 = 0,
     reselect_should_succeed: bool = true,
+    seek_should_succeed: bool = true,
     samples: []f32 = &.{},
     select_calls: i32 = 0,
     reselect_calls: i32 = 0,
@@ -102,6 +103,7 @@ const MultiTrackFakeBackend = struct {
         return true;
     }
     pub fn seek(self: *MultiTrackFakeBackend, pts_seconds: f64) bool {
+        if (!self.seek_should_succeed) return false;
         var idx: i32 = @intFromFloat(pts_seconds * 30.0);
         if (idx < 0) idx = 0;
         self.next_index = idx;
@@ -364,6 +366,30 @@ test "a mid-stream reselect the backend refuses rolls the desired track back" {
     }
     try std.testing.expectEqual(1, warnings.items.len);
     try expectContains(warnings.items[0], "failed; recovering via seek");
+
+    controller.shutdown();
+}
+
+test "an unresolved exact seek does not re-anchor the playback clock" {
+    const sched = makeSched();
+    defer sched.deinit();
+    var controller = PlaybackController.init();
+    defer controller.deinit();
+    const fake = MultiTrackFakeBackend.create(alloc, &.{.{ .channels = 2, .sample_rate = 48000 }}, 4096);
+    try controller.load(alloc, sched, fake.backend(), 0.0);
+
+    fake.seek_should_succeed = false;
+    controller.play(WallClockMs.init(0.0));
+
+    try std.testing.expectApproxEqAbs(0.0, controller.mediaTime(), 1e-9);
+    try std.testing.expectApproxEqAbs(0.0, controller.position, 1e-9);
+    var warnings = controller.takeWarnings();
+    defer {
+        for (warnings.items) |s| alloc.free(s);
+        warnings.deinit(alloc);
+    }
+    try std.testing.expectEqual(1, warnings.items.len);
+    try expectContains(warnings.items[0], "backend_seek_failed");
 
     controller.shutdown();
 }

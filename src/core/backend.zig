@@ -288,4 +288,3 @@ pub const Backend = struct {
         return self.vtable.next_audio_chunk(self.ptr);
     }
 };
-

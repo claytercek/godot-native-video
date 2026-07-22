@@ -51,6 +51,8 @@
 //! returns — the stream is marked dead, any in-flight busy claim is waited
 //! out, and it is removed from the ready list — so the handle is simply
 //! invalid after unregister, which is exactly how every caller uses it.
+//! A claimant completes and requeues under the same mutex before dropping its
+//! busy lease; it never dereferences the handle after teardown can proceed.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -154,6 +156,14 @@ pub const DecodeStream = struct {
 
 pub const StreamHandle = *DecodeStream;
 
+pub const ExactSeekResult = enum {
+    resolved,
+    end_of_stream,
+    backend_seek_failed,
+    decode_budget_exhausted,
+    stream_unavailable,
+};
+
 // -----------------------------------------------------------------------
 // DecodeScheduler — the shared pool. One instance serves many streams; the
 // caller owns its lifetime and injects it wherever decode is needed (the
@@ -169,6 +179,7 @@ pub const DecodeScheduler = struct {
     mu: sys_clock.Mutex = .{},
     cv: sys_clock.Condition = .{},
     ready: std.ArrayList(StreamHandle) = .empty,
+    ready_head: usize = 0,
     shutting_down: bool = false,
 
     // Keep handles for all registered streams so unregister can be ordered
@@ -255,6 +266,10 @@ pub const DecodeScheduler = struct {
     // ahead into the returned stream's queue. Auto-notified on registration to
     // start decode-ahead.
     pub fn registerStream(self: *DecodeScheduler, backend: Backend) !StreamHandle {
+        errdefer {
+            backend.close();
+            backend.deinit();
+        }
         const stream = try self.allocator.create(DecodeStream);
         stream.* = .{ .backend = backend };
         {
@@ -291,7 +306,7 @@ pub const DecodeScheduler = struct {
 
             // Drop it from the registry and the ready queue.
             removeHandle(&self.registered, stream);
-            removeHandle(&self.ready, stream);
+            self.removeReadyLocked(stream);
             stream.queued = false;
             self.mu.unlock();
         }
@@ -347,13 +362,7 @@ pub const DecodeScheduler = struct {
         }
         // We exclusively own the Backend here (busy held, no worker can claim it).
         func(ctx, &stream.backend.?);
-        {
-            self.mu.lock();
-            stream.busy = false;
-            self.mu.unlock();
-        }
-        self.cv.broadcast(); // release waiters and let a worker resume decode-ahead
-        self.notify(stream);
+        self.finishClaim(stream);
     }
 
     // Peek the PTS of the head / second decode-ahead frame WITHOUT removing it
@@ -400,13 +409,7 @@ pub const DecodeScheduler = struct {
         // Flush queued frames on the consumer side (single-consumer: the caller).
         // We hold busy, so no worker is producing concurrently.
         while (stream.queue.pop()) |f| f.release();
-        {
-            self.mu.lock();
-            stream.busy = false;
-            self.mu.unlock();
-        }
-        self.cv.broadcast(); // release any unregister/withBackend waiters
-        self.notify(stream);
+        self.finishClaim(stream);
     }
 
     // Resolve a seek to the exact target synchronously on the calling thread.
@@ -418,15 +421,16 @@ pub const DecodeScheduler = struct {
     // so afterwards the queue head is at/after target - eps. Stops at EOS
     // when the clip ends before the target. Intended for the settle/resume
     // scrub path, which values precision over latency and is not per-frame
-    // hot. No-op if the stream is dead.
-    pub fn seekExact(self: *DecodeScheduler, stream: StreamHandle, target_seconds: f64, eps_seconds: f64) void {
+    // hot. Returns an explicit outcome so callers never re-anchor playback to
+    // an unresolved target.
+    pub fn seekExact(self: *DecodeScheduler, stream: StreamHandle, target_seconds: f64, eps_seconds: f64) ExactSeekResult {
         const target = @max(target_seconds, 0.0);
         {
             self.mu.lock();
             while (stream.busy) self.cv.wait(&self.mu);
             if (stream.dead.load(.monotonic) or stream.backend == null) {
                 self.mu.unlock();
-                return;
+                return .stream_unavailable;
             }
             // We seek right here, so any older pending seek is superseded.
             stream.seek_pending = false;
@@ -439,7 +443,13 @@ pub const DecodeScheduler = struct {
         // toucher of the Backend until we drop it.
         while (stream.queue.pop()) |f| f.release();
         const backend_ptr = &stream.backend.?;
-        _ = backend_ptr.seek(target);
+        if (!backend_ptr.seek(target)) {
+            self.mu.lock();
+            stream.wants_more = false;
+            self.mu.unlock();
+            self.finishClaim(stream);
+            return .backend_seek_failed;
+        }
         // PTS jumps across the seek — reset the monotonicity baseline so the
         // surviving frame re-establishes it (rather than tripping the guard).
         stream.last_enqueued_pts = null;
@@ -449,6 +459,7 @@ pub const DecodeScheduler = struct {
         // enough that real GOP-bounded scrub-settle never trips it.
         const max_scrub_decode_frames = 4096;
         var scrub_decoded: usize = 0;
+        var result: ExactSeekResult = .decode_budget_exhausted;
         while (backend_ptr.nextVideoFrame()) |f| {
             if (f.pts_seconds + eps_seconds >= target) {
                 // The frame at/just before the target: keep it for present. It
@@ -457,6 +468,7 @@ pub const DecodeScheduler = struct {
                 checkEnqueueMonotonic(stream, f.pts_seconds);
                 const pushed = stream.queue.push(f);
                 std.debug.assert(pushed); // queue was flushed above
+                result = .resolved;
                 break;
             }
             f.release();
@@ -466,14 +478,15 @@ pub const DecodeScheduler = struct {
             self.mu.lock();
             stream.eos = true; // clip ended before the target — clamp.
             self.mu.unlock();
+            result = .end_of_stream;
         }
-        {
+        if (result != .resolved) {
             self.mu.lock();
-            stream.busy = false;
+            stream.wants_more = false;
             self.mu.unlock();
         }
-        self.cv.broadcast(); // release unregister/withBackend waiters
-        self.notify(stream); // resume decode-ahead behind the surviving frame
+        self.finishClaim(stream);
+        return result;
     }
 
     // True end-of-stream: the Backend reported EOS and the queue is drained.
@@ -511,11 +524,33 @@ pub const DecodeScheduler = struct {
     // folded back into wants_more.
     fn claimLocked(self: *DecodeScheduler, stream: StreamHandle) void {
         if (stream.queued) {
-            removeHandle(&self.ready, stream);
+            self.removeReadyLocked(stream);
             stream.queued = false;
             stream.wants_more = true;
         }
         stream.busy = true;
+    }
+
+    // End an exclusive lease atomically with any requeue. Once busy becomes
+    // false an unregister waiter may destroy the stream, so this function is
+    // deliberately the claimant's final stream access.
+    fn finishClaim(self: *DecodeScheduler, stream: StreamHandle) void {
+        if (self.synchronous) {
+            // Satisfy pending work while the same lease is still held. This
+            // avoids recursively notifying after releasing it.
+            self.mu.lock();
+            const pump_more = !stream.dead.load(.monotonic) and stream.wants_more;
+            stream.wants_more = false;
+            self.mu.unlock();
+            if (pump_more) self.pumpStream(stream);
+        }
+
+        self.mu.lock();
+        stream.busy = false;
+        const wake = if (self.synchronous) false else self.enqueueLocked(stream);
+        self.mu.unlock();
+        self.cv.broadcast();
+        if (wake) self.cv.signal();
     }
 
     // Mark a stream as needing decode-ahead and wake a worker (async mode) or
@@ -580,11 +615,32 @@ pub const DecodeScheduler = struct {
         while (true) {
             while (!self.shutting_down and self.ready.items.len == 0) self.cv.wait(&self.mu);
             if (self.shutting_down and self.ready.items.len == 0) return null;
-            const stream = self.ready.orderedRemove(0);
+            const stream = self.ready.items[self.ready_head];
+            self.ready_head += 1;
+            if (self.ready_head == self.ready.items.len) {
+                self.ready.clearRetainingCapacity();
+                self.ready_head = 0;
+            }
             stream.queued = false;
             if (stream.dead.load(.monotonic)) continue;
             stream.busy = true;
             return stream;
+        }
+    }
+
+    // Claim/teardown removal is cold. The worker's hot FIFO dequeue advances a
+    // cursor, making it amortized O(1) instead of shifting every ready stream.
+    fn removeReadyLocked(self: *DecodeScheduler, stream: StreamHandle) void {
+        var idx = self.ready_head;
+        while (idx < self.ready.items.len) : (idx += 1) {
+            if (self.ready.items[idx] == stream) {
+                _ = self.ready.orderedRemove(idx);
+                if (self.ready_head == self.ready.items.len) {
+                    self.ready.clearRetainingCapacity();
+                    self.ready_head = 0;
+                }
+                return;
+            }
         }
     }
 
