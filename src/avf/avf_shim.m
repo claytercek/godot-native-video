@@ -189,8 +189,18 @@ static AVAssetReaderTrackOutput *make_video_output(AVAssetTrack *track, const nv
 
 // Interleaved float32 LPCM, native (little) endianness.
 static AVAssetReaderTrackOutput *make_audio_output(AVAssetTrack *track) {
+	NSArray *formats = track.formatDescriptions;
+	if (formats.count == 0) return nil;
+	CMAudioFormatDescriptionRef description =
+			(__bridge CMAudioFormatDescriptionRef)formats[0];
+	const AudioStreamBasicDescription *source =
+			CMAudioFormatDescriptionGetStreamBasicDescription(description);
+	if (!source || source->mChannelsPerFrame == 0 || source->mSampleRate <= 0) return nil;
+
 	NSDictionary *settings = @{
 		(NSString *)AVFormatIDKey : @(kAudioFormatLinearPCM),
+		(NSString *)AVSampleRateKey : @(source->mSampleRate),
+		(NSString *)AVNumberOfChannelsKey : @(source->mChannelsPerFrame),
 		(NSString *)AVLinearPCMBitDepthKey : @32,
 		(NSString *)AVLinearPCMIsFloatKey : @YES,
 		(NSString *)AVLinearPCMIsBigEndianKey : @NO,
@@ -229,6 +239,18 @@ static void free_tracks(NvAvfState *s) {
 		s->tracks = NULL;
 	}
 	s->track_count = 0;
+}
+
+static void reset_media_state(NvAvfState *s) {
+	s->duration = 0.0;
+	s->width = 0;
+	s->height = 0;
+	s->has_video = 0;
+	s->color.matrix = NV_AVF_MATRIX_BT709;
+	s->color.primaries = NV_AVF_PRIM_BT709;
+	s->color.transfer = NV_AVF_TRANSFER_BT709;
+	s->color.range = NV_AVF_RANGE_VIDEO;
+	s->color.bit_depth = 8;
 }
 
 // -----------------------------------------------------------------------
@@ -278,11 +300,7 @@ void nv_avf_abi_probe_fill(nv_avf_abi_probe *out) {
 // -----------------------------------------------------------------------
 nv_avf_backend *nv_avf_create(void) {
 	NvAvfState *s = [[NvAvfState alloc] init];
-	s->color.matrix = NV_AVF_MATRIX_BT709;
-	s->color.primaries = NV_AVF_PRIM_BT709;
-	s->color.transfer = NV_AVF_TRANSFER_BT709;
-	s->color.range = NV_AVF_RANGE_VIDEO;
-	s->color.bit_depth = 8;
+	reset_media_state(s);
 	return (__bridge_retained nv_avf_backend *)s;
 }
 
@@ -297,10 +315,7 @@ void nv_avf_close(nv_avf_backend *h) {
 	free(s->audio_scratch);
 	s->audio_scratch = NULL;
 	s->audio_scratch_cap = 0;
-	s->duration = 0.0;
-	s->width = 0;
-	s->height = 0;
-	s->has_video = 0;
+	reset_media_state(s);
 }
 
 void nv_avf_destroy(nv_avf_backend *h) {
@@ -480,6 +495,15 @@ typedef struct {
 	BOOL audio_attached;
 } started_reader_t;
 
+static void cancel_started_reader(started_reader_t *started) {
+	if (started->reader) {
+		[started->reader cancelReading];
+	}
+	started->reader = nil;
+	started->video_attached = NO;
+	started->audio_attached = NO;
+}
+
 // Shared skeleton behind all three reader constructors below: create an
 // AVAssetReader for `asset`, window it to [start_time, +inf) when
 // start_time > 0 (AVAssetReader decodes from the keyframe at or before
@@ -539,26 +563,38 @@ static nv_avf_result create_started_reader(AVURLAsset *asset, double start_time,
 
 nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_index) {
 	NvAvfState *s = state_of(h);
-	teardown_audio_reader(s);
-	teardown_combined(s);
 
 	@autoreleasepool {
 		AVAssetTrack *use_audio = nil;
-		if (audio_track_index >= 0 && s->all_audio_tracks &&
-				audio_track_index < (int)s->all_audio_tracks.count) {
+		if (audio_track_index >= 0) {
+			if (!s->all_audio_tracks ||
+					audio_track_index >= (int)s->all_audio_tracks.count) {
+				return NV_AVF_NONE;
+			}
 			use_audio = s->all_audio_tracks[audio_track_index];
+			if (!use_audio) return NV_AVF_NONE;
 		}
 
 		AVAssetReaderTrackOutput *vo = s->video_track ? make_video_output(s->video_track, &s->color) : nil;
 		AVAssetReaderTrackOutput *ao = use_audio ? make_audio_output(use_audio) : nil;
+		if (s->video_track && !vo) return NV_AVF_NONE;
+		if (use_audio && !ao) return NV_AVF_NONE;
 
-		// Both outputs are optional here: a track that can't be added is
-		// dropped rather than failing the whole combined reader.
+		// Every output requested from an available asset stream is part of the
+		// candidate contract. Never publish a reader that silently lost one of
+		// those streams: the Zig backend would otherwise publish metadata for an
+		// output that can never produce samples.
 		started_reader_t started;
-		nv_avf_result rc = create_started_reader(s->asset, start_time, vo, NO, ao, NO, &started);
+		nv_avf_result rc = create_started_reader(s->asset, start_time,
+				vo, s->video_track != nil, ao, use_audio != nil, &started);
 		if (rc != NV_AVF_OK) {
 			return rc;
 		}
+
+		// Commit only after the replacement is fully started. A failed seek
+		// therefore leaves both the combined and dedicated readers usable.
+		teardown_audio_reader(s);
+		teardown_combined(s);
 		s->reader = started.reader;
 		s->video_out = started.video_attached ? vo : nil;
 		s->audio_out = started.audio_attached ? ao : nil;
@@ -569,9 +605,8 @@ nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audi
 // Build a dedicated audio-only reader for `track_index` from `start_time`.
 // Internal step of nv_avf_reselect_audio_track. NV_AVF_NONE on bad index or
 // a rejected output, NV_AVF_FAIL on reader create/start failure.
-static nv_avf_result build_audio_reader(NvAvfState *s, int track_index, double start_time) {
-	teardown_audio_reader(s);
-
+static nv_avf_result prepare_audio_reader(NvAvfState *s, int track_index,
+		double start_time, started_reader_t *started, AVAssetReaderTrackOutput **output) {
 	if (track_index < 0 || !s->all_audio_tracks ||
 			track_index >= (int)s->all_audio_tracks.count) {
 		return NV_AVF_NONE;
@@ -583,14 +618,13 @@ static nv_avf_result build_audio_reader(NvAvfState *s, int track_index, double s
 
 	@autoreleasepool {
 		AVAssetReaderTrackOutput *ao = make_audio_output(use_audio);
+		if (!ao) return NV_AVF_NONE;
 
-		started_reader_t started;
-		nv_avf_result rc = create_started_reader(s->asset, start_time, nil, NO, ao, YES, &started);
+		nv_avf_result rc = create_started_reader(s->asset, start_time, nil, NO, ao, YES, started);
 		if (rc != NV_AVF_OK) {
 			return rc;
 		}
-		s->audio_reader = started.reader;
-		s->audio_only_out = ao;
+		*output = ao;
 		return NV_AVF_OK;
 	}
 }
@@ -599,9 +633,8 @@ static nv_avf_result build_audio_reader(NvAvfState *s, int track_index, double s
 // combined reader (leaves any audio-only reader intact). Internal step of
 // nv_avf_reselect_audio_track. NV_AVF_NONE when there's no video or the
 // output is rejected, NV_AVF_FAIL on reader create/start failure.
-static nv_avf_result build_video_reader(NvAvfState *s, double start_time) {
-	teardown_combined(s);
-
+static nv_avf_result prepare_video_reader(NvAvfState *s, double start_time,
+		started_reader_t *started, AVAssetReaderTrackOutput **output) {
 	if (!s->video_track) {
 		return NV_AVF_NONE;
 	}
@@ -609,14 +642,11 @@ static nv_avf_result build_video_reader(NvAvfState *s, double start_time) {
 	@autoreleasepool {
 		AVAssetReaderTrackOutput *vo = make_video_output(s->video_track, &s->color);
 
-		started_reader_t started;
-		nv_avf_result rc = create_started_reader(s->asset, start_time, vo, YES, nil, NO, &started);
+		nv_avf_result rc = create_started_reader(s->asset, start_time, vo, YES, nil, NO, started);
 		if (rc != NV_AVF_OK) {
 			return rc;
 		}
-		s->reader = started.reader;
-		s->video_out = vo;
-		// audio_out stays nil — no audio output to back up and block video.
+		*output = vo;
 		return NV_AVF_OK;
 	}
 }
@@ -624,22 +654,35 @@ static nv_avf_result build_video_reader(NvAvfState *s, double start_time) {
 nv_avf_result nv_avf_reselect_audio_track(nv_avf_backend *h, int track_index, double start_time) {
 	NvAvfState *s = state_of(h);
 
-	nv_avf_result ar = build_audio_reader(s, track_index, start_time);
+	started_reader_t audio_started;
+	AVAssetReaderTrackOutput *new_audio_out = nil;
+	nv_avf_result ar = prepare_audio_reader(s, track_index, start_time,
+			&audio_started, &new_audio_out);
 	if (ar != NV_AVF_OK) {
 		return ar;
 	}
-	nv_avf_result vr = build_video_reader(s, start_time);
-	if (vr != NV_AVF_OK) {
-		// Partial failure: don't leave a dedicated audio reader dangling
-		// with no matching video-only combined reader behind it.
-		teardown_audio_reader(s);
-		return vr;
-	}
-	return NV_AVF_OK;
-}
 
-void nv_avf_teardown_audio_reader(nv_avf_backend *h) {
-	teardown_audio_reader(state_of(h));
+	started_reader_t video_started = { nil, NO, NO };
+	AVAssetReaderTrackOutput *new_video_out = nil;
+	if (s->video_track) {
+		nv_avf_result vr = prepare_video_reader(s, start_time,
+				&video_started, &new_video_out);
+		if (vr != NV_AVF_OK) {
+			cancel_started_reader(&audio_started);
+			return vr;
+		}
+	}
+
+	// Both replacements are known-good. Retire the old generation and publish
+	// the new reader pair as one state transition.
+	teardown_audio_reader(s);
+	teardown_combined(s);
+	s->audio_reader = audio_started.reader;
+	s->audio_only_out = new_audio_out;
+	s->reader = video_started.reader;
+	s->video_out = new_video_out;
+	s->audio_out = nil;
+	return NV_AVF_OK;
 }
 
 // -----------------------------------------------------------------------

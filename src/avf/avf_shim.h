@@ -172,24 +172,19 @@ int nv_avf_get_audio_track_info(nv_avf_backend *h, int index, nv_avf_audio_track
 // --- Reader construction ---
 // Build the combined reader from `start_time` seconds. `audio_track_index`
 // selects which audio track to include; < 0 omits audio. Returns NV_AVF_OK
-// on success, NV_AVF_FAIL on hard failure (reader create/start failed) —
-// never NV_AVF_NONE.
+// on success, NV_AVF_NONE when a requested output cannot be attached, and
+// NV_AVF_FAIL on hard failure (reader create/start failed).
 nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audio_track_index);
 
 // Atomically reselect the audio track mid-decode: build a dedicated
-// audio-only reader for `track_index`, then rebuild the combined reader as
-// video-only from `start_time` so video resumes near the requested position
-// instead of repeating from the clip start, and so the combined reader's
-// audio output can't block video decode. Rolls the audio-only reader back
-// if the second step fails, so the caller never observes a half-applied
-// reselect. Returns NV_AVF_OK on success, NV_AVF_NONE on soft failure (bad
-// track index / no video / an output rejected), NV_AVF_FAIL on hard failure
-// (reader create/start failed).
+// audio-only reader for `track_index`, then, when video exists, rebuild the
+// combined reader as video-only from `start_time` so video resumes near the
+// requested position instead of repeating from the clip start. Rolls the
+// audio-only reader back if video construction fails, so the caller never
+// observes a half-applied reselect. Returns NV_AVF_OK on success, NV_AVF_NONE
+// on soft failure (bad track index / an output rejected), NV_AVF_FAIL on hard
+// failure (reader create/start failed).
 nv_avf_result nv_avf_reselect_audio_track(nv_avf_backend *h, int track_index, double start_time);
-
-// Tear down the dedicated audio-only reader (no-op if none). Used by seek to
-// drop any mid-decode reselect state before it rebuilds the combined reader.
-void nv_avf_teardown_audio_reader(nv_avf_backend *h);
 
 // --- Decode pump ---
 // Returns NV_AVF_OK with *out filled, NV_AVF_NONE on clean end-of-stream,
