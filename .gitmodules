@@ -1,9 +1,4 @@
-[submodule "godot-cpp"]
-	path = godot-cpp
-	url = https://github.com/godotengine/godot-cpp.git
-	branch = master
-	shallow = true
-[submodule "thirdparty/vulkan-headers"]
-	path = thirdparty/vulkan-headers
-	url = https://github.com/KhronosGroup/Vulkan-Headers.git
-	shallow = true
+[submodule "vendor/gdzig"]
+	path = vendor/gdzig
+	url = https://github.com/claytercek/gdzig.git
+	branch = media-streams-fixes-0.16

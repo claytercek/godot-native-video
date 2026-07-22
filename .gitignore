@@ -1,38 +1,19 @@
 # Godot auto generated files
 *.gen.*
 .godot/
+!project/.godot/
 
-# Ignore built library files but keep the .gdextension manifest.
-demo/addons/native-video/*
-!demo/addons/native-video/*.gdextension
-.sconsign*.dblite
+# Zig 0.16 project-local dependency store
+zig-pkg/
+project/.godot/*
+!project/.godot/extension_list.cfg
 
-# Ignore custom.py
-custom.py
+# Zig build outputs
+.zig-cache/
+zig-out/
 
-# Ignore generated compile_commands.json
-compile_commands.json
-
-# Ignore files generated for documentation
-/src/gen
-
-# Binaries
-*.o
-*.os
-*.so
-*.obj
-*.bc
-*.pyc
-*.dblite
-*.pdb
-*.lib
-*.config
-*.creator
-*.creator.user
-*.files
-*.includes
-*.idb
-*.exp
+# Built extension library — keep the .gdextension manifest.
+project/lib/
 
 # Other stuff
 *.log
@@ -45,34 +26,7 @@ compile_commands.json
 # Jetbrains
 .idea/
 
-# Cmake
-cmake-build*
-CMakeUserPresets.json
-
-/bin
-
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
 .beads-credential-key
-
-# CI cached tools
-.godot/
-
-# Generated test fixtures — none are committed. The synthetic marker clip
-# (tools/gen_test_media.sh) and the real-clip matrix (tools/gen_clip_matrix.sh:
-# clips + the matrix.list / matrix.json manifests) are all regenerated on demand
-# by CI and locally. The generator scripts are the single source of truth.
-tests/fixtures/
-# The demo's copy of the synthetic clip (see demo/README.md) is generated too.
-demo/synthetic.mp4
-demo/synthetic.mp4.uid
-
-# Headless smoke test project generated artifacts
-tests/headless-smoke/synthetic.mp4
-tests/headless-smoke/synthetic.mov
-tests/headless-smoke/synthetic.m4v
-tests/headless-smoke/addons/native-video/*
-!tests/headless-smoke/addons/native-video/*.gdextension
-tests/headless-smoke/**/*.uid
-tests/headless-smoke/*.uid

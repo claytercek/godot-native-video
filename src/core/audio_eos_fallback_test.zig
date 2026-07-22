@@ -1,0 +1,219 @@
+//! Audio-EOS wall-clock fallback — no Godot, no GPU.
+//!
+//! A clip's audio track can legitimately end before its video track. The
+//! audio-master clock only advances from real samples consumed (onAudioMixed());
+//! once the backend stops producing real audio frames for good, nothing will
+//! ever call onAudioMixed() again, so the clock would freeze permanently unless
+//! something else advances it.
+//!
+//! This models the controller's unified clock rule:
+//!
+//!   var advanced_from_audio = false;
+//!   if (has_audio) { fill_audio(); advanced_from_audio = drive_audio(); }
+//!   if (!advanced_from_audio and audio_exhausted()) {
+//!       clock.setTime(clock.mediaTime() + delta);
+//!   }
+//!
+//! where audio_exhausted() == !has_audio or (audio_eos and ring empty): the
+//! clock advances from real samples whenever any exist; only once no more can
+//! ever come does the render delta take over. The !advanced_from_audio gate
+//! keeps the tick that drains the last partial block from double-advancing
+//! (real leftover + delta).
+
+const std = @import("std");
+
+const clock_mod = @import("clock.zig");
+const ts = @import("test_support.zig");
+
+const AudioMasterClock = clock_mod.AudioMasterClock;
+const MonotonicClock = clock_mod.MonotonicClock;
+
+const kSampleRate: i32 = 48000;
+const kFps: f64 = 30.0;
+const kFrameInterval: f64 = 1.0 / kFps;
+const kTickSeconds: f64 = 1.0 / 60.0; // render tick, independent of fps
+const kTotalFrames: i32 = 300; // 10s @ 30fps
+// Audio track only covers the first ~2.63s. Deliberately not a multiple of a
+// tick's worth of samples, so one tick drains a partial final block of real
+// audio — the exact seam a double-advance bug would show up on.
+const kAudioEndSeconds: f64 = 2.63;
+
+// Deliver every video frame whose PTS has already passed into the decode-ahead
+// buffer (no jitter — this test is about the clock, not drift).
+fn fillReadyFrames(a: std.mem.Allocator, buf: *std.ArrayList(f64), next_frame: *i32, now: f64) void {
+    while (next_frame.* < kTotalFrames and @as(f64, @floatFromInt(next_frame.*)) * kFrameInterval <= now) {
+        buf.append(a, @as(f64, @floatFromInt(next_frame.*)) * kFrameInterval) catch @panic("oom");
+        next_frame.* += 1;
+    }
+}
+
+const SimResult = struct {
+    shown_pts: f64 = -1.0,
+    max_tick_advance: f64 = 0.0, // largest single-tick clock jump observed
+};
+
+// Runs the freeze scenario. `apply_fallback` toggles the fix under test.
+fn simulate(a: std.mem.Allocator, apply_fallback: bool) SimResult {
+    var result: SimResult = .{};
+    var clock = AudioMasterClock.init(kSampleRate, 0.0);
+    var buf: std.ArrayList(f64) = .empty;
+    defer buf.deinit(a);
+    var next_frame: i32 = 0;
+    const total_real_frames: i64 = @intFromFloat(kAudioEndSeconds * @as(f64, @floatFromInt(kSampleRate)));
+    var real_frames_consumed: i64 = 0;
+    var prev_now: f64 = 0.0;
+
+    var tick: i32 = 0;
+    while (tick < 1200) : (tick += 1) {
+        const block: i64 = @intFromFloat(kTickSeconds * @as(f64, @floatFromInt(kSampleRate)));
+        const remaining = total_real_frames - real_frames_consumed;
+        const this_block = @min(block, @max(remaining, @as(i64, 0)));
+
+        var advanced_from_audio = false;
+        if (this_block > 0) {
+            clock.onAudioMixed(@intCast(this_block));
+            real_frames_consumed += this_block;
+            advanced_from_audio = true;
+        }
+        // audio_exhausted(): the backend reported genuine EOS and the ring has
+        // drained — in this sim the supply running dry stands in for both.
+        const audio_exhausted = real_frames_consumed >= total_real_frames;
+        if (apply_fallback and !advanced_from_audio and audio_exhausted) {
+            clock.setTime(clock.mediaTime() + kTickSeconds);
+        }
+
+        const now = clock.mediaTime();
+        result.max_tick_advance = @max(result.max_tick_advance, now - prev_now);
+        prev_now = now;
+
+        fillReadyFrames(a, &buf, &next_frame, now);
+        result.shown_pts = ts.runPresent(&buf, now, result.shown_pts, kFrameInterval);
+
+        if (result.shown_pts >= @as(f64, @floatFromInt(kTotalFrames - 1)) * kFrameInterval) {
+            break; // last frame presented — playback reached the end
+        }
+    }
+    return result;
+}
+
+test "audio ending before video falls back to wall-clock so trailing video keeps playing" {
+    const a = std.testing.allocator;
+    const result = simulate(a, true);
+
+    // Without the fallback, `now` would freeze at kAudioEndSeconds forever and
+    // shown_pts would get stuck well short of the clip's last frame.
+    try std.testing.expect(result.shown_pts >= @as(f64, @floatFromInt(kTotalFrames - 1)) * kFrameInterval);
+    try std.testing.expect(result.shown_pts <= @as(f64, @floatFromInt(kTotalFrames)) * kFrameInterval);
+
+    // The real-advance/fallback gate must be mutually exclusive: no tick should
+    // ever advance the clock by more than one tick's worth.
+    try std.testing.expect(result.max_tick_advance <= kTickSeconds * 1.0001);
+}
+
+test "without the fallback, audio ending early freezes video short of the clip end" {
+    const a = std.testing.allocator;
+    const result = simulate(a, false);
+
+    // The clip never reaches its last frame: playback is stuck at the frame
+    // nearest the audio cutoff.
+    try std.testing.expect(result.shown_pts < @as(f64, @floatFromInt(kTotalFrames - 1)) * kFrameInterval);
+    try std.testing.expect(result.shown_pts <= kAudioEndSeconds);
+}
+
+test "mid-stream underrun without audio EOS freezes the clock until audio resumes" {
+    // Models a transient decode stall: real audio stops arriving for a stretch of
+    // ticks, but the backend never reported EOS, so audio_exhausted() stays false
+    // and the wall-clock fallback must NOT fire.
+    const a = std.testing.allocator;
+    var clock = AudioMasterClock.init(kSampleRate, 0.0);
+    var buf: std.ArrayList(f64) = .empty;
+    defer buf.deinit(a);
+    var next_frame: i32 = 0;
+    var shown_pts: f64 = -1.0;
+    var real_frames_consumed: i64 = 0;
+    const block: i64 = @intFromFloat(kTickSeconds * @as(f64, @floatFromInt(kSampleRate)));
+
+    const kGapStart: i32 = 120; // ticks [kGapStart, kGapEnd): no audio arrives
+    const kGapEnd: i32 = 180;
+
+    var time_at_gap_start: f64 = -1.0;
+    var shown_at_gap_start: f64 = -1.0;
+
+    var tick: i32 = 0;
+    while (tick < 480) : (tick += 1) {
+        const in_gap = tick >= kGapStart and tick < kGapEnd;
+
+        var advanced_from_audio = false;
+        if (!in_gap) { // audio flowing normally
+            clock.onAudioMixed(@intCast(block));
+            real_frames_consumed += block;
+            advanced_from_audio = true;
+        }
+        // audio_exhausted() is false throughout: an empty ring alone must not
+        // trigger the fallback.
+        const audio_exhausted = false;
+        if (!advanced_from_audio and audio_exhausted) {
+            clock.setTime(clock.mediaTime() + kTickSeconds);
+        }
+
+        const now = clock.mediaTime();
+        fillReadyFrames(a, &buf, &next_frame, now);
+        shown_pts = ts.runPresent(&buf, now, shown_pts, kFrameInterval);
+
+        if (tick == kGapStart) {
+            time_at_gap_start = now;
+            shown_at_gap_start = shown_pts;
+        }
+        if (in_gap) {
+            // Frozen: no advance of any kind during the underrun.
+            try std.testing.expectApproxEqAbs(time_at_gap_start, now, 1e-9);
+            try std.testing.expectApproxEqAbs(shown_at_gap_start, shown_pts, 1e-9);
+        }
+    }
+
+    // A/V sync preserved across the gap: media time is exactly the real samples
+    // consumed — the underrun neither advanced nor skewed the clock.
+    try std.testing.expectApproxEqAbs(
+        @as(f64, @floatFromInt(real_frames_consumed)) / @as(f64, @floatFromInt(kSampleRate)),
+        clock.mediaTime(),
+        1e-9,
+    );
+    // Video resumed after the gap and moved past where it froze.
+    try std.testing.expect(shown_pts > shown_at_gap_start);
+}
+
+test "silent clip advances by exactly delta per tick under the unified rule" {
+    // No audio track at all: audio_exhausted() is true from tick 0, so the same
+    // fallback that handles the post-audio-EOS tail drives the whole clip. The
+    // master here is the MonotonicClock, where setTime(mediaTime() + delta) is
+    // equivalent to advance(delta).
+    const a = std.testing.allocator;
+    var clock = MonotonicClock.init(0.0);
+    var buf: std.ArrayList(f64) = .empty;
+    defer buf.deinit(a);
+    var next_frame: i32 = 0;
+    var shown_pts: f64 = -1.0;
+
+    var tick: i32 = 0;
+    while (tick < 1200) : (tick += 1) {
+        const before = clock.mediaTime();
+
+        // The unified gate, folded: with no audio track, advanced_from_audio is
+        // always false and audio_exhausted() is always true (!has_audio), so the
+        // fallback fires every tick.
+        clock.setTime(clock.mediaTime() + kTickSeconds);
+
+        // Exactly one render delta per tick — the clip plays at the correct rate.
+        try std.testing.expectApproxEqAbs(kTickSeconds, clock.mediaTime() - before, 1e-9);
+
+        const now = clock.mediaTime();
+        fillReadyFrames(a, &buf, &next_frame, now);
+        shown_pts = ts.runPresent(&buf, now, shown_pts, kFrameInterval);
+
+        if (shown_pts >= @as(f64, @floatFromInt(kTotalFrames - 1)) * kFrameInterval) {
+            break; // last frame presented — the silent clip played to the end
+        }
+    }
+
+    try std.testing.expect(shown_pts >= @as(f64, @floatFromInt(kTotalFrames - 1)) * kFrameInterval);
+}
