@@ -21,13 +21,11 @@ on:
         default: ""
 
 jobs:
-  build:
-    name: Build & Package
-    runs-on: macos-latest
+  build-macos:
+    name: Build macOS
+    runs-on: macos-15
     permissions:
-      contents: write
-    env:
-      RELEASE_TAG: ${{ inputs.release-tag }}
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,12 +37,6 @@ jobs:
         with:
           version: 0.16.0
 
-      # Windows targets cross-compile from macOS via Zig's bundled mingw,
-      # so every target below is built on this one macOS runner — no need
-      # for a windows-latest leg or the matrix/artifact-merge dance the old
-      # C++ build.yml used. GODOT_PATH isn't set explicitly: build.zig
-      # defaults to Godot 4.6 and lets gdzig's dependency step download it
-      # for bindgen, same as test.yml relies on implicitly.
       - name: Stage output dir
         run: mkdir -p staging
 
@@ -72,6 +64,43 @@ jobs:
         run: |
           lipo -create staging/libnative_video.macos-arm64.debug.dylib staging/libnative_video.macos-x86_64.debug.dylib -output staging/libnative_video.macos.debug.dylib
           lipo -create staging/libnative_video.macos-arm64.release.dylib staging/libnative_video.macos-x86_64.release.dylib -output staging/libnative_video.macos.release.dylib
+
+      # iOS is deliberately not built here: it produces a plain .dylib, but
+      # Godot's iOS export conventionally needs a static library /
+      # .xcframework, and only link-time (not on-device runtime) has been
+      # verified. See README for the follow-up.
+
+      - name: Upload macOS binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-video-macos
+          path: |
+            staging/libnative_video.macos.debug.dylib
+            staging/libnative_video.macos.release.dylib
+          if-no-files-found: error
+          retention-days: 1
+
+  build-windows:
+    name: Build Windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Zig's bundled MinGW toolchain can cross-compile every Windows target
+      # from Linux. GODOT_PATH is omitted so gdzig downloads the host Godot
+      # binary it needs for bindgen, as it does in test.yml.
+      - name: Stage output dir
+        run: mkdir -p staging
 
       - name: Build Windows x86_64 (debug)
         run: |
@@ -103,10 +132,50 @@ jobs:
           zig build -Dtarget=aarch64-windows-gnu -Doptimize=ReleaseFast --summary all
           cp project/lib/native_video.dll staging/native_video.windows.release.arm64.dll
 
-      # iOS is deliberately not built here: it produces a plain .dylib, but
-      # Godot's iOS export conventionally needs a static library /
-      # .xcframework, and only link-time (not on-device runtime) has been
-      # verified. See README for the follow-up.
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-video-windows
+          path: staging/*.dll
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Package & Publish
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download macOS binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: native-video-macos
+          path: staging
+
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: native-video-windows
+          path: staging
+
+      - name: Validate binaries
+        run: |
+          test -s staging/libnative_video.macos.debug.dylib
+          test -s staging/libnative_video.macos.release.dylib
+          test -s staging/native_video.windows.debug.x86_64.dll
+          test -s staging/native_video.windows.release.x86_64.dll
+          test -s staging/native_video.windows.debug.x86_32.dll
+          test -s staging/native_video.windows.release.x86_32.dll
+          test -s staging/native_video.windows.debug.arm64.dll
+          test -s staging/native_video.windows.release.arm64.dll
 
       - name: Assemble addon
         run: |
@@ -140,4 +209,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native_video
-          path: addon-out/**
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
