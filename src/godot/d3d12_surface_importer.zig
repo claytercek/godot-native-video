@@ -21,9 +21,8 @@
 //! Cross-adapter fallback: the shared handles/fence are opened on Godot's
 //! ID3D12Device. That succeeds whenever Godot runs on the same adapter as the
 //! decoder (the overwhelmingly common case). On a true cross-adapter / hybrid-
-//! GPU setup OpenSharedHandle fails; import() then returns an invalid result and
-//! the WindowsSurfaceImporter wrapper degrades to the CPU-copy importer
-//! permanently (it probes only the first import, never per-frame).
+//! GPU setup OpenSharedHandle fails; import() reports a permanent capability
+//! mismatch and the WindowsSurfaceImporter wrapper degrades to CPU-copy.
 //!
 //! The interop chain (see the C++ reference for the full rationale):
 //!   initialize() once:
@@ -57,9 +56,10 @@
 //!     6. Hand each ID3D12Resource to RenderingDevice.texture_create_from_
 //!        extension with SAMPLING | COLOR_ATTACHMENT usage (COLOR_ATTACHMENT
 //!        for the same driver reason as the RENDER_TARGET bind flag above).
-//!     7. PlaneTextures.acquire carries the fence handoff: it CPU-waits (bounded
-//!        5s) on the D3D12-side fence for this frame's signal value before the
-//!        present pipeline's compute dispatch samples the planes.
+//!     7. CPU-wait on the D3D12-side fence before exposing either imported RID.
+//!        This keeps every success and failure path under the same ownership
+//!        rule: plane resources are never sampled or destroyed while D3D11 is
+//!        still writing them.
 //!
 //! Known limitation: no keyed mutex and no release-sync. The plane textures are
 //! single-use (the retire-ring destroys them, they are never reused), so
@@ -87,6 +87,23 @@ const wic = @import("windows_import_common.zig");
 const CachedTex2D = wic.CachedTex2D;
 
 const log = std.log.scoped(.native_video_d3d12_import);
+
+const BootstrapResult = enum {
+    ready,
+    transient_failure,
+    capability_unavailable,
+};
+
+const SharedOpenResult = enum {
+    success,
+    transient_failure,
+    capability_unavailable,
+};
+
+const e_outofmemory: com.HRESULT = @bitCast(@as(u32, 0x8007000E));
+const dxgi_error_device_removed: com.HRESULT = @bitCast(@as(u32, 0x887A0005));
+const dxgi_error_device_hung: com.HRESULT = @bitCast(@as(u32, 0x887A0006));
+const dxgi_error_device_reset: com.HRESULT = @bitCast(@as(u32, 0x887A0007));
 
 // -----------------------------------------------------------------------
 // Plane-split compute shader. Reads two source planes (PlaneSlice SRVs over the
@@ -171,22 +188,16 @@ fn releaseTeardown(v: *ReleaseValue) void {
     com.release(@as(*com.IUnknown, @ptrCast(@alignCast(v.d3d12_chroma))));
 }
 
-/// Per-frame acquire payload: CPU-wait on the D3D12 fence for this frame's
-/// signal value before the planes are sampled. Bounded (5s) — on a GPU/driver
-/// hang the pipeline proceeds anyway rather than freezing forever.
-const AcquireValue = struct {
-    fence: *d3d12.ID3D12Fence,
-    event: com.HANDLE,
-    signal_value: u64,
-};
-
-fn acquireWait(v: *AcquireValue) void {
-    if (v.fence.GetCompletedValue() < v.signal_value) {
-        _ = v.fence.SetEventOnCompletion(v.signal_value, v.event);
-        if (com.WaitForSingleObject(v.event, 5000) != com.WAIT_OBJECT_0) {
-            log.err("shared-fence wait timed out; sampling planes without confirmed GPU sync.", .{});
-        }
+fn waitForSignal(fence: *d3d12.ID3D12Fence, event: com.HANDLE, signal_value: u64) bool {
+    if (fence.GetCompletedValue() >= signal_value) return true;
+    if (com.FAILED(fence.SetEventOnCompletion(signal_value, event))) {
+        log.err("shared-fence SetEventOnCompletion failed.", .{});
+        return false;
     }
+    // Resource destruction without this handoff is a use-after-submit. A GPU
+    // hang must therefore fail at the process watchdog boundary, not continue
+    // by freeing or sampling allocations whose producer may still own them.
+    return com.WaitForSingleObject(event, com.INFINITE) == com.WAIT_OBJECT_0;
 }
 
 pub const D3D12SurfaceImporter = struct {
@@ -226,6 +237,11 @@ pub const D3D12SurfaceImporter = struct {
     // True once the first import() built the D3D11 pipeline on the decoder's
     // own device (fence, extended interfaces, compute state).
     pipeline_ready: bool = false,
+    // Once one frame has crossed the entire interop boundary successfully,
+    // later per-frame failures are retryable. Before that point, failure to
+    // open a plane on D3D12 or wrap it as an RD texture proves that this
+    // device/driver combination cannot support the zero-copy contract.
+    imported_once: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) D3D12SurfaceImporter {
         return .{ .allocator = allocator };
@@ -256,17 +272,21 @@ pub const D3D12SurfaceImporter = struct {
     /// Build the D3D11-side pipeline (shared fence, extended interfaces, compute
     /// state) on the device that OWNS `decoded` — the decoder texture's own
     /// device, obtained via GetDevice. Called once, on the first import(). On
-    /// failure the wrapper (WindowsSurfaceImporter) tears this importer down and
-    /// falls back to the CPU-copy path, so partial state is cleaned up by
-    /// teardown(); we do not attempt to retry here.
-    fn ensurePipeline(self: *D3D12SurfaceImporter, decoded: *d3d11.ID3D11Texture2D) bool {
-        if (self.pipeline_ready) return true;
+    /// Permanent interface/interop incompatibilities authorize CPU fallback;
+    /// allocation/bootstrap failures clear their partial state and retry on a
+    /// later frame.
+    fn ensurePipeline(self: *D3D12SurfaceImporter, decoded: *d3d11.ID3D11Texture2D) BootstrapResult {
+        if (self.pipeline_ready) return .ready;
+
+        // A retry after a transient bootstrap failure must start from a clean
+        // decoder-side pipeline rather than leaking or mixing partial COM state.
+        self.resetDecoderPipeline();
 
         // Bind to the SAME device the decoder texture lives on. GetDevice /
         // GetImmediateContext AddRef; teardown() Releases both.
         const bound = wic.bindDecoderDevice(decoded) orelse {
             log.err("init: ID3D11Texture2D.GetDevice failed.", .{});
-            return false;
+            return .transient_failure;
         };
         self.device = bound.device;
         self.context = bound.context;
@@ -277,45 +297,53 @@ pub const D3D12SurfaceImporter = struct {
         // --- Shared fence bootstrap. ---
         const device5 = com.queryInterface(d3d11.ID3D11Device5, dev11) orelse {
             log.err("init: ID3D11Device5 not available (needs Windows 10 1809+).", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .capability_unavailable;
         };
         defer com.release(device5);
 
         var fence_out: ?*anyopaque = null;
         if (com.FAILED(device5.CreateFence(0, d3d11.D3D11_FENCE_FLAG_SHARED, &d3d11.ID3D11Fence.IID, &fence_out))) {
             log.err("init: ID3D11Device5.CreateFence failed.", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .transient_failure;
         }
         self.d3d11_fence = @ptrCast(@alignCast(fence_out.?));
 
         var fence_handle: com.HANDLE = null;
         if (com.FAILED(self.d3d11_fence.?.CreateSharedHandle(null, com.GENERIC_ALL, null, &fence_handle)) or fence_handle == null) {
+            if (fence_handle != null) _ = com.CloseHandle(fence_handle);
             log.err("init: ID3D11Fence.CreateSharedHandle failed.", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .transient_failure;
         }
         var d3d12_fence_out: ?*anyopaque = null;
         const open_fence_hr = d3d12_device.OpenSharedHandle(fence_handle, &d3d12.ID3D12Fence.IID, &d3d12_fence_out);
         _ = com.CloseHandle(fence_handle);
         if (com.FAILED(open_fence_hr)) {
             log.err("init: ID3D12Device.OpenSharedHandle (fence) failed (cross-adapter setup?).", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .capability_unavailable;
         }
         self.d3d12_fence = @ptrCast(@alignCast(d3d12_fence_out.?));
 
         self.fence_event = com.CreateEventW(null, com.FALSE, com.FALSE, null);
         if (self.fence_event == null) {
             log.err("init: CreateEventW failed.", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .transient_failure;
         }
 
         // --- Extended device/context interfaces used every frame. ---
         self.device3 = com.queryInterface(d3d11.ID3D11Device3, dev11) orelse {
             log.err("init: ID3D11Device3 not available.", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .capability_unavailable;
         };
         self.context4 = com.queryInterface(d3d11.ID3D11DeviceContext4, self.context.?) orelse {
             log.err("init: ID3D11DeviceContext4 not available (needs Windows 10 1809+).", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .capability_unavailable;
         };
 
         // --- Plane-split compute shader bootstrap. ---
@@ -339,14 +367,16 @@ pub const D3D12SurfaceImporter = struct {
         };
         if (com.FAILED(compile_hr) or bytecode == null) {
             log.err("init: plane-split shader compile failed.", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .capability_unavailable;
         }
         defer com.release(bytecode.?);
 
         var cs_out: ?*d3d11.ID3D11ComputeShader = null;
         if (com.FAILED(dev11.CreateComputeShader(bytecode.?.GetBufferPointer().?, bytecode.?.GetBufferSize(), null, &cs_out))) {
             log.err("init: CreateComputeShader (plane-split) failed.", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .transient_failure;
         }
         self.plane_split_cs = cs_out;
 
@@ -357,12 +387,13 @@ pub const D3D12SurfaceImporter = struct {
         var cb_out: ?*d3d11.ID3D11Buffer = null;
         if (com.FAILED(dev11.CreateBuffer(&cb_desc, null, &cb_out))) {
             log.err("init: CreateBuffer (plane-split params) failed.", .{});
-            return false;
+            self.resetDecoderPipeline();
+            return .transient_failure;
         }
         self.params_cb = cb_out;
 
         self.pipeline_ready = true;
-        return true;
+        return .ready;
     }
 
     pub fn isInitialized(self: *const D3D12SurfaceImporter) bool {
@@ -371,19 +402,22 @@ pub const D3D12SurfaceImporter = struct {
 
     /// Import the NV12/P010 ID3D11Texture2D (opaque handle == ID3D11Texture2D*)
     /// into two RD plane textures, zero-copy (GPU-only), CROPPED to `crop`
-    /// (the frame's display aperture -- see core.backend.CropRect). Returns an
-    /// invalid PlaneTextures on failure. Does NOT take ownership of the
-    /// decoder texture.
-    pub fn import(self: *D3D12SurfaceImporter, native_handle: ?*anyopaque, plane_slice: u32, crop: core.backend.CropRect) PlaneTextures {
+    /// (the frame's display aperture -- see core.backend.CropRect). Does NOT
+    /// take ownership of the decoder texture.
+    pub fn import(self: *D3D12SurfaceImporter, frame_info: core.backend.VideoFrame) si.ImportResult {
         var out: PlaneTextures = .{};
-        if (!self.initialized) return out;
-        const handle = native_handle orelse return out;
+        if (!self.initialized) return .transient_failure;
+        const handle = frame_info.native_handle orelse return .bad_frame;
         const decoded: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(handle));
 
         // Lazily bootstrap the D3D11 pipeline on the decoder texture's own
         // device. A failure here (including OpenSharedHandle on a cross-adapter
-        // setup) returns an invalid result; the wrapper falls back to CPU-copy.
-        if (!self.ensurePipeline(decoded)) return out;
+        // setup) is the capability failure that lets the wrapper use CPU-copy.
+        switch (self.ensurePipeline(decoded)) {
+            .ready => {},
+            .transient_failure => return .transient_failure,
+            .capability_unavailable => return .capability_unavailable,
+        }
 
         const rd = self.rd.?;
         const device = self.device.?;
@@ -393,11 +427,11 @@ pub const D3D12SurfaceImporter = struct {
         decoded.GetDesc(&src_desc);
         const is_10bit = wic.detectBitDepth(src_desc.Format) orelse {
             log.err("decoder texture is not NV12 or P010.", .{});
-            return out;
+            return .bad_frame;
         };
         const width: com.UINT = src_desc.Width;
         const height: com.UINT = src_desc.Height;
-        const rc = wic.resolveCrop(crop, width, height);
+        const rc = wic.resolveCrop(frame_info.crop, width, height);
 
         const luma_format = dxgiPlaneFormat(is_10bit, false);
         const chroma_format = dxgiPlaneFormat(is_10bit, true);
@@ -405,10 +439,10 @@ pub const D3D12SurfaceImporter = struct {
         // --- 1. GPU-blit the decoder slice into the cached intermediate. ---
         if (!self.intermediate.ensure(device, width, height, src_desc.Format, d3d11.D3D11_USAGE_DEFAULT, d3d11.D3D11_BIND_SHADER_RESOURCE, 0)) {
             log.err("intermediate texture create failed.", .{});
-            return out;
+            return .transient_failure;
         }
         const intermediate = self.intermediate.texture.?;
-        context.CopySubresourceRegion(intermediate.asResource(), 0, 0, 0, 0, decoded.asResource(), @intCast(plane_slice), null);
+        context.CopySubresourceRegion(intermediate.asResource(), 0, 0, 0, 0, decoded.asResource(), @intCast(frame_info.plane_slice), null);
 
         // --- 2. PlaneSlice SRVs over the intermediate. ---
         var luma_srv = com.ComPtr(d3d11.ID3D11ShaderResourceView){};
@@ -424,14 +458,14 @@ pub const D3D12SurfaceImporter = struct {
             luma_srv_desc.u.Texture2D.PlaneSlice = 0;
             if (com.FAILED(self.device3.?.CreateShaderResourceView1(intermediate.asResource(), &luma_srv_desc, luma_srv.put()))) {
                 log.err("luma PlaneSlice SRV create failed.", .{});
-                return out;
+                return .transient_failure;
             }
             var chroma_srv_desc = luma_srv_desc;
             chroma_srv_desc.Format = chroma_format;
             chroma_srv_desc.u.Texture2D.PlaneSlice = 1;
             if (com.FAILED(self.device3.?.CreateShaderResourceView1(intermediate.asResource(), &chroma_srv_desc, chroma_srv.put()))) {
                 log.err("chroma PlaneSlice SRV create failed.", .{});
-                return out;
+                return .transient_failure;
             }
         }
 
@@ -444,7 +478,7 @@ pub const D3D12SurfaceImporter = struct {
             !makeOutputTexture(device, chroma_format, rc.chroma_width, rc.chroma_height, chroma_out.put()))
         {
             log.err("plane-split output texture create failed.", .{});
-            return out;
+            return .transient_failure;
         }
 
         var luma_uav = com.ComPtr(d3d11.ID3D11UnorderedAccessView){};
@@ -457,14 +491,14 @@ pub const D3D12SurfaceImporter = struct {
             luma_uav_desc.ViewDimension = d3d11.D3D11_UAV_DIMENSION_TEXTURE2D;
             if (com.FAILED(device.CreateUnorderedAccessView(luma_out.get().?.asResource(), &luma_uav_desc, luma_uav.put()))) {
                 log.err("luma UAV create failed.", .{});
-                return out;
+                return .transient_failure;
             }
             var chroma_uav_desc = std.mem.zeroes(d3d11.D3D11_UNORDERED_ACCESS_VIEW_DESC);
             chroma_uav_desc.Format = chroma_format;
             chroma_uav_desc.ViewDimension = d3d11.D3D11_UAV_DIMENSION_TEXTURE2D;
             if (com.FAILED(device.CreateUnorderedAccessView(chroma_out.get().?.asResource(), &chroma_uav_desc, chroma_uav.put()))) {
                 log.err("chroma UAV create failed.", .{});
-                return out;
+                return .transient_failure;
             }
         }
 
@@ -502,20 +536,27 @@ pub const D3D12SurfaceImporter = struct {
         const signal_value = self.next_fence_value;
         if (com.FAILED(self.context4.?.Signal(self.d3d11_fence.?, signal_value))) {
             log.err("shared-fence Signal failed.", .{});
-            return out;
+            return .transient_failure;
         }
         context.Flush();
+        if (!waitForSignal(self.d3d12_fence.?, self.fence_event, signal_value)) {
+            return .transient_failure;
+        }
 
         // --- 5. Export both output textures and open them on D3D12. ---
         var d3d12_luma = com.ComPtr(d3d12.ID3D12Resource){};
         defer d3d12_luma.deinit();
         var d3d12_chroma = com.ComPtr(d3d12.ID3D12Resource){};
         defer d3d12_chroma.deinit();
-        if (!self.exportAndOpen(luma_out.get().?, d3d12_luma.put()) or
-            !self.exportAndOpen(chroma_out.get().?, d3d12_chroma.put()))
-        {
-            log.err("OpenSharedHandle (plane texture) failed.", .{});
-            return out;
+        switch (self.exportAndOpen(luma_out.get().?, d3d12_luma.put())) {
+            .success => {},
+            .transient_failure => return .transient_failure,
+            .capability_unavailable => return .capability_unavailable,
+        }
+        switch (self.exportAndOpen(chroma_out.get().?, d3d12_chroma.put())) {
+            .success => {},
+            .transient_failure => return .transient_failure,
+            .capability_unavailable => return .capability_unavailable,
         }
 
         // --- 6. Hand each ID3D12Resource to Godot RD as a plane texture. ---
@@ -524,21 +565,12 @@ pub const D3D12SurfaceImporter = struct {
         if (!luma.isValid() or !chroma.isValid()) {
             si.freePlaneRids(rd, luma, chroma);
             log.err("texture_create_from_extension failed.", .{});
-            return out;
+            return if (self.imported_once) .transient_failure else .capability_unavailable;
         }
 
-        // --- 7. Build the acquire (fence wait) and release closures. Ownership
-        // of the two D3D12 resources moves into the release box; the D3D11-side
-        // transients are released by the defers above (shared memory survives
-        // via the D3D12 references).
-        const acquire = si.boxClosure(self.allocator, AcquireValue{
-            .fence = self.d3d12_fence.?,
-            .event = self.fence_event,
-            .signal_value = signal_value,
-        }, acquireWait) catch {
-            si.freePlaneRids(rd, luma, chroma);
-            return out;
-        };
+        // --- 7. Build the release closure. Ownership of the two D3D12
+        // resources moves into its box; the D3D11-side transients are released
+        // by the defers above (shared memory survives via the D3D12 references).
         const release = si.boxClosure(self.allocator, ReleaseValue{
             .rd = rd,
             .luma = luma,
@@ -546,9 +578,8 @@ pub const D3D12SurfaceImporter = struct {
             .d3d12_luma = d3d12_luma.get().?,
             .d3d12_chroma = d3d12_chroma.get().?,
         }, releaseTeardown) catch {
-            acquire.call(); // run + free the acquire box so it does not leak
             si.freePlaneRids(rd, luma, chroma);
-            return out;
+            return .transient_failure;
         };
 
         _ = d3d12_luma.take(); // ownership handed to the release box
@@ -558,26 +589,53 @@ pub const D3D12SurfaceImporter = struct {
         out.chroma = chroma;
         out.width = @intCast(rc.luma_width);
         out.height = @intCast(rc.luma_height);
-        out.acquire = acquire;
+        out.metadata = si.PresentationMetadata.fromFrame(frame_info);
         out.release = release;
-        return out;
+        self.imported_once = true;
+        return .{ .success = out };
     }
 
     /// QI the D3D11 texture to IDXGIResource1, export an NT shared handle, and
     /// open it as an ID3D12Resource on Godot's D3D12 device.
-    fn exportAndOpen(self: *D3D12SurfaceImporter, tex: *d3d11.ID3D11Texture2D, out: *?*d3d12.ID3D12Resource) bool {
-        const dxgi_res = com.queryInterface(dxgi.IDXGIResource1, tex) orelse return false;
+    fn exportAndOpen(self: *D3D12SurfaceImporter, tex: *d3d11.ID3D11Texture2D, out: *?*d3d12.ID3D12Resource) SharedOpenResult {
+        var dxgi_out: ?*anyopaque = null;
+        const unknown: *com.IUnknown = @ptrCast(@alignCast(tex));
+        const qi_hr = unknown.lpVtbl.QueryInterface(unknown, &dxgi.IDXGIResource1.IID, &dxgi_out);
+        if (com.FAILED(qi_hr) or dxgi_out == null) {
+            log.err("IDXGIResource1 unavailable for plane texture.", .{});
+            return self.classifyInteropFailure(qi_hr);
+        }
+        const dxgi_res: *dxgi.IDXGIResource1 = @ptrCast(@alignCast(dxgi_out.?));
         defer com.release(dxgi_res);
         var handle: com.HANDLE = null;
-        if (com.FAILED(dxgi_res.CreateSharedHandle(null, dxgi.DXGI_SHARED_RESOURCE_READ | dxgi.DXGI_SHARED_RESOURCE_WRITE, null, &handle)) or handle == null) {
-            return false;
+        const create_hr = dxgi_res.CreateSharedHandle(null, dxgi.DXGI_SHARED_RESOURCE_READ | dxgi.DXGI_SHARED_RESOURCE_WRITE, null, &handle);
+        if (com.FAILED(create_hr) or handle == null) {
+            if (handle != null) _ = com.CloseHandle(handle);
+            log.err("IDXGIResource1.CreateSharedHandle failed.", .{});
+            return self.classifyInteropFailure(create_hr);
         }
         var res_out: ?*anyopaque = null;
         const hr = self.d3d12_device.?.OpenSharedHandle(handle, &d3d12.IID_ID3D12Resource, &res_out);
         _ = com.CloseHandle(handle);
-        if (com.FAILED(hr) or res_out == null) return false;
+        if (com.FAILED(hr) or res_out == null) {
+            log.err("OpenSharedHandle (plane texture) failed.", .{});
+            return self.classifyInteropFailure(hr);
+        }
         out.* = @ptrCast(@alignCast(res_out));
-        return true;
+        return .success;
+    }
+
+    /// Before the first successful import, deterministic interop failures prove
+    /// that zero-copy is unavailable on this device/driver pair. Resource
+    /// pressure and device-loss HRESULTs remain retryable; after one successful
+    /// import every per-frame failure is transient.
+    fn classifyInteropFailure(self: *const D3D12SurfaceImporter, hr: com.HRESULT) SharedOpenResult {
+        if (self.imported_once or hr == e_outofmemory or hr == dxgi_error_device_removed or
+            hr == dxgi_error_device_hung or hr == dxgi_error_device_reset)
+        {
+            return .transient_failure;
+        }
+        return .capability_unavailable;
     }
 
     pub fn deinit(self: *D3D12SurfaceImporter) void {
@@ -587,6 +645,19 @@ pub const D3D12SurfaceImporter = struct {
     /// Release every owned COM object / handle. Idempotent; used both by the
     /// initialize() failure paths and by deinit().
     fn teardown(self: *D3D12SurfaceImporter) void {
+        self.resetDecoderPipeline();
+        if (self.d3d12_device) |p| {
+            com.release(p);
+            self.d3d12_device = null;
+        }
+        self.imported_once = false;
+        self.initialized = false;
+    }
+
+    /// Drop a partial or complete decoder-side bootstrap while preserving the
+    /// RenderingDevice binding. This makes transient bootstrap failures truly
+    /// retryable on the next frame.
+    fn resetDecoderPipeline(self: *D3D12SurfaceImporter) void {
         if (self.params_cb) |p| {
             // @alignCast: ID3D11Buffer/ComputeShader are opaque (align-1)
             // handles; a live COM pointer is vtable-aligned, so the upcast is
@@ -627,12 +698,7 @@ pub const D3D12SurfaceImporter = struct {
             com.release(d);
             self.device = null;
         }
-        if (self.d3d12_device) |p| {
-            com.release(p);
-            self.d3d12_device = null;
-        }
         self.pipeline_ready = false;
-        self.initialized = false;
     }
 };
 

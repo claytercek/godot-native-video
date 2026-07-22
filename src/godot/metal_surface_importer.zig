@@ -334,23 +334,22 @@ pub const MetalSurfaceImporter = struct {
     }
 
     /// Import a decoder surface (CVPixelBufferRef) into two RD plane textures,
-    /// zero-copy. Returns an invalid PlaneTextures on failure. Does NOT take
-    /// ownership of the decoder surface. The crop parameter is accepted only
-    /// for interface parity with WindowsSurfaceImporter and ignored: AVF's
+    /// zero-copy. Does NOT take ownership of the decoder surface. AVF's
     /// CVPixelBuffers already come back sized to the display/clean aperture
     /// (VideoToolbox crops internally -- see avf_shim.m's
     /// CVPixelBufferGetWidth/Height and this importer's
     /// CVPixelBufferGetWidthOfPlane/HeightOfPlane calls below, both of which
     /// already read the cropped size), so there is no decoder padding here to
     /// crop away.
-    pub fn import(self: *MetalSurfaceImporter, native_handle: ?*anyopaque, _: u32, _: core.backend.CropRect) PlaneTextures {
+    pub fn import(self: *MetalSurfaceImporter, frame_info: core.backend.VideoFrame) si.ImportResult {
         var out: PlaneTextures = .{};
-        if (self.texture_cache == null or native_handle == null) return out;
+        if (self.texture_cache == null) return .transient_failure;
+        if (frame_info.native_handle == null) return .bad_frame;
 
-        const pb = native_handle; // CVPixelBufferRef
+        const pb = frame_info.native_handle; // CVPixelBufferRef
         const pf = CVPixelBufferGetPixelFormatType(pb);
         const is_supported = pf == pf_420v or pf == pf_420f or pf == pf_x420 or pf == pf_xf20;
-        if (!is_supported or CVPixelBufferGetPlaneCount(pb) < 2) return out;
+        if (!is_supported or CVPixelBufferGetPlaneCount(pb) < 2) return .bad_frame;
 
         // Detect 10-bit vs 8-bit from the pixel format type.
         const is_10bit = pf == pf_x420 or pf == pf_xf20;
@@ -381,13 +380,13 @@ pub const MetalSurfaceImporter = struct {
             if (chroma.isValid()) rd.freeRid(chroma);
             if (cv_luma) |t| CFRelease(t);
             if (cv_chroma) |t| CFRelease(t);
-            return out;
+            return .transient_failure;
         }
         if (!chroma.isValid()) {
             rd.freeRid(luma);
             if (cv_luma) |t| CFRelease(t);
             if (cv_chroma) |t| CFRelease(t);
-            return out;
+            return .transient_failure;
         }
 
         // Park the teardown in a heap box.
@@ -403,15 +402,16 @@ pub const MetalSurfaceImporter = struct {
             rd.freeRid(chroma);
             if (cv_luma) |t| CFRelease(t);
             if (cv_chroma) |t| CFRelease(t);
-            return out;
+            return .transient_failure;
         };
 
         out.luma = luma;
         out.chroma = chroma;
         out.width = @intCast(CVPixelBufferGetWidthOfPlane(pb, 0));
         out.height = @intCast(CVPixelBufferGetHeightOfPlane(pb, 0));
+        out.metadata = si.PresentationMetadata.fromFrame(frame_info);
         out.release = release;
-        return out;
+        return .{ .success = out };
     }
 
     /// Metal is always zero-copy: nothing here ever violates the contract, so

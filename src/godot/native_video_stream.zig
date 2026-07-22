@@ -10,6 +10,7 @@
 const NativeVideoStream = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const godot = @import("godot");
@@ -78,11 +79,14 @@ pub fn destroy(self: *NativeVideoStream, allocator: *Allocator) void {
     allocator.destroy(self);
 }
 
-/// True when the platform supports 10-bit/HDR hardware decode output through
-/// the zero-copy Metal import path. Always true on macOS.
+/// True only on targets where this extension has both a 10-bit hardware decode
+/// path and a matching P010/x420 surface importer.
 pub fn hdrDecodeSupported(self: *NativeVideoStream) bool {
     _ = self;
-    return true;
+    return switch (builtin.os.tag) {
+        .macos, .ios, .windows => true,
+        else => false,
+    };
 }
 
 // -----------------------------------------------------------------------

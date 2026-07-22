@@ -6,6 +6,7 @@ on:
     paths:
       - "src/**"
       - "project/**"
+      - "tools/**"
       - "vendor/**"
       - ".gitmodules"
       - "build.zig"
@@ -40,6 +41,10 @@ jobs:
       - name: Decode smoke test
         run: zig build decode-smoke
 
+      - name: Godot integration smoke test
+        timeout-minutes: 2
+        run: zig build smoke
+
   test-windows:
     name: Build & Test (Windows)
     runs-on: windows-latest
@@ -55,8 +60,19 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Generate mandatory decode fixtures
+        shell: bash
+        run: |
+          bash tools/gen_stress_media.sh --duration 3
+          cp tests/fixtures/stress/bframes.mp4 project/bframes.mp4
+          test -s project/bframes.mp4
+          test -s tests/fixtures/stress/nonmod16_854x480.mp4
+
       - name: Run core tests
         run: zig build test --summary all
 
       - name: Build extension
         run: zig build --summary all
+
+      - name: Decode smoke test
+        run: zig build decode-smoke -- project/bframes.mp4

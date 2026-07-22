@@ -34,6 +34,17 @@ var _smoke_player: VideoStreamPlayer
 var _smoke_frames := 0
 var _smoke_saw_texture := false
 var _smoke_positions: Array[float] = []
+var _smoke_started_msec := 0
+var _smoke_next_probe_msec := 0
+var _smoke_content_valid := false
+
+const SMOKE_DEADLINE_MSEC := 10_000
+const SMOKE_PROBE_INTERVAL_MSEC := 250
+const SMOKE_EXPECTED_SIZE := Vector2i(320, 240)
+const SMOKE_LUMINANCE_MIN := 0.04
+const SMOKE_LUMINANCE_MAX := 0.14
+const SMOKE_VARIANCE_MIN := 0.0005
+const SMOKE_CHANNEL_DELTA_MAX := 0.02
 
 
 func _ready() -> void:
@@ -81,50 +92,73 @@ func _extract_file_arg(args: PackedStringArray) -> String:
 
 
 # ---------------------------------------------------------------------------
-# Smoke mode (headless verification — pass/fail semantics preserved verbatim
-# from the original smoke.gd)
+# Smoke mode (integration verification against the checked-in synthetic clip)
 # ---------------------------------------------------------------------------
 
 func _run_smoke(clip_path: String) -> void:
-	print("SMOKE: NativeVideoStream registered = ", ClassDB.class_exists("NativeVideoStream"))
+	var registered := ClassDB.class_exists("NativeVideoStream")
+	print("SMOKE: NativeVideoStream registered = ", registered)
+	if not registered:
+		_fail_smoke("NativeVideoStream was not registered")
+		return
 	var stream = load(clip_path)
 	print("SMOKE: loaded stream = ", stream)
 	if stream == null:
-		print("SMOKE: FAIL — loader did not handle mp4")
-		get_tree().quit(1)
+		_fail_smoke("loader did not handle mp4")
+		return
+	if not stream is NativeVideoStream:
+		_fail_smoke("loader returned %s instead of NativeVideoStream" % stream.get_class())
 		return
 	_smoke_player = VideoStreamPlayer.new()
 	add_child(_smoke_player)
 	_smoke_player.stream = stream
+	_smoke_started_msec = Time.get_ticks_msec()
+	_smoke_next_probe_msec = _smoke_started_msec
 	_smoke_player.play()
 	print("SMOKE: is_playing = ", _smoke_player.is_playing())
 	print("SMOKE: length = ", _smoke_player.get_stream_length())
+	if not _smoke_player.is_playing():
+		_fail_smoke("playback did not start")
+		return
+	if _smoke_player.get_stream_length() <= 0.0:
+		_fail_smoke("stream reported no duration")
+		return
 
 
 func _process_smoke() -> void:
 	_smoke_frames += 1
-	if _smoke_frames % 30 == 0:
+	var now := Time.get_ticks_msec()
+	var probe_due := false
+	if now >= _smoke_next_probe_msec:
+		probe_due = true
+		_smoke_next_probe_msec = now + SMOKE_PROBE_INTERVAL_MSEC
 		_smoke_positions.append(_smoke_player.stream_position)
 	var tex := _smoke_player.get_video_texture()
 	if tex != null and not _smoke_saw_texture:
-		_smoke_saw_texture = true
-		print("SMOKE: first texture at frame ", _smoke_frames, ": ", tex, " ", tex.get_size())
+		var texture_size := Vector2i(tex.get_size())
+		if texture_size != Vector2i.ZERO and texture_size != SMOKE_EXPECTED_SIZE:
+			_fail_smoke("texture dimensions were %s, expected %s" % [texture_size, SMOKE_EXPECTED_SIZE])
+			return
+		if texture_size == SMOKE_EXPECTED_SIZE:
+			_smoke_saw_texture = true
+			print("SMOKE: first populated texture at frame ", _smoke_frames, ": ", tex, " ", texture_size)
 	# Mid-playback pixel check: read back the presented frame and verify the
 	# compute pass wrote real video content (not all-black / all-one-color).
 	# The clip is greyscale and mostly dark, so single points can be genuinely
 	# black — average the whole image (8px stride) to prove real content and
 	# pin NV12->RGB conversion fidelity against the known-good value (avg ~= 0.078).
-	if _smoke_frames == 60 and _smoke_saw_texture:
+	if _smoke_saw_texture and not _smoke_content_valid and probe_due:
 		var rtex := _smoke_player.get_video_texture()
 		var img := rtex.get_image() if rtex != null else null
-		if img == null:
-			print("SMOKE: get_image() returned null (no CPU readback path)")
-		else:
+		if img != null:
 			var w := img.get_width()
 			var h := img.get_height()
 			var r := 0.0
 			var g := 0.0
 			var b := 0.0
+			var luminance_sum := 0.0
+			var luminance_squared_sum := 0.0
+			var max_channel_delta := 0.0
 			var n := 0
 			for y in range(0, h, 8):
 				for x in range(0, w, 8):
@@ -132,17 +166,77 @@ func _process_smoke() -> void:
 					r += px.r
 					g += px.g
 					b += px.b
+					var luminance := px.get_luminance()
+					luminance_sum += luminance
+					luminance_squared_sum += luminance * luminance
+					max_channel_delta = max(
+						max_channel_delta,
+						max(abs(px.r - px.g), max(abs(px.g - px.b), abs(px.b - px.r)))
+					)
 					n += 1
 			var inv: float = 1.0 / float(n) if n > 0 else 0.0
 			var avg := Color(r * inv, g * inv, b * inv)
-			print("SMOKE: avg over ", n, " samples = ", avg)
-			print("SMOKE: content = ", "REAL" if avg.get_luminance() > 0.01 else "BLACK")
-	# ~2.5s at 60fps: past EOS of the 2s clip.
-	if _smoke_frames == 150:
-		print("SMOKE: positions at 0.5s intervals = ", _smoke_positions)
-		print("SMOKE: still playing at EOS+0.5s = ", _smoke_player.is_playing())
-		print("SMOKE: ", "PASS" if _smoke_saw_texture else "FAIL — no texture ever presented")
-		get_tree().quit(0 if _smoke_saw_texture else 1)
+			var avg_luminance: float = luminance_sum * inv
+			var variance: float = max(0.0, luminance_squared_sum * inv - avg_luminance * avg_luminance)
+			_smoke_content_valid = (
+				n > 0
+				and avg_luminance >= SMOKE_LUMINANCE_MIN
+				and avg_luminance <= SMOKE_LUMINANCE_MAX
+				and variance >= SMOKE_VARIANCE_MIN
+				and max_channel_delta <= SMOKE_CHANNEL_DELTA_MAX
+			)
+			print(
+				"SMOKE: samples = ", n,
+				", avg = ", avg,
+				", luminance = ", avg_luminance,
+				", variance = ", variance,
+				", max channel delta = ", max_channel_delta
+			)
+			print("SMOKE: content = ", "EXPECTED SYNTHETIC FRAME" if _smoke_content_valid else "INVALID")
+	if (
+		_smoke_content_valid
+		and _smoke_positions.size() >= 3
+		and _smoke_player.stream_position >= _smoke_player.get_stream_length() - 0.1
+	):
+		_finish_smoke(_positions_are_monotonic(_smoke_positions))
+		return
+	if now - _smoke_started_msec >= SMOKE_DEADLINE_MSEC:
+		var monotonic := _positions_are_monotonic(_smoke_positions)
+		_finish_smoke(_smoke_saw_texture and _smoke_content_valid and monotonic)
+
+
+func _finish_smoke(passed: bool) -> void:
+	print("SMOKE: sampled positions = ", _smoke_positions)
+	print("SMOKE: monotonic positions = ", _positions_are_monotonic(_smoke_positions))
+	print("SMOKE: ", "PASS" if passed else "FAIL — missing/black output or non-monotonic clock")
+	_smoke_player.stop()
+	_smoke_player.stream = null
+	remove_child(_smoke_player)
+	_smoke_player.free()
+	get_tree().quit(0 if passed else 1)
+
+
+func _fail_smoke(reason: String) -> void:
+	print("SMOKE: FAIL — ", reason)
+	if is_instance_valid(_smoke_player):
+		_smoke_player.stop()
+		_smoke_player.stream = null
+		if _smoke_player.get_parent() != null:
+			_smoke_player.get_parent().remove_child(_smoke_player)
+		_smoke_player.free()
+	get_tree().quit(1)
+
+
+func _positions_are_monotonic(positions: Array[float]) -> bool:
+	if positions.size() < 3:
+		return false
+	var advanced := false
+	for i in range(1, positions.size()):
+		if positions[i] + 0.001 < positions[i - 1]:
+			return false
+		if positions[i] > positions[i - 1] + 0.001:
+			advanced = true
+	return advanced
 
 
 # ---------------------------------------------------------------------------
