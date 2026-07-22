@@ -25,6 +25,60 @@ pub fn build(b: *Build) !void {
     const test_step = b.step("test", "Run core unit tests (no Godot needed)");
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Windows import-path selector: lives in src/godot/ (it picks between the
+    // D3D12 zero-copy and CPU-copy surface importers) but is a pure function
+    // with zero Godot dependencies, so its tests run standalone here rather
+    // than needing the full extension build.
+    const importer_selector_mod = b.createModule(.{
+        .root_source_file = b.path("src/godot/importer_selector.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const importer_selector_tests = b.addTest(.{ .root_module = importer_selector_mod });
+    test_step.dependOn(&b.addRunArtifact(importer_selector_tests).step);
+
+    // --- Media Foundation Windows bindings (Windows only). ---
+    // Hand-written OS bindings layer that the eventual MF decoder backend and
+    // the D3D11/D3D12 surface importers build on. Its own module so the future
+    // backend can import "core" without escaping a module root, mirroring how
+    // avf_mod is wired below. The runtime bindings test is folded into the main
+    // `test` step; it exercises real MF + D3D11 objects, so it needs Windows and
+    // a D3D11-capable GPU (it SkipZigTests when no device is available).
+    // Held past the Windows block so the Godot extension below can wire it into
+    // ext_mod as the "mf" import (the D3D11/D3D12 surface importers reach the
+    // bindings through `@import("mf").win`). Null off Windows.
+    var mf_mod: ?*Build.Module = null;
+    if (target.result.os.tag == .windows) {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/mf/mf.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+            },
+        });
+        linkMfLibs(m);
+        mf_mod = m;
+        const mf_tests = b.addTest(.{ .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(mf_tests).step);
+
+        // Standalone decode harness: pumps the MF backend without Godot. Mirrors
+        // the macOS decode-smoke step below.
+        const smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/mf/decode_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+            },
+        });
+        linkMfLibs(smoke_mod);
+        const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
+        const smoke_run = b.addRunArtifact(smoke_exe);
+        if (b.args) |args| smoke_run.addArgs(args);
+        b.step("decode-smoke", "Pump the MF backend without Godot (pass a media path via -- <path>)").dependOn(&smoke_run.step);
+    }
+
     // --- Godot extension: gdzig glue + AVFoundation backend. ---
     // Explicit path > explicit version > downloaded default version.
     const gdzig_dep = if (opt_godot_path) |p| b.dependency("gdzig", .{
@@ -38,8 +92,10 @@ pub fn build(b: *Build) !void {
     });
 
     // AVFoundation backend as its own module so src/avf can import "core"
-    // without escaping a module root.
-    const avf_mod = b.createModule(.{
+    // without escaping a module root. Off Windows only — the extension's backend
+    // seam picks `mf` on Windows and `avf` elsewhere at comptime, and a named
+    // module import must exist for exactly the platform that imports it.
+    const avf_mod = if (target.result.os.tag == .windows) null else b.createModule(.{
         .root_source_file = b.path("src/avf/avf_backend.zig"),
         .target = target,
         .optimize = optimize,
@@ -55,9 +111,14 @@ pub fn build(b: *Build) !void {
         .imports = &.{
             .{ .name = "godot", .module = gdzig_dep.module("gdzig") },
             .{ .name = "core", .module = core_mod },
-            .{ .name = "avf", .module = avf_mod },
         },
     });
+
+    // Backend seam: the surface importers and backend-open path resolve their
+    // platform module by name. Wire exactly the one the target uses so the
+    // comptime switch in native_video_stream_playback.zig has its import.
+    if (mf_mod) |m| ext_mod.addImport("mf", m);
+    if (avf_mod) |m| ext_mod.addImport("avf", m);
 
     const extension = gdzig.addExtension(b, .{
         .name = "native_video",
@@ -106,6 +167,18 @@ pub fn build(b: *Build) !void {
     run.addDirectoryArg(b.path("./project"));
     run.step.dependOn(&install.step);
     b.step("run", "Run the demo project in Godot").dependOn(&run.step);
+}
+
+/// Link the Windows system libraries the Media Foundation backend needs.
+/// Shared by the bindings/backend test module and the decode-smoke harness so
+/// the list lives in exactly one place.
+fn linkMfLibs(mod: *Build.Module) void {
+    for ([_][]const u8{
+        "mfplat", "mfreadwrite", "mf",    "d3d11",
+        "dxgi",   "d3d12",       "ole32", "d3dcompiler_47",
+    }) |lib| {
+        mod.linkSystemLibrary(lib, .{});
+    }
 }
 
 /// Compile the AVFoundation ObjC shim into `mod` and link the frameworks it

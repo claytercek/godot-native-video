@@ -6,3 +6,5 @@ reloadable = false
 [libraries]
 macos.debug = "lib/libnative_video.dylib"
 macos.release = "lib/libnative_video.dylib"
+windows.debug = "lib/native_video.dll"
+windows.release = "lib/native_video.dll"

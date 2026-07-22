@@ -17,6 +17,7 @@
 //! and re-points the stable Texture2DRD at it.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const godot = @import("godot");
 const RenderingServer = godot.class.RenderingServer;
@@ -48,7 +49,16 @@ const shaders = core.shaders;
 
 const si = @import("surface_importer.zig");
 const PlaneTextures = si.PlaneTextures;
-const MetalSurfaceImporter = @import("metal_surface_importer.zig").MetalSurfaceImporter;
+
+// The concrete surface importer is chosen at comptime per platform. On Windows
+// the WindowsSurfaceImporter itself picks between the D3D12 zero-copy and
+// CPU-copy paths at runtime; on macOS the Metal importer is the only path.
+// Both present the same value-held interface (init/initialize/import/deinit),
+// so the pipeline below stays platform-agnostic.
+const SurfaceImporter = if (builtin.os.tag == .windows)
+    @import("windows_surface_importer.zig").WindowsSurfaceImporter
+else
+    @import("metal_surface_importer.zig").MetalSurfaceImporter;
 
 /// Present-pipeline output format.
 pub const OutputMode = enum(u8) {
@@ -108,7 +118,7 @@ pub const PresentPipeline = struct {
     allocator: std.mem.Allocator,
 
     rd: ?*RenderingDevice = null, // borrowed: the global RD
-    importer: ?MetalSurfaceImporter = null, // built at first buildResources
+    importer: ?SurfaceImporter = null, // built at first buildResources
 
     shader: Rid = si.rid_invalid,
     pipeline: Rid = si.rid_invalid,
@@ -146,6 +156,14 @@ pub const PresentPipeline = struct {
 
     pub fn outputMode(self: *const PresentPipeline) OutputMode {
         return self.output_mode;
+    }
+
+    /// Frames imported through the CPU-copy path so far this session (always
+    /// 0 on macOS, and on Windows until/unless the importer is or degrades to
+    /// CPU-copy). See WindowsSurfaceImporter.cpuCopyCount / CpuCopySurfaceImporter.
+    pub fn cpuCopyCount(self: *const PresentPipeline) u64 {
+        if (self.importer) |*importer| return importer.cpuCopyCount();
+        return 0;
     }
 
     /// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
@@ -212,7 +230,7 @@ pub const PresentPipeline = struct {
 
         // Build the surface importer lazily, then bind it to RD.
         if (self.importer == null) {
-            self.importer = MetalSurfaceImporter.init(self.allocator);
+            self.importer = SurfaceImporter.init(self.allocator);
         }
         const importer = &self.importer.?;
         if (!importer.initialize(rd)) {
@@ -351,12 +369,22 @@ pub const PresentPipeline = struct {
         // surfaces. advance() releases whatever was parked frame_latency ago.
         self.retire.advance();
 
-        // Import the decoder surface zero-copy into two RD plane textures.
-        var planes = importer.import(frame.native_handle, frame.plane_slice);
+        // Import the decoder surface zero-copy into two RD plane textures,
+        // cropped to the frame's display aperture (see core.backend.CropRect)
+        // so decoder padding from a macroblock-aligned backing texture never
+        // reaches the planes the present shader samples.
+        var planes = importer.import(frame.native_handle, frame.plane_slice, frame.crop);
         if (!planes.valid()) {
             frame.release();
             return false;
         }
+
+        // GPU-submission-ordering handoff: on the Windows D3D12 path this
+        // CPU-blocks on a shared fence until the decoder-side plane-split pass
+        // has finished on the GPU before we sample the planes. Empty (no-op) on
+        // Metal and the CPU-copy path. Called exactly once here on the valid
+        // path, which also frees its own heap box (see PlaneTextures.acquire).
+        planes.acquire.call();
 
         // Advance the output ring slot.
         self.ring_index = (self.ring_index + 1) % ring_depth;
@@ -369,11 +397,10 @@ pub const PresentPipeline = struct {
             return false;
         }
 
-        // Push constant: output dimensions + colorimetry + bit depth + the
-        // importer's 10-bit sample scale (std430, push_constant_size bytes).
-        // Repacked into the reusable, pre-sized scratch buffer — no per-frame
-        // alloc.
-        self.packPushConstants(frame, planes.sample_scale);
+        // Push constant: output dimensions + colorimetry + bit depth (std430,
+        // push_constant_size bytes). Repacked into the reusable, pre-sized
+        // scratch buffer — no per-frame alloc.
+        self.packPushConstants(frame);
 
         // --- ONE compute dispatch: NV12 -> RGBA into the engine-owned slot. ---
         const gx: u32 = @intCast(@divTrunc(self.width + 7, 8));
@@ -447,10 +474,10 @@ pub const PresentPipeline = struct {
     }
 
     /// Repack the compute shader's push constants (output dimensions +
-    /// colorimetry + bit depth + the importer's 10-bit sample scale) into the
-    /// reusable push_scratch buffer (sized once in buildResources), ready for
-    /// rd.computeListSetPushConstant(). No allocation.
-    fn packPushConstants(self: *PresentPipeline, frame: VideoFrame, sample_scale: f32) void {
+    /// colorimetry + bit depth) into the reusable push_scratch buffer (sized
+    /// once in buildResources), ready for rd.computeListSetPushConstant(). No
+    /// allocation.
+    fn packPushConstants(self: *PresentPipeline, frame: VideoFrame) void {
         // Pack into a stack buffer, then copy into push_scratch's own storage.
         var buf: [push_constants.push_constant_size]u8 = undefined;
         push_constants.packPushConstants(
@@ -458,7 +485,6 @@ pub const PresentPipeline = struct {
             @intCast(self.width),
             @intCast(self.height),
             frame.color,
-            sample_scale,
         );
         // index(0) detaches push_scratch's CoW storage and hands back its
         // unique buffer (same idiom as the audio mix path), so the memcpy

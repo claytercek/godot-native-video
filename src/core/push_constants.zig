@@ -1,9 +1,10 @@
 //! Byte-packing for the NV12-to-RGB compute shader's push-constant block.
 //!
 //! The GLSL shader declares a std430 push-constant block with seven uint32
-//! and one float (32 bytes total). This file provides the CPU side of that
-//! contract: a single pack function that writes the correct bytes so the
-//! shader reads them back in the expected layout.
+//! fields plus four bytes of trailing padding (32 bytes total). This file
+//! provides the CPU side of that contract: a single pack function that
+//! writes the correct bytes so the shader reads them back in the expected
+//! layout.
 //!
 //! Layout (std430, little-endian assumed — x86-64 and ARM64 both are):
 //!   offset 0: out_width       (uint32)
@@ -13,12 +14,13 @@
 //!   offset 16: bit_depth      (uint32) — 8 or 10
 //!   offset 20: transfer_select (uint32) — core.TransferFunction
 //!   offset 24: primaries_select (uint32) — core.ColorPrimaries
-//!   offset 28: sample_scale   (float)
+//!   offset 28: pad0           (uint32, always 0)
 //!   Total: push_constant_size (32) bytes
 //!
 //! A 16-byte multiple is required because pre-4.7 Godot rounds the required
 //! push-constant size up to 32 and 4.7+ validates the exact declared size of
-//! 32 bytes — this layout satisfies both.
+//! 32 bytes — pad0 keeps this layout at 32 bytes even though there are only
+//! seven meaningful fields.
 
 const std = @import("std");
 const backend = @import("backend.zig");
@@ -37,7 +39,7 @@ pub const PushConstants = extern struct {
     bit_depth: u32 = 0,
     transfer_select: u32 = 0,
     primaries_select: u32 = 0,
-    sample_scale: f32 = 0.0,
+    pad0: u32 = 0,
 };
 
 comptime {
@@ -51,7 +53,7 @@ comptime {
     if (@offsetOf(PushConstants, "bit_depth") != 16) @compileError("bit_depth offset must be 16");
     if (@offsetOf(PushConstants, "transfer_select") != 20) @compileError("transfer_select offset must be 20");
     if (@offsetOf(PushConstants, "primaries_select") != 24) @compileError("primaries_select offset must be 24");
-    if (@offsetOf(PushConstants, "sample_scale") != 28) @compileError("sample_scale offset must be 28");
+    if (@offsetOf(PushConstants, "pad0") != 28) @compileError("pad0 offset must be 28");
 }
 
 /// Pack the frame's colorimetry and output dimensions into the
@@ -67,7 +69,6 @@ pub fn packPushConstants(
     width: u32,
     height: u32,
     color: backend.Colorimetry,
-    sample_scale: f32,
 ) void {
     std.debug.assert(dst.len >= push_constant_size);
     const region = dst[0..push_constant_size];
@@ -80,7 +81,6 @@ pub fn packPushConstants(
         .bit_depth = @bitCast(color.bit_depth),
         .transfer_select = @intFromEnum(color.transfer),
         .primaries_select = @intFromEnum(color.primaries),
-        .sample_scale = sample_scale,
     };
     @memcpy(region, std.mem.asBytes(&pc));
 }
@@ -99,17 +99,16 @@ fn checkPackedBytes(
     width: u32,
     height: u32,
     color: backend.Colorimetry,
-    sample_scale: f32,
     expected: []const u8,
 ) !void {
     var buf: [push_constant_size]u8 = undefined;
-    packPushConstants(&buf, width, height, color, sample_scale);
+    packPushConstants(&buf, width, height, color);
     try testing.expectEqualSlices(u8, expected, &buf);
 }
 
-test "Push constant: all-zero inputs produce zero-filled buffer (float(0) is also zero)" {
-    // width=height=0, all enums=Unspecified(0), bit_depth=0, sample_scale=0.0
-    // float 0.0 is bytes 00 00 00 00, so the whole 32 bytes are zeros.
+test "Push constant: all-zero inputs produce zero-filled buffer" {
+    // width=height=0, all enums=Unspecified(0), bit_depth=0, pad0=0: the
+    // whole 32 bytes are zeros.
     const color: backend.Colorimetry = .{
         .matrix = .unspecified,
         .primaries = .unspecified,
@@ -119,10 +118,10 @@ test "Push constant: all-zero inputs produce zero-filled buffer (float(0) is als
     };
 
     const expected = [_]u8{0} ** push_constant_size;
-    try checkPackedBytes(0, 0, color, 0.0, &expected);
+    try checkPackedBytes(0, 0, color, &expected);
 }
 
-test "Push constant: 1920x1080, BT.709, Video, 8-bit, sample_scale=1.0" {
+test "Push constant: 1920x1080, BT.709, Video, 8-bit" {
     const color: backend.Colorimetry = .{
         .matrix = .bt709,
         .range = .video,
@@ -146,13 +145,13 @@ test "Push constant: 1920x1080, BT.709, Video, 8-bit, sample_scale=1.0" {
         0x01, 0x00, 0x00, 0x00,
         // primaries_select = BT709 = 1
         0x01, 0x00, 0x00, 0x00,
-        // sample_scale = 1.0f
-        0x00, 0x00, 0x80, 0x3f,
+        // pad0
+        0x00, 0x00, 0x00, 0x00,
     };
-    try checkPackedBytes(1920, 1080, color, 1.0, &expected);
+    try checkPackedBytes(1920, 1080, color, &expected);
 }
 
-test "Push constant: 3840x2160, BT.2020, PQ, Full, 10-bit, sample_scale=1.0" {
+test "Push constant: 3840x2160, BT.2020, PQ, Full, 10-bit" {
     const color: backend.Colorimetry = .{
         .matrix = .bt2020,
         .range = .full,
@@ -176,10 +175,10 @@ test "Push constant: 3840x2160, BT.2020, PQ, Full, 10-bit, sample_scale=1.0" {
         0x02, 0x00, 0x00, 0x00,
         // primaries_select = BT2020 = 4
         0x04, 0x00, 0x00, 0x00,
-        // sample_scale = 1.0f
-        0x00, 0x00, 0x80, 0x3f,
+        // pad0
+        0x00, 0x00, 0x00, 0x00,
     };
-    try checkPackedBytes(3840, 2160, color, 1.0, &expected);
+    try checkPackedBytes(3840, 2160, color, &expected);
 }
 
 test "Push constant: 720x576, BT.601, BT.601_625, HLG, Video, 8-bit" {
@@ -206,40 +205,10 @@ test "Push constant: 720x576, BT.601, BT.601_625, HLG, Video, 8-bit" {
         0x03, 0x00, 0x00, 0x00,
         // primaries_select = BT601_625 = 2
         0x02, 0x00, 0x00, 0x00,
-        // sample_scale = 1.0f
-        0x00, 0x00, 0x80, 0x3f,
+        // pad0
+        0x00, 0x00, 0x00, 0x00,
     };
-    try checkPackedBytes(720, 576, color, 1.0, &expected);
-}
-
-test "Push constant: sample_scale=1/64 from DXGI left-justified P010" {
-    const color: backend.Colorimetry = .{
-        .matrix = .bt2020,
-        .range = .full,
-        .bit_depth = 10,
-        .transfer = .pq,
-        .primaries = .dci_p3,
-    };
-
-    const expected = [_]u8{
-        // out_width = 1920
-        0x80, 0x07, 0x00, 0x00,
-        // out_height = 1080
-        0x38, 0x04, 0x00, 0x00,
-        // matrix_select = BT2020 = 3
-        0x03, 0x00, 0x00, 0x00,
-        // range_select = Full = 2
-        0x02, 0x00, 0x00, 0x00,
-        // bit_depth = 10
-        0x0A, 0x00, 0x00, 0x00,
-        // transfer_select = PQ = 2
-        0x02, 0x00, 0x00, 0x00,
-        // primaries_select = DCI_P3 = 5
-        0x05, 0x00, 0x00, 0x00,
-        // sample_scale = 1/64 ~= 0.015625
-        0x00, 0x00, 0x80, 0x3C,
-    };
-    try checkPackedBytes(1920, 1080, color, 1.0 / 64.0, &expected);
+    try checkPackedBytes(720, 576, color, &expected);
 }
 
 test "Push constant: does not write past byte 31" {
@@ -247,7 +216,7 @@ test "Push constant: does not write past byte 31" {
     var buf: [push_constant_size + 4]u8 = undefined;
     @memset(&buf, 0xAB);
     const color: backend.Colorimetry = .{}; // default/zero Colorimetry
-    packPushConstants(buf[2..], 0, 0, color, 0.0);
+    packPushConstants(buf[2..], 0, 0, color);
     // Guard bytes before the written region must stay untouched.
     try testing.expectEqual(0xAB, buf[0]);
     try testing.expectEqual(0xAB, buf[1]);
