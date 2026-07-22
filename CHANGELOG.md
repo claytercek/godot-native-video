@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.0](https://github.com/claytercek/godot-native-video/compare/v0.2.1...v0.3.0) (2026-07-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* the extension runtime and build pipeline now use Zig instead of C++.
+
+### Features
+
+* **logging:** expose playback diagnostics ([77da92e](https://github.com/claytercek/godot-native-video/commit/77da92eaa2e2553720a0630808dc079a944095be))
+* **project:** add interactive media player ([f6aaeac](https://github.com/claytercek/godot-native-video/commit/f6aaeacf0b32f2a7f7985e126bad2ca0c5c1df03))
+* **windows:** add Media Foundation playback ([2cbd03e](https://github.com/claytercek/godot-native-video/commit/2cbd03ea6ddecc8d530488135cdeaa738987aabb))
+
+
+### Bug Fixes
+
+* **backends:** make reader swaps atomic ([9e8e740](https://github.com/claytercek/godot-native-video/commit/9e8e740549bd7ee9be4daae4b92deae163ec51ce))
+* **core:** harden playback transitions ([a146681](https://github.com/claytercek/godot-native-video/commit/a1466811e684fb2cf05bd42a789575b76759f624))
+* **core:** sync playback to audible audio ([8b0056d](https://github.com/claytercek/godot-native-video/commit/8b0056da0e2a783d5ef382c8bc9a9fab6b9f01c7))
+* **godot:** preserve presentation generations ([49d0bc4](https://github.com/claytercek/godot-native-video/commit/49d0bc4b1d3cf86f976b70d49fe81ae1ffea70ef))
+
+
+### Refactoring
+
+* replace C++ runtime with Zig ([ae21831](https://github.com/claytercek/godot-native-video/commit/ae2183158d4d9b0dacc3af432b1a553968419e85))
+
 ## [0.2.1](https://github.com/claytercek/godot-native-video/compare/v0.2.0...v0.2.1) (2026-07-11)
 
 
