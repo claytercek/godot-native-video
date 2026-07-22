@@ -17,8 +17,8 @@
 //! real wall time since the first accept converges to the buffered depth once
 //! the gulp is done and the sink is draining 1x. The estimate is FROZEN after a
 //! short warmup so per-tick wall-clock jitter cannot wobble video pacing, and
-//! RESET (re-measured) after a seek/flush or an underrun, when the sink's ring
-//! drains and re-primes.
+//! RESET (re-measured) on an explicit delivery generation change such as a
+//! seek/flush. Upstream queue emptiness is not evidence that the sink drained.
 //!
 //! Scope: this measures ONLY the accept-side ring depth (the gulp). Downstream
 //! AudioServer output latency is a DISJOINT delay already handled by the
@@ -41,6 +41,7 @@ pub const SinkLatencyEstimator = struct {
     first_wall_ms: ?f64 = null,
     estimate_seconds: f64 = 0.0,
     frozen: bool = false,
+    generation: u64 = 0,
 
     /// Freeze the estimate this long (wall seconds) after the first real mix.
     /// The gulp completes well under a second; a couple of seconds guarantees
@@ -51,11 +52,12 @@ pub const SinkLatencyEstimator = struct {
         return .{ .sample_rate = sample_rate };
     }
 
-    /// Begin a fresh measurement window: called at load(), after a seek/flush,
-    /// and on an underrun — every point where the sink's ring drains and must
-    /// re-prime. Preserves sample_rate/warmup; clears the running estimate so
-    /// compensation() ramps back up from the new gulp.
-    pub fn reset(self: *SinkLatencyEstimator) void {
+    /// Begin a fresh, explicitly identified delivery generation. Repeating the
+    /// same generation is a no-op, preventing incidental upstream starvation
+    /// from discarding an otherwise valid sink-depth estimate.
+    pub fn beginGeneration(self: *SinkLatencyEstimator, generation: u64) void {
+        if (self.generation == generation) return;
+        self.generation = generation;
         self.accepted_frames = 0;
         self.first_wall_ms = null;
         self.estimate_seconds = 0.0;
@@ -138,14 +140,14 @@ test "SinkLatencyEstimator freezes after warmup and ignores later jitter" {
     try std.testing.expectApproxEqAbs(gulp_expected_depth, e.compensation(), 1e-9);
 }
 
-test "SinkLatencyEstimator reset re-measures a fresh gulp (seek/flush/underrun)" {
+test "SinkLatencyEstimator generation change re-measures a fresh gulp" {
     var e = SinkLatencyEstimator{ .sample_rate = gulp_rate, .warmup_seconds = 0.35 };
     var i: usize = 0;
     while (i < 6) : (i += 1) e.onRealMix(wallAt(i), gulp_accepts[i]);
     try std.testing.expect(e.isFrozen());
 
     // Seek/flush: the sink re-primes, so the old frozen estimate is discarded.
-    e.reset();
+    e.beginGeneration(1);
     try std.testing.expectApproxEqAbs(0.0, e.compensation(), 1e-9);
     try std.testing.expect(!e.isFrozen());
     // sample_rate survives the reset.
@@ -155,6 +157,15 @@ test "SinkLatencyEstimator reset re-measures a fresh gulp (seek/flush/underrun)"
     const accepts2 = [_]i32{ 200, 200, 100, 100, 100, 100 };
     for (accepts2, 0..) |acc, k| e.onRealMix(wallAt(k), acc);
     try std.testing.expectApproxEqAbs(0.3, e.compensation(), 1e-9);
+}
+
+test "SinkLatencyEstimator ignores a repeated generation" {
+    var e = SinkLatencyEstimator{ .sample_rate = gulp_rate, .warmup_seconds = 1000.0 };
+    e.beginGeneration(4);
+    e.onRealMix(wallAt(0), 200);
+    e.beginGeneration(4);
+    try std.testing.expectApproxEqAbs(0.2, e.compensation(), 1e-9);
+    try std.testing.expectEqual(@as(u64, 200), e.accepted_frames);
 }
 
 test "SinkLatencyEstimator ignores silence / zero-accept ticks" {

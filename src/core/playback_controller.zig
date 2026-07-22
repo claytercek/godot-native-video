@@ -21,6 +21,7 @@ const backend_mod = @import("backend.zig");
 const clock_mod = @import("clock.zig");
 const audio_ring_mod = @import("audio_ring.zig");
 const audio_telemetry_mod = @import("audio_telemetry.zig");
+const audio_delivery = @import("audio_delivery.zig");
 const scrubber_mod = @import("scrubber.zig");
 const sink_latency_mod = @import("sink_latency.zig");
 const wall_clock_mod = @import("wall_clock.zig");
@@ -38,6 +39,7 @@ const AudioMasterClock = clock_mod.AudioMasterClock;
 const MonotonicClock = clock_mod.MonotonicClock;
 const AudioRing = audio_ring_mod.AudioRing;
 const AudioTelemetry = audio_telemetry_mod.AudioTelemetry;
+const TrackHandoff = audio_delivery.TrackHandoff;
 const Scrubber = scrubber_mod.Scrubber;
 const SinkLatencyEstimator = sink_latency_mod.SinkLatencyEstimator;
 const ScrubResolve = scrubber_mod.ScrubResolve;
@@ -46,96 +48,7 @@ const WallClockMs = wall_clock_mod.WallClockMs;
 const DecodeScheduler = decode_scheduler.DecodeScheduler;
 const StreamHandle = decode_scheduler.StreamHandle;
 
-// -----------------------------------------------------------------------
-// MixSink — the one Godot-touching seam the controller calls through.
-//
-// Returns the frames it actually ACCEPTED; that count is the back-pressure
-// signal the controller's clock-advance accounting keys on (it advances by
-// min(accepted, real_frames) so neither underrun silence nor a full downstream
-// buffer inflates media time). The Binding wraps mix_audio().
-//
-// A ptr + vtable interface (Zig has no capturing closures). `interleaved`
-// holds whole frames of `channel_count` contiguous float32 samples; the
-// frame count is interleaved.len / channel_count.
-// -----------------------------------------------------------------------
-pub const MixSink = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        mix: *const fn (*anyopaque, interleaved: []const f32, channel_count: i32) i32,
-    };
-
-    /// Mix `channel_count`-channel interleaved PCM into the downstream
-    /// buffer. `interleaved.len` must be an exact multiple of
-    /// `channel_count`. Returns the number of frames actually accepted.
-    pub fn mix(self: MixSink, interleaved: []const f32, channel_count: i32) i32 {
-        std.debug.assert(channel_count > 0);
-        std.debug.assert(interleaved.len % @as(usize, @intCast(channel_count)) == 0);
-        return self.vtable.mix(self.ptr, interleaved, channel_count);
-    }
-};
-
-// -----------------------------------------------------------------------
-// AudioTrackSwitch — the clock-mastership half of a mid-stream audio-track
-// switch, as an explicit little state machine.
-//
-// A switch runs idle -> handing-off -> live (with a recovering-on-failure
-// edge back to live). The transitions that used to be smeared across load(),
-// stop(), reconcileAudioTrack() and the audio-decode inner loop live here.
-//
-// This struct owns exactly ONE piece of state: `in_progress` — true from the
-// moment a live reselect puts the ClockBridge into monotonic-master (so video
-// keeps advancing while the new track is still silent) until the first chunk
-// of the NEW track flows and re-anchors the clock back to audio-master. The
-// caller keeps `desired_track`/`live_track` (which track is wanted vs. live)
-// as its own caller-readable state; every clock handoff/re-anchor tied to a
-// switch runs through the methods below so the mastership timing is defined in
-// one place, not four.
-// -----------------------------------------------------------------------
-const AudioTrackSwitch = struct {
-    in_progress: bool = false,
-
-    /// A live reselect is starting: hand the clock to monotonic-master so
-    /// video keeps advancing through the coming audio silence, and mark the
-    /// switch in progress. handoffToMonotonic() is a no-op if already
-    /// monotonic (e.g. a second request arrives mid-handoff).
-    fn begin(self: *AudioTrackSwitch, clock: *ClockBridge) void {
-        clock.handoffToMonotonic();
-        self.in_progress = true;
-    }
-
-    /// The completing edge, called from the audio-decode loop for every chunk.
-    /// reconcile cleared the ring before handing off, so the FIRST chunk to
-    /// reach the decode loop (genuinely decoded, not merely attempted) is from
-    /// the new track: re-anchor the audio clock to the current monotonic
-    /// position so mediaTime() stays continuous, and end the handoff. A no-op
-    /// once the switch has completed — the common per-chunk case.
-    fn onFirstChunk(self: *AudioTrackSwitch, clock: *ClockBridge) void {
-        if (!self.in_progress) return;
-        clock.reanchorToAudio();
-        self.in_progress = false;
-    }
-
-    /// The reselect failed: the Backend leaves the audio decode path undefined,
-    /// so end the handoff and re-anchor to audio. The caller rolls its own
-    /// desired track back to what is still live and seeks to recover.
-    fn rollback(self: *AudioTrackSwitch, clock: *ClockBridge) void {
-        self.in_progress = false;
-        clock.reanchorToAudio();
-    }
-
-    /// Cancel a possibly half-complete switch (stop): end the handoff and make
-    /// sure the bridge is audio-master again so it does not stay
-    /// monotonic-master forever with no fillAudio() left to re-anchor it.
-    /// `clock` is optional (unloaded controller) and reanchorToAudio() is
-    /// itself a no-op on a silent clip's null audio clock, so this is safe to
-    /// call unconditionally.
-    fn cancel(self: *AudioTrackSwitch, clock: ?*ClockBridge) void {
-        self.in_progress = false;
-        if (clock) |c| c.reanchorToAudio();
-    }
-};
+pub const MixSink = audio_delivery.MixSink;
 
 // -----------------------------------------------------------------------
 // PlaybackController — Godot-free per-stream playback state machine.
@@ -155,6 +68,9 @@ pub const PlaybackController = struct {
     // resampler ring) from the accept-vs-walltime signal, so the present
     // selector can be shifted back onto audible time. Zero on silent clips.
     sink_latency: SinkLatencyEstimator = .{},
+    // Explicitly identifies discontinuous delivery windows. Only controller
+    // events that flush/reset delivery advance it; ring starvation does not.
+    sink_generation: u64 = 0,
     // Wall-clock timestamp of the most recent tick(), cached so stop()/
     // shutdown() (which don't take `now`) can still fire a final telemetry
     // report with a real wall-time reading.
@@ -197,10 +113,9 @@ pub const PlaybackController = struct {
     live_track: i32 = 0,
 
     // The clock-mastership half of a switch (the monotonic-master handoff
-    // window and its re-anchor timing). Owns `in_progress`; the controller
-    // drives it via begin/onFirstChunk/rollback/cancel rather than poking a
-    // bare bool from four different methods.
-    track_switch: AudioTrackSwitch = .{},
+    // window and its re-anchor timing). The explicit state machine owns every
+    // begin/chunk/rollback/cancel transition.
+    track_switch: TrackHandoff = .{},
 
     // Per-track audio metadata cached at load time for sample-rate validation
     // during mid-stream track switches.
@@ -331,6 +246,7 @@ pub const PlaybackController = struct {
         // Fresh sink-depth measurement window. Silent clips get a rate-0
         // estimator that never leaves zero compensation.
         self.sink_latency = SinkLatencyEstimator.init(if (self.has_audio) self.canonical_sample_rate else 0);
+        self.beginSinkGeneration();
 
         // A pre-load requestAudioTrack() selection must survive, not be
         // clobbered; validate it now that audio_track_count is known.
@@ -367,6 +283,7 @@ pub const PlaybackController = struct {
         self.position = 0.0;
         if (self.master()) |c| c.setTime(0.0);
         if (self.audio_ring) |*r| r.clear();
+        self.beginSinkGeneration();
         // Flush + reseek to start (serialized against the worker).
         if (self.stream) |s| self.sched.requestSeek(s, 0.0);
         self.scrubber = Scrubber.init(self.scrubber.config); // no stale velocity/settle
@@ -611,8 +528,8 @@ pub const PlaybackController = struct {
             // Mid-stream track switch: the FSM re-anchors the clock the first
             // time a genuinely-new-track chunk reaches this point (a no-op on
             // every other chunk). The "why the first chunk is genuinely new"
-            // reasoning lives in AudioTrackSwitch.onFirstChunk, not here.
-            self.track_switch.onFirstChunk(&self.clock.?);
+            // reasoning lives in TrackHandoff.onChunk, not here.
+            self.track_switch.onChunk(&self.clock.?);
             // Mix native layout -> canonical (no-op memcpy when counts match).
             const nf = chunk.frame_count;
             const sc = chunk.channel_count;
@@ -632,10 +549,6 @@ pub const PlaybackController = struct {
         const ch = self.canonical_channels;
         var ring = &self.audio_ring.?;
         const available = ring.availableFrames();
-        // Ring drained: the sink will re-prime its own buffer, so restart the
-        // depth measurement (start-of-play, post-seek/flush, and underruns all
-        // reach here with an empty ring).
-        if (available == 0) self.sink_latency.reset();
         // On underrun, offer a small block of silence so the sink keeps its
         // buffer fed; the clock is NOT advanced for silence (readFrames reports 0
         // real frames).
@@ -687,17 +600,21 @@ pub const PlaybackController = struct {
         return true;
     }
 
+    fn beginSinkGeneration(self: *PlaybackController) void {
+        self.sink_generation +%= 1;
+        self.sink_latency.beginGeneration(self.sink_generation);
+    }
+
     fn applyScrubResolve(self: *PlaybackController, resolve: ScrubResolve) void {
         const c = self.master() orelse return;
         if (self.stream == null) return;
         const target = @max(resolve.target_seconds, 0.0);
 
         if (self.audio_ring) |*r| r.clear(); // stale audio must not play after a (re)seek
-        // The sink re-primes its buffer after a flush, so re-measure the depth.
-        // (fillAudio() refills the ring before driveAudio() next runs, hiding
-        // the drain from driveAudio's own empty-ring reset — so reset here.)
-        self.sink_latency.reset();
+        // A seek begins a new delivery generation, so re-measure sink depth.
+        self.beginSinkGeneration();
         const sched = self.sched;
+        var resolved_target = target;
 
         if (resolve.mode == .exact) {
             // Settle/resume wants the precise frame: seek and decode forward
@@ -705,15 +622,26 @@ pub const PlaybackController = struct {
             // the workers inside the scheduler). Precision over latency —
             // this never runs on the hot per-frame path.
             const eps = 1.0 / 120.0; // ~half a frame at 60fps tolerance
-            sched.seekExact(self.stream.?, target, eps);
+            const outcome = sched.seekExact(self.stream.?, target, eps);
+            switch (outcome) {
+                .resolved => {},
+                .end_of_stream => if (self.length > 0.0) {
+                    resolved_target = @min(target, self.length);
+                },
+                .backend_seek_failed, .decode_budget_exhausted, .stream_unavailable => {
+                    self.warnFmt("Exact seek to {d:.3}s failed ({s}); playback position was not changed.", .{ target, @tagName(outcome) });
+                    sched.requestSeek(self.stream.?, self.position);
+                    return;
+                },
+            }
         } else {
             // Keyframe scrub: flush and reseek to the preceding keyframe;
             // whatever the backend yields first is the fast approximate frame.
             sched.requestSeek(self.stream.?, target);
         }
 
-        c.setTime(target); // re-anchor the master clock to the resolved target
-        self.position = target;
+        c.setTime(resolved_target); // re-anchor only to a resolved/clamped target
+        self.position = resolved_target;
         self.audio_eos = false;
 
         // Reconcile any pending track switch at the resolved position (position
@@ -777,6 +705,7 @@ pub const PlaybackController = struct {
         // Clear stale samples; fillAudio() re-anchors when the new track flows.
         self.live_track = self.desired_track;
         self.audio_ring.?.clear();
+        self.beginSinkGeneration();
         self.audio_eos = false;
     }
 

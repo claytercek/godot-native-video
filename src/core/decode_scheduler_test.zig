@@ -31,6 +31,8 @@ const FakeBackend = struct {
     live: ?*std.atomic.Value(i32),
     total: ?*std.atomic.Value(i64),
     decode_micros: i32 = 0,
+    seek_succeeds: bool = true,
+    seek_positions: bool = true,
     surfaces: std.ArrayList(*Surface) = .empty,
 
     fn create(
@@ -68,6 +70,8 @@ const FakeBackend = struct {
         return 1;
     }
     pub fn seek(self: *FakeBackend, pts_seconds: f64) bool {
+        if (!self.seek_succeeds) return false;
+        if (!self.seek_positions) return true;
         var idx: i32 = @intFromFloat(pts_seconds * 30.0);
         if (idx < 0) idx = 0;
         self.next_index = idx;
@@ -295,6 +299,105 @@ test "request_seek flushes and resumes decode-ahead at the target" {
 
     sched.unregisterStream(s);
     try std.testing.expectEqual(0, live.load(.monotonic));
+}
+
+test "seekExact reports resolved, backend failure, EOS, and decode budget exhaustion" {
+    const alloc = std.testing.allocator;
+    const sched = try DecodeScheduler.init(alloc, 1, true);
+    defer sched.deinit();
+
+    const resolved_backend = FakeBackend.create(alloc, 0, 100, null, null, 0);
+    const resolved = try sched.registerStream(resolved_backend.backend());
+    try std.testing.expectEqual(ds.ExactSeekResult.resolved, sched.seekExact(resolved, 1.0, 1.0 / 120.0));
+    sched.unregisterStream(resolved);
+
+    const failed_backend = FakeBackend.create(alloc, 0, 100, null, null, 0);
+    failed_backend.seek_succeeds = false;
+    const failed = try sched.registerStream(failed_backend.backend());
+    try std.testing.expectEqual(ds.ExactSeekResult.backend_seek_failed, sched.seekExact(failed, 1.0, 1.0 / 120.0));
+    sched.unregisterStream(failed);
+
+    const eos_backend = FakeBackend.create(alloc, 0, 10, null, null, 0);
+    const eos = try sched.registerStream(eos_backend.backend());
+    try std.testing.expectEqual(ds.ExactSeekResult.end_of_stream, sched.seekExact(eos, 1.0, 1.0 / 120.0));
+    sched.unregisterStream(eos);
+
+    const stuck_backend = FakeBackend.create(alloc, 0, 5000, null, null, 0);
+    stuck_backend.seek_positions = false;
+    const stuck = try sched.registerStream(stuck_backend.backend());
+    try std.testing.expectEqual(ds.ExactSeekResult.decode_budget_exhausted, sched.seekExact(stuck, 1000.0, 0.0));
+    sched.unregisterStream(stuck);
+}
+
+test "registerStream releases backend ownership when stream allocation fails" {
+    const OwnershipBackend = struct {
+        closed: *u32,
+        destroyed: *u32,
+
+        pub fn close(self: *@This()) void {
+            self.closed.* += 1;
+        }
+        pub fn deinit(self: *@This()) void {
+            self.destroyed.* += 1;
+        }
+    };
+
+    const sched = try DecodeScheduler.init(std.testing.allocator, 1, true);
+    defer sched.deinit();
+
+    var storage: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const scheduler_allocator = sched.allocator;
+    sched.allocator = fixed.allocator();
+    defer sched.allocator = scheduler_allocator;
+
+    var closed: u32 = 0;
+    var destroyed: u32 = 0;
+    var owned = OwnershipBackend{ .closed = &closed, .destroyed = &destroyed };
+    try std.testing.expectError(error.OutOfMemory, sched.registerStream(ts.backend(&owned)));
+    sched.allocator = scheduler_allocator;
+    try std.testing.expectEqual(1, closed);
+    try std.testing.expectEqual(1, destroyed);
+}
+
+test "unregister waits for a backend lease and claimant never touches the freed stream" {
+    const alloc = std.testing.allocator;
+    const sched = try DecodeScheduler.init(alloc, 1, false);
+    defer sched.deinit();
+    const stream = try sched.registerStream(FakeBackend.create(alloc, 0, 0, null, null, 0).backend());
+
+    var entered = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    const LeaseCtx = struct {
+        sched: *DecodeScheduler,
+        stream: StreamHandle,
+        entered: *std.atomic.Value(bool),
+        release: *std.atomic.Value(bool),
+
+        fn use(ctx: *@This(), _: *Backend) void {
+            ctx.entered.store(true, .release);
+            while (!ctx.release.load(.acquire)) sys_clock.sleep(50 * std.time.ns_per_us);
+        }
+        fn run(ctx: *@This()) void {
+            ctx.sched.withBackend(ctx.stream, ctx, use);
+        }
+    };
+    var lease_ctx = LeaseCtx{ .sched = sched, .stream = stream, .entered = &entered, .release = &release };
+    const lease_thread = try std.Thread.spawn(.{}, LeaseCtx.run, .{&lease_ctx});
+    while (!entered.load(.acquire)) sys_clock.sleep(50 * std.time.ns_per_us);
+
+    const UnregisterCtx = struct {
+        sched: *DecodeScheduler,
+        stream: StreamHandle,
+        fn run(ctx: @This()) void {
+            ctx.sched.unregisterStream(ctx.stream);
+        }
+    };
+    const unregister_thread = try std.Thread.spawn(.{}, UnregisterCtx.run, .{UnregisterCtx{ .sched = sched, .stream = stream }});
+    sys_clock.sleep(1 * std.time.ns_per_ms);
+    release.store(true, .release);
+    lease_thread.join();
+    unregister_thread.join();
 }
 
 // -----------------------------------------------------------------------
