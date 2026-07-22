@@ -317,27 +317,36 @@ pub const MfBackend = struct {
         return clamped;
     }
 
-    // Deselect the old audio stream, select track_index on the shared reader,
-    // renegotiate PCM. This IS the application of a selection, so selected and
-    // applied both converge here.
+    // Select track_index on the shared reader and renegotiate PCM, deselecting
+    // the old audio stream only once the new one is known-good. This IS the
+    // application of a selection, so selected and applied both converge here.
+    //
+    // Select-then-negotiate happens entirely on the new stream before the old
+    // one is touched, mirroring the build-then-swap pattern buildAudioReader
+    // uses for the dedicated reader: on failure, the old stream's selection
+    // and media type are exactly as they were before the call, so audio keeps
+    // playing on the old track. configurePcmOutput selects `aidx` as a side
+    // effect regardless of outcome, so a failed negotiation still needs the
+    // new stream explicitly deselected again.
     fn switchAudioTrack(self: *MfBackend, track_index: i32) bool {
         if (track_index < 0 or track_index >= @as(i32, @intCast(self.audio_stream_indices.items.len))) return false;
 
-        if (self.audio_stream_index >= 0) {
+        const new_mf_index = self.audio_stream_indices.items[@intCast(track_index)];
+        const aidx: com.DWORD = @intCast(new_mf_index);
+
+        const fmt = pipe.configurePcmOutput(self.pipeline.reader.?, aidx) orelse {
+            _ = self.pipeline.reader.?.SetStreamSelection(aidx, com.FALSE);
+            return false;
+        };
+
+        // Known-good: retire the old stream now, then commit.
+        if (self.audio_stream_index >= 0 and self.audio_stream_index != new_mf_index) {
             _ = self.pipeline.reader.?.SetStreamSelection(@intCast(self.audio_stream_index), com.FALSE);
         }
-        const new_mf_index = self.audio_stream_indices.items[@intCast(track_index)];
         self.audio_stream_index = new_mf_index;
-        const aidx: com.DWORD = @intCast(new_mf_index);
-        if (pipe.configurePcmOutput(self.pipeline.reader.?, aidx)) |fmt| {
-            self.audio_channels = fmt.channels;
-            self.audio_rate = fmt.rate;
-        } else {
-            _ = self.pipeline.reader.?.SetStreamSelection(aidx, com.FALSE);
-            self.audio_stream_index = -1;
-            return false;
-        }
-        self.selected_audio_track = track_index;
+        _ = self.applyTrackSelection(track_index);
+        self.audio_channels = fmt.channels;
+        self.audio_rate = fmt.rate;
         self.applied_audio_track = track_index;
         return true;
     }
