@@ -22,6 +22,7 @@ const clock_mod = @import("clock.zig");
 const audio_ring_mod = @import("audio_ring.zig");
 const audio_telemetry_mod = @import("audio_telemetry.zig");
 const scrubber_mod = @import("scrubber.zig");
+const sink_latency_mod = @import("sink_latency.zig");
 const wall_clock_mod = @import("wall_clock.zig");
 const decode_scheduler = @import("decode_scheduler.zig");
 const canonical_mix_format = @import("canonical_mix_format.zig");
@@ -38,6 +39,7 @@ const MonotonicClock = clock_mod.MonotonicClock;
 const AudioRing = audio_ring_mod.AudioRing;
 const AudioTelemetry = audio_telemetry_mod.AudioTelemetry;
 const Scrubber = scrubber_mod.Scrubber;
+const SinkLatencyEstimator = sink_latency_mod.SinkLatencyEstimator;
 const ScrubResolve = scrubber_mod.ScrubResolve;
 const ResolveMode = scrubber_mod.ResolveMode;
 const WallClockMs = wall_clock_mod.WallClockMs;
@@ -149,6 +151,10 @@ pub const PlaybackController = struct {
     clock: ?ClockBridge = null,
     audio_ring: ?AudioRing = null,
     audio_telemetry: AudioTelemetry = .{},
+    // Measures the sink's buffered depth (the startup gulp into Godot's audio
+    // resampler ring) from the accept-vs-walltime signal, so the present
+    // selector can be shifted back onto audible time. Zero on silent clips.
+    sink_latency: SinkLatencyEstimator = .{},
     // Wall-clock timestamp of the most recent tick(), cached so stop()/
     // shutdown() (which don't take `now`) can still fire a final telemetry
     // report with a real wall-time reading.
@@ -322,6 +328,9 @@ pub const PlaybackController = struct {
         self.track_switch = .{};
         self.checked_first_audio_chunk = false;
         self.audio_telemetry.reset();
+        // Fresh sink-depth measurement window. Silent clips get a rate-0
+        // estimator that never leaves zero compensation.
+        self.sink_latency = SinkLatencyEstimator.init(if (self.has_audio) self.canonical_sample_rate else 0);
 
         // A pre-load requestAudioTrack() selection must survive, not be
         // clobbered; validate it now that audio_track_count is known.
@@ -438,8 +447,14 @@ pub const PlaybackController = struct {
         const sched = self.sched;
 
         const media_now = self.advanceClock(delta_seconds, now, sink, c);
+        // Telemetry stays on RAW media time so its media-vs-wall reading keeps
+        // exposing the sink's buffered depth (the thing we compensate for).
         self.audio_telemetry.maybeReportPeriodic(now, media_now);
-        const chosen = self.selectPresentFrame(sched, media_now);
+        // Present (and therefore reported position) against AUDIBLE time: raw
+        // media time shifted back by the measured sink depth so video lands on
+        // what the listener is hearing, not on what was just queued.
+        const present_now = @max(media_now - self.sink_latency.compensation(), 0.0);
+        const chosen = self.selectPresentFrame(sched, present_now);
         self.checkEndOfPlayback(sched, now, media_now);
 
         return chosen;
@@ -617,6 +632,10 @@ pub const PlaybackController = struct {
         const ch = self.canonical_channels;
         var ring = &self.audio_ring.?;
         const available = ring.availableFrames();
+        // Ring drained: the sink will re-prime its own buffer, so restart the
+        // depth measurement (start-of-play, post-seek/flush, and underruns all
+        // reach here with an empty ring).
+        if (available == 0) self.sink_latency.reset();
         // On underrun, offer a small block of silence so the sink keeps its
         // buffer fed; the clock is NOT advanced for silence (readFrames reports 0
         // real frames).
@@ -626,18 +645,35 @@ pub const PlaybackController = struct {
         const needed: usize = @as(usize, @intCast(request)) * @as(usize, @intCast(ch));
         if (!self.ensureScratchCapacity(&self.drive_scratch, needed)) return false;
 
-        // Drain decoded PCM (or silence on underrun) into the staging buffer.
-        const real_frames = ring.readFrames(self.drive_scratch.items[0..needed], @intCast(request));
+        // Copy decoded PCM (or silence on underrun) into the staging buffer
+        // WITHOUT consuming it yet: the sink is back-pressured (its downstream
+        // buffer holds fewer FRAMES the more channels we push), so it commonly
+        // accepts fewer than we offer. Any frame it rejects must stay in the
+        // ring for the next tick, not be dropped.
+        const real_frames = ring.peekFrames(self.drive_scratch.items[0..needed], @intCast(request));
 
-        // Advance the clock ONLY by frames both real (non-silence) AND consumed —
+        // Advance the clock ONLY by frames both real (non-silence) AND accepted —
         // neither underrun silence nor a full downstream buffer inflates media
-        // time. If the sink accepts fewer than `real_frames` (near-full
-        // downstream buffer), the surplus is dropped: the clock stays honest at
-        // the cost of a little lost audio. Tolerable for linear playback.
+        // time.
         const accepted = sink.mix(self.drive_scratch.items[0..needed], ch);
         self.audio_telemetry.recordMix(now, self.clock.?.mediaTime(), available, request, accepted);
         const advance = @min(accepted, @as(i32, @intCast(real_frames)));
-        if (advance > 0) self.clock.?.onAudioMixed(advance);
+        // Consume exactly the real frames the sink took; the rest remain
+        // buffered. This keeps ring drain == sink consumption, so fillAudio()
+        // pulls the source reader at playback rate instead of racing ahead by a
+        // per-channel factor and discarding most of the decoded audio.
+        if (advance > 0) {
+            _ = ring.consume(@intCast(advance));
+            self.clock.?.onAudioMixed(advance);
+            // Feed the sink-depth estimator the frames that BOTH were real and
+            // the sink accepted — the same quantity that advanced the clock, so
+            // the measurement stays consistent with media time.
+            const was_frozen = self.sink_latency.isFrozen();
+            self.sink_latency.onRealMix(now, advance);
+            if (!was_frozen and self.sink_latency.isFrozen()) {
+                log.info("estimated sink latency {d:.3}s (video pacing compensated)", .{self.sink_latency.compensation()});
+            }
+        }
         return advance > 0;
     }
 
@@ -657,6 +693,10 @@ pub const PlaybackController = struct {
         const target = @max(resolve.target_seconds, 0.0);
 
         if (self.audio_ring) |*r| r.clear(); // stale audio must not play after a (re)seek
+        // The sink re-primes its buffer after a flush, so re-measure the depth.
+        // (fillAudio() refills the ring before driveAudio() next runs, hiding
+        // the drain from driveAudio's own empty-ring reset — so reset here.)
+        self.sink_latency.reset();
         const sched = self.sched;
 
         if (resolve.mode == .exact) {
