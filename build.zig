@@ -134,9 +134,11 @@ pub fn build(b: *Build) !void {
         extension.compile.link_gc_sections = true;
     }
 
-    // AVFoundation ObjC shim + frameworks (macOS only). Metal is
+    // AVFoundation ObjC shim + frameworks (macOS and iOS — the shim uses only
+    // cross-platform AVFoundation/CoreMedia/CoreVideo APIs). Metal is
     // extension-only — the decode harness never presents.
-    if (target.result.os.tag == .macos) {
+    if (target.result.os.tag == .macos or target.result.os.tag == .ios) {
+        addAppleSdkPaths(b, extension.compile.root_module, target);
         linkAvfShim(b, extension.compile.root_module);
         extension.compile.root_module.linkFramework("Metal", .{});
     }
@@ -151,6 +153,7 @@ pub fn build(b: *Build) !void {
                 .{ .name = "core", .module = core_mod },
             },
         });
+        addAppleSdkPaths(b, smoke_mod, target);
         linkAvfShim(b, smoke_mod);
         const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
         const smoke_run = b.addRunArtifact(smoke_exe);
@@ -165,8 +168,23 @@ pub fn build(b: *Build) !void {
     run.addFileArg(gdzig_dep.namedLazyPath("godot"));
     run.addArg("--path");
     run.addDirectoryArg(b.path("./project"));
+    if (b.args) |args| {
+        run.addArg("--");
+        run.addArgs(args);
+    }
     run.step.dependOn(&install.step);
-    b.step("run", "Run the demo project in Godot").dependOn(&run.step);
+    b.step("run", "Run the demo project in Godot (forwards `-- <args>` to the demo's CLI, e.g. a clip path or --file=<path>)").dependOn(&run.step);
+
+    // Headless pass/fail smoke test: the interactive demo's --smoke mode,
+    // equivalent to `godot --headless --path project -- --smoke`. Fails the
+    // step (non-zero exit) if the smoke run's own exit code is non-zero.
+    const smoke = Build.Step.Run.create(b, "run godot demo smoke test");
+    smoke.addFileArg(gdzig_dep.namedLazyPath("godot"));
+    smoke.addArgs(&.{ "--headless", "--path" });
+    smoke.addDirectoryArg(b.path("./project"));
+    smoke.addArgs(&.{ "--", "--smoke" });
+    smoke.step.dependOn(&install.step);
+    b.step("smoke", "Run the demo project's headless --smoke pass/fail check").dependOn(&smoke.step);
 }
 
 /// Link the Windows system libraries the Media Foundation backend needs.
@@ -190,4 +208,23 @@ fn linkAvfShim(b: *Build, mod: *Build.Module) void {
     for ([_][]const u8{ "Foundation", "AVFoundation", "CoreMedia", "CoreVideo" }) |fw| {
         mod.linkFramework(fw, .{});
     }
+}
+
+/// Add the Apple SDK's framework/library/include search paths to `mod`.
+///
+/// Zig 0.16 only auto-adds these for the fully-native default target query;
+/// any explicit `-Dtarget=...macos`/`...ios` disables that autodetection, so
+/// framework lookups (Foundation, AVFoundation, ...) and libobjc fail to
+/// resolve. Derive the active SDK path from `xcrun` at build time (never
+/// hardcode it — SDK locations vary across Xcode/Command Line Tools installs)
+/// and wire it in explicitly. Picks the macOS SDK or the iOS (device) SDK
+/// based on the target's OS tag.
+fn addAppleSdkPaths(b: *Build, mod: *Build.Module, target: Build.ResolvedTarget) void {
+    const sdk = switch (target.result.os.tag) {
+        .ios => std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" }), " \n"),
+        else => std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \n"),
+    };
+    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
 }

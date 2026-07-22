@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: ["main", "zig", "zig-win"]
+    branches: ["main"]
     paths:
       - "src/**"
       - "project/**"

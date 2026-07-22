@@ -1,0 +1,143 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "Release tag to attach the packaged artifact to (e.g. v0.1.0)"
+        type: string
+        required: false
+        default: ""
+  # Called by release-please.yml when a release is created. The tag input
+  # makes this job attach the packaged zip to that GitHub Release. Called
+  # (workflow_call) instead of triggered by `on: release`, because releases
+  # made by the default GITHUB_TOKEN don't fire release events.
+  workflow_call:
+    inputs:
+      release-tag:
+        description: "Release tag to attach the packaged artifact to (e.g. v0.1.0)"
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build & Package
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Windows targets cross-compile from macOS via Zig's bundled mingw,
+      # so every target below is built on this one macOS runner — no need
+      # for a windows-latest leg or the matrix/artifact-merge dance the old
+      # C++ build.yml used. GODOT_PATH isn't set explicitly: build.zig
+      # defaults to Godot 4.6 and lets gdzig's dependency step download it
+      # for bindgen, same as test.yml relies on implicitly.
+      - name: Stage output dir
+        run: mkdir -p staging
+
+      - name: Build macOS arm64 (debug)
+        run: |
+          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-arm64.debug.dylib
+
+      - name: Build macOS arm64 (release)
+        run: |
+          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-arm64.release.dylib
+
+      - name: Build macOS x86_64 (debug)
+        run: |
+          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-x86_64.debug.dylib
+
+      - name: Build macOS x86_64 (release)
+        run: |
+          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-x86_64.release.dylib
+
+      - name: Lipo universal macOS binaries
+        run: |
+          lipo -create staging/libnative_video.macos-arm64.debug.dylib staging/libnative_video.macos-x86_64.debug.dylib -output staging/libnative_video.macos.debug.dylib
+          lipo -create staging/libnative_video.macos-arm64.release.dylib staging/libnative_video.macos-x86_64.release.dylib -output staging/libnative_video.macos.release.dylib
+
+      - name: Build Windows x86_64 (debug)
+        run: |
+          zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.debug.x86_64.dll
+
+      - name: Build Windows x86_64 (release)
+        run: |
+          zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.release.x86_64.dll
+
+      - name: Build Windows x86_32 (debug)
+        run: |
+          zig build -Dtarget=x86-windows-gnu -Doptimize=ReleaseSafe --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.debug.x86_32.dll
+
+      - name: Build Windows x86_32 (release)
+        run: |
+          zig build -Dtarget=x86-windows-gnu -Doptimize=ReleaseFast --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.release.x86_32.dll
+
+      - name: Build Windows arm64 (debug)
+        run: |
+          zig build -Dtarget=aarch64-windows-gnu -Doptimize=ReleaseSafe --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.debug.arm64.dll
+
+      - name: Build Windows arm64 (release)
+        run: |
+          zig build -Dtarget=aarch64-windows-gnu -Doptimize=ReleaseFast --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.release.arm64.dll
+
+      # iOS is deliberately not built here: it produces a plain .dylib, but
+      # Godot's iOS export conventionally needs a static library /
+      # .xcframework, and only link-time (not on-device runtime) has been
+      # verified. See README for the follow-up.
+
+      - name: Assemble addon
+        run: |
+          mkdir -p addon-out/addons/native_video
+          cp staging/libnative_video.macos.debug.dylib addon-out/addons/native_video/
+          cp staging/libnative_video.macos.release.dylib addon-out/addons/native_video/
+          cp staging/native_video.windows.debug.x86_64.dll addon-out/addons/native_video/
+          cp staging/native_video.windows.release.x86_64.dll addon-out/addons/native_video/
+          cp staging/native_video.windows.debug.x86_32.dll addon-out/addons/native_video/
+          cp staging/native_video.windows.release.x86_32.dll addon-out/addons/native_video/
+          cp staging/native_video.windows.debug.arm64.dll addon-out/addons/native_video/
+          cp staging/native_video.windows.release.arm64.dll addon-out/addons/native_video/
+          cp addon/native_video.gdextension addon-out/addons/native_video/
+          cp LICENSE addon-out/addons/native_video/
+          cp README.md addon-out/addons/native_video/
+
+      - name: Zip addon
+        run: |
+          zip_name="native_video-${RELEASE_TAG:-${GITHUB_SHA}}.zip"
+          echo "ZIP_NAME=${zip_name}" >> "$GITHUB_ENV"
+          (cd addon-out && zip -r "../${zip_name}" addons)
+
+      - name: Attach zip to GitHub Release
+        if: inputs.release-tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" "$ZIP_NAME" --clobber
+
+      - name: Upload workflow artifact (manual runs)
+        if: inputs.release-tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: native_video
+          path: addon-out/**
