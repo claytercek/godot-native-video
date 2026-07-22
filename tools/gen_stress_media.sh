@@ -51,7 +51,7 @@
 # decoder then fails to read the file back ("Audio object type SBR+21 is not
 # implemented"), so the output could not even be verified with ffprobe, let
 # alone trusted as real SBR bitstream. Faking it would defeat the point of a
-# stress clip. Skipped; see AGENTS/README notes for the limitation.
+# stress clip. It remains a documented generator limitation.
 #
 # Usage:
 #   tools/gen_stress_media.sh [--output-dir DIR] [--duration SECONDS]

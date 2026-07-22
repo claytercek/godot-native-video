@@ -26,6 +26,26 @@ const Rid = godot.builtin.Rid;
 
 const core = @import("core");
 
+pub const PresentationMetadata = struct {
+    pts_seconds: f64 = 0.0,
+    width: i32 = 0,
+    height: i32 = 0,
+    pixel_format: core.backend.PixelFormat = .unknown,
+    crop: core.backend.CropRect = .{},
+    color: core.backend.Colorimetry = .{},
+
+    pub fn fromFrame(frame: core.backend.VideoFrame) PresentationMetadata {
+        return .{
+            .pts_seconds = frame.pts_seconds,
+            .width = frame.width,
+            .height = frame.height,
+            .pixel_format = frame.pixel_format,
+            .crop = frame.crop,
+            .color = frame.color,
+        };
+    }
+};
+
 /// An invalid (zero) RID for struct-field defaults. isValid() is false.
 pub const rid_invalid: Rid = std.mem.zeroes(Rid);
 
@@ -71,21 +91,7 @@ pub const PlaneTextures = struct {
     chroma: Rid = rid_invalid, // RG8 (8-bit) or RG16 (10-bit), half resolution
     width: i32 = 0, // luma (frame) width
     height: i32 = 0, // luma (frame) height
-
-    /// Optional GPU-submission-ordering hook the present pipeline calls once,
-    /// BEFORE the compute dispatch that samples the planes. Empty (a no-op) for
-    /// importers that share one device with the decoder (Metal) or copy through
-    /// the CPU (Windows CPU-copy): no cross-device sync object exists there. The
-    /// Windows D3D12 zero-copy importer sets it to a CPU-blocking fence wait that
-    /// does not return until the D3D11 plane-split pass it depends on has
-    /// finished on the GPU — so callers must not assume acquire returns quickly.
-    ///
-    /// This is a submission-ordering hook, distinct from `release` below (which
-    /// frees the wrappers). There is no matching release-sync hook: the only
-    /// path that would have needed one is the DXGI keyed-mutex import, which is
-    /// not ported (see importer_selector's module doc comment); the D3D12 path's
-    /// plane textures are single-use, so nothing hands access back.
-    acquire: Closure = .{},
+    metadata: PresentationMetadata = .{},
 
     /// Frees the RD texture RIDs and releases the native import wrappers. Call
     /// exactly once (the retire-ring does this after N frames).
@@ -94,6 +100,24 @@ pub const PlaneTextures = struct {
     pub fn valid(self: PlaneTextures) bool {
         return self.luma.isValid() and self.chroma.isValid();
     }
+
+    /// Abandon an imported frame and consume its release hook exactly once.
+    pub fn discard(self: *PlaneTextures) void {
+        const release = self.release;
+        self.release = .{};
+        release.call();
+    }
+};
+
+/// Typed import outcome. Only `capability_unavailable` authorizes the Windows
+/// selector to permanently abandon D3D12; malformed or transient frames must
+/// not silently change the session's presentation architecture.
+pub const ImportResult = union(enum) {
+    success: PlaneTextures,
+    not_ready,
+    bad_frame,
+    transient_failure,
+    capability_unavailable,
 };
 
 /// Frees whichever of the two plane RIDs are valid. Shared by importers'

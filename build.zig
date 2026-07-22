@@ -175,12 +175,12 @@ pub fn build(b: *Build) !void {
     run.step.dependOn(&install.step);
     b.step("run", "Run the demo project in Godot (forwards `-- <args>` to the demo's CLI, e.g. a clip path or --file=<path>)").dependOn(&run.step);
 
-    // Headless pass/fail smoke test: the interactive demo's --smoke mode,
-    // equivalent to `godot --headless --path project -- --smoke`. Fails the
-    // step (non-zero exit) if the smoke run's own exit code is non-zero.
+    // Pass/fail presentation smoke. This intentionally uses the real display
+    // driver: Godot's headless driver has no RenderingDevice and therefore
+    // cannot exercise texture import or the conversion shader.
     const smoke = Build.Step.Run.create(b, "run godot demo smoke test");
     smoke.addFileArg(gdzig_dep.namedLazyPath("godot"));
-    smoke.addArgs(&.{ "--headless", "--path" });
+    smoke.addArgs(&.{ "--log-file", b.pathFromRoot(".zig-cache/godot-smoke.log"), "--path" });
     smoke.addDirectoryArg(b.path("./project"));
     smoke.addArgs(&.{ "--", "--smoke" });
     smoke.step.dependOn(&install.step);

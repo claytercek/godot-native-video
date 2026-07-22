@@ -88,10 +88,28 @@ const RingSlot = struct {
     rgba_rid: Rid = si.rid_invalid, // RD storage texture (rgba8 or rgba16f)
 };
 
+const ResourceGeneration = struct {
+    rd: *RenderingDevice,
+    shader: Rid,
+    pipeline: Rid,
+    sampler: Rid,
+    ring: [ring_depth]RingSlot,
+};
+
+fn resourceGenerationTeardown(generation: *ResourceGeneration) void {
+    for (generation.ring) |slot| {
+        if (slot.rgba_rid.isValid()) generation.rd.freeRid(slot.rgba_rid);
+    }
+    if (generation.pipeline.isValid()) generation.rd.freeRid(generation.pipeline);
+    if (generation.sampler.isValid()) generation.rd.freeRid(generation.sampler);
+    if (generation.shader.isValid()) generation.rd.freeRid(generation.shader);
+}
+
 /// The pipeline's RD-resource lifecycle.
 const State = enum(u8) {
     unbuilt, // resources not built (initial, or after free/dimension change)
     ready, // resources built and usable
+    rebuild_pending, // live resources must be retired before replacement
     disabled, // no RenderingServer/RenderingDevice — terminal, never leaves
 };
 
@@ -106,12 +124,14 @@ const RetireValue = struct {
     uniform_set: Rid,
     plane_release: si.Closure,
     frame: VideoFrame,
+    generation_release: si.Closure,
 };
 
 fn retireTeardown(v: *RetireValue) void {
     if (v.uniform_set.isValid()) v.rd.freeRid(v.uniform_set);
     v.plane_release.call();
     v.frame.release();
+    v.generation_release.call();
 }
 
 pub const PresentPipeline = struct {
@@ -136,6 +156,7 @@ pub const PresentPipeline = struct {
     current_texture: ?*Texture2drd = null,
 
     retire: retire_ring.RetireRing(frame_latency) = .{},
+    pending_generation_release: si.Closure = .{},
 
     width: i32 = 0,
     height: i32 = 0,
@@ -174,7 +195,7 @@ pub const PresentPipeline = struct {
         if (mode != self.output_mode) {
             self.output_mode = mode;
             if (self.state == .ready) {
-                self.state = .unbuilt; // force rebuild on next ensureReady
+                self.state = .rebuild_pending;
             }
         }
     }
@@ -197,14 +218,15 @@ pub const PresentPipeline = struct {
         if (width <= 0 or height <= 0) return false;
         // Disabled (e.g. headless) is terminal — don't retry build every frame.
         if (self.state == .disabled) return false;
+        if (!self.ensureImporter()) return false;
         if (self.state == .ready and width == self.width and height == self.height) {
             return true;
         }
-        // Dimensions or output mode changed (or first use): rebuild. Drain held
-        // surfaces first so we don't leak the old ring's transient textures.
-        if (self.state == .ready) {
-            self.retire.drain();
-            self.freeResources();
+        // Dimensions or output mode changed: move the whole live generation
+        // into the same latency ring as its submitted frames. New resources
+        // can be built immediately without freeing anything the GPU may use.
+        if (self.state == .ready or self.state == .rebuild_pending) {
+            if (!self.retireResourceGeneration()) return false;
         }
         return self.buildResources(width, height);
     }
@@ -215,28 +237,7 @@ pub const PresentPipeline = struct {
         // (ensureReady already freed them) since every free is isValid()-guarded.
         self.freeResources();
 
-        // Use the global RenderingDevice — the present output must live on the
-        // same device Godot samples from when compositing the player.
-        const rd = RenderingServer.getRenderingDevice() orelse {
-            // No RenderingDevice (headless). Degrade gracefully: decode, audio,
-            // clock, and the playback state machine keep running; only texture
-            // output is disabled. Latch Disabled and print once.
-            self.state = .disabled;
-            log.info("No RenderingDevice — presentation disabled (headless mode). " ++
-                "Decode and audio continue normally.", .{});
-            return false;
-        };
-        self.rd = rd;
-
-        // Build the surface importer lazily, then bind it to RD.
-        if (self.importer == null) {
-            self.importer = SurfaceImporter.init(self.allocator);
-        }
-        const importer = &self.importer.?;
-        if (!importer.initialize(rd)) {
-            log.err("Surface importer init failed (RD backend not supported by importer?).", .{});
-            return false;
-        }
+        const rd = self.rd.?;
 
         // Size the reusable push-constant staging buffer once. present()
         // repacks into its detached buffer instead of allocating per frame.
@@ -279,6 +280,31 @@ pub const PresentPipeline = struct {
         // the player's cached texture picks up the real dimensions.
         self.getTexture().setTextureRdRid(self.ring[0].rgba_rid);
         self.state = .ready;
+        return true;
+    }
+
+    fn ensureImporter(self: *PresentPipeline) bool {
+        if (self.state == .disabled) return false;
+        const rd = self.rd orelse RenderingServer.getRenderingDevice() orelse {
+            // No RenderingDevice (headless). Degrade gracefully: decode, audio,
+            // clock, and the playback state machine keep running; only texture
+            // output is disabled. Latch Disabled and print once.
+            self.state = .disabled;
+            log.info("No RenderingDevice — presentation disabled (headless mode). " ++
+                "Decode and audio continue normally.", .{});
+            return false;
+        };
+        self.rd = rd;
+
+        // Build the surface importer lazily, then bind it to RD.
+        if (self.importer == null) {
+            self.importer = SurfaceImporter.init(self.allocator);
+        }
+        const importer = &self.importer.?;
+        if (!importer.initialize(rd)) {
+            log.err("Surface importer init failed (RD backend not supported by importer?).", .{});
+            return false;
+        }
         return true;
     }
 
@@ -356,13 +382,10 @@ pub const PresentPipeline = struct {
     /// that have aged out. The frame's own release() is parked in the ring.
     /// Returns true if a GPU pass ran.
     pub fn present(self: *PresentPipeline, frame: VideoFrame) bool {
-        if (!self.ensureReady(frame.width, frame.height)) {
-            // Couldn't build the pipeline; still run the frame's own release so
-            // the decoder pool can recycle the surface. Retire immediately.
+        if (!self.ensureImporter()) {
             frame.release();
             return false;
         }
-        const rd = self.rd.?;
         const importer = &self.importer.?;
 
         // Age the retire-ring by one rendered frame BEFORE parking this frame's
@@ -373,18 +396,19 @@ pub const PresentPipeline = struct {
         // cropped to the frame's display aperture (see core.backend.CropRect)
         // so decoder padding from a macroblock-aligned backing texture never
         // reaches the planes the present shader samples.
-        var planes = importer.import(frame.native_handle, frame.plane_slice, frame.crop);
-        if (!planes.valid()) {
+        var planes = switch (importer.import(frame)) {
+            .success => |value| value,
+            .not_ready, .bad_frame, .transient_failure, .capability_unavailable => {
+                frame.release();
+                return false;
+            },
+        };
+        if (!self.ensureReady(planes.width, planes.height)) {
+            planes.discard();
             frame.release();
             return false;
         }
-
-        // GPU-submission-ordering handoff: on the Windows D3D12 path this
-        // CPU-blocks on a shared fence until the decoder-side plane-split pass
-        // has finished on the GPU before we sample the planes. Empty (no-op) on
-        // Metal and the CPU-copy path. Called exactly once here on the valid
-        // path, which also frees its own heap box (see PlaneTextures.acquire).
-        planes.acquire.call();
+        const rd = self.rd.?;
 
         // Advance the output ring slot.
         self.ring_index = (self.ring_index + 1) % ring_depth;
@@ -392,7 +416,7 @@ pub const PresentPipeline = struct {
 
         const uniform_set = self.buildUniformSet(rd, planes, slot);
         if (!uniform_set.isValid()) {
-            planes.release.call();
+            planes.discard();
             frame.release();
             return false;
         }
@@ -400,7 +424,7 @@ pub const PresentPipeline = struct {
         // Push constant: output dimensions + colorimetry + bit depth (std430,
         // push_constant_size bytes). Repacked into the reusable, pre-sized
         // scratch buffer — no per-frame alloc.
-        self.packPushConstants(frame);
+        self.packPushConstants(planes);
 
         // --- ONE compute dispatch: NV12 -> RGBA into the engine-owned slot. ---
         const gx: u32 = @intCast(@divTrunc(self.width + 7, 8));
@@ -424,6 +448,7 @@ pub const PresentPipeline = struct {
             .uniform_set = uniform_set,
             .plane_release = planes.release,
             .frame = frame,
+            .generation_release = self.pending_generation_release,
         }, retireTeardown) catch {
             // Out of memory: free everything now rather than leaking.
             if (uniform_set.isValid()) rd.freeRid(uniform_set);
@@ -431,6 +456,7 @@ pub const PresentPipeline = struct {
             frame.release();
             return true;
         };
+        self.pending_generation_release = .{};
         self.retire.retain(release);
         return true;
     }
@@ -477,14 +503,14 @@ pub const PresentPipeline = struct {
     /// colorimetry + bit depth) into the reusable push_scratch buffer (sized
     /// once in buildResources), ready for rd.computeListSetPushConstant(). No
     /// allocation.
-    fn packPushConstants(self: *PresentPipeline, frame: VideoFrame) void {
+    fn packPushConstants(self: *PresentPipeline, planes: PlaneTextures) void {
         // Pack into a stack buffer, then copy into push_scratch's own storage.
         var buf: [push_constants.push_constant_size]u8 = undefined;
         push_constants.packPushConstants(
             &buf,
             @intCast(self.width),
             @intCast(self.height),
-            frame.color,
+            planes.metadata.color,
         );
         // index(0) detaches push_scratch's CoW storage and hands back its
         // unique buffer (same idiom as the audio mix path), so the memcpy
@@ -523,10 +549,41 @@ pub const PresentPipeline = struct {
         self.height = 0;
     }
 
+    fn retireResourceGeneration(self: *PresentPipeline) bool {
+        const rd = self.rd orelse return false;
+        if (self.pending_generation_release.func != null) {
+            log.err("cannot rebuild again before the previous GPU generation has been attached to a presented frame.", .{});
+            return false;
+        }
+        const release = si.boxClosure(self.allocator, ResourceGeneration{
+            .rd = rd,
+            .shader = self.shader,
+            .pipeline = self.pipeline,
+            .sampler = self.sampler,
+            .ring = self.ring,
+        }, resourceGenerationTeardown) catch {
+            log.err("could not retain the current GPU resource generation for a safe rebuild.", .{});
+            return false;
+        };
+
+        if (self.current_texture) |texture| texture.setTextureRdRid(si.rid_invalid);
+        self.shader = si.rid_invalid;
+        self.pipeline = si.rid_invalid;
+        self.sampler = si.rid_invalid;
+        self.ring = @splat(.{});
+        self.width = 0;
+        self.height = 0;
+        self.state = .unbuilt;
+        self.pending_generation_release = release;
+        return true;
+    }
+
     /// Tear down all RD resources and drain the retire-ring.
     pub fn shutdown(self: *PresentPipeline) void {
         // Release any surfaces still parked before tearing down RD resources.
         self.retire.drain();
+        self.pending_generation_release.call();
+        self.pending_generation_release = .{};
         self.freeResources();
         if (self.importer) |*imp| {
             imp.deinit();

@@ -32,7 +32,7 @@ const selectImporter = importer_selector.selectImporter;
 const ImporterKind = importer_selector.ImporterKind;
 
 const si = @import("surface_importer.zig");
-const PlaneTextures = si.PlaneTextures;
+const ImportResult = si.ImportResult;
 
 const D3D12SurfaceImporter = @import("d3d12_surface_importer.zig").D3D12SurfaceImporter;
 const CpuCopySurfaceImporter = @import("cpu_copy_surface_importer.zig").CpuCopySurfaceImporter;
@@ -50,11 +50,6 @@ pub const WindowsSurfaceImporter = struct {
     concrete: ?Concrete = null,
     // Kept so the runtime CPU-copy fallback can bind a fresh importer.
     rd: ?*RenderingDevice = null,
-    // The D3D12 zero-copy path is only proven at its first import (that is when
-    // the decoder-device pipeline is built and the shared handles are opened).
-    // We probe exactly that one import; after it, no further per-frame probing.
-    d3d12_probed: bool = false,
-
     pub fn init(allocator: std.mem.Allocator) WindowsSurfaceImporter {
         return .{ .allocator = allocator };
     }
@@ -99,23 +94,21 @@ pub const WindowsSurfaceImporter = struct {
         };
     }
 
-    pub fn import(self: *WindowsSurfaceImporter, native_handle: ?*anyopaque, plane_slice: u32, crop: core.backend.CropRect) PlaneTextures {
-        const c = &(self.concrete orelse return .{});
+    pub fn import(self: *WindowsSurfaceImporter, frame_info: core.backend.VideoFrame) ImportResult {
+        const c = &(self.concrete orelse return .transient_failure);
         switch (c.*) {
             .d3d12 => |*imp| {
-                const result = imp.import(native_handle, plane_slice, crop);
-                if (self.d3d12_probed) return result;
-                // First D3D12 import: it builds the decoder-device pipeline and
-                // opens the shared handles. If that failed (e.g. cross-adapter
-                // OpenSharedHandle), degrade to CPU-copy permanently.
-                self.d3d12_probed = true;
-                if (result.valid()) return result;
-                log.warn("D3D12 zero-copy import failed on first frame (cross-adapter setup?); falling back to CPU-copy import permanently.", .{});
-                const rd = self.rd orelse return .{};
-                if (!self.degradeToCpuCopy(rd)) return .{};
-                return self.concrete.?.cpu_copy.import(native_handle, plane_slice, crop);
+                const result = imp.import(frame_info);
+                switch (result) {
+                    .capability_unavailable => {},
+                    else => return result,
+                }
+                log.warn("D3D12 zero-copy capability unavailable; falling back to CPU-copy import permanently.", .{});
+                const rd = self.rd orelse return .transient_failure;
+                if (!self.degradeToCpuCopy(rd)) return .transient_failure;
+                return self.concrete.?.cpu_copy.import(frame_info);
             },
-            .cpu_copy => |*imp| return imp.import(native_handle, plane_slice, crop),
+            .cpu_copy => |*imp| return imp.import(frame_info),
         }
     }
 

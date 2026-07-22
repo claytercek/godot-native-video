@@ -55,6 +55,7 @@ const d3d11 = win.d3d11;
 
 const si = @import("surface_importer.zig");
 const PlaneTextures = si.PlaneTextures;
+const ImportResult = si.ImportResult;
 
 const wic = @import("windows_import_common.zig");
 const CachedTex2D = wic.CachedTex2D;
@@ -74,7 +75,7 @@ const ReadbackSlot = struct {
     // dimensions rather than whatever crop the CURRENT call() received, since
     // the slot being read back was written by an earlier, different import()
     // call -- see the ring-buffer accounting in the module doc comment.
-    crop: core.backend.CropRect = .{},
+    metadata: si.PresentationMetadata = .{},
 };
 
 pub const CpuCopySurfaceImporter = struct {
@@ -89,6 +90,9 @@ pub const CpuCopySurfaceImporter = struct {
 
     ring: [readback_ring_depth]ReadbackSlot = @splat(.{}),
     frame_index: u64 = 0,
+    source_width: com.UINT = 0,
+    source_height: com.UINT = 0,
+    source_format: dxgi.DXGI_FORMAT = dxgi.DXGI_FORMAT_UNKNOWN,
     initialized: bool = false,
 
     // Session-scoped: every frame actually imported through this path, honest
@@ -118,19 +122,18 @@ pub const CpuCopySurfaceImporter = struct {
     /// Import the NV12/P010 ID3D11Texture2D (opaque handle == ID3D11Texture2D*)
     /// into two RD plane textures via a GPU->CPU readback, CROPPED to `crop`
     /// (the frame's display aperture -- see core.backend.CropRect). Returns an
-    /// invalid PlaneTextures on failure OR while the readback ring is still
-    /// warming up.
-    pub fn import(self: *CpuCopySurfaceImporter, native_handle: ?*anyopaque, plane_slice: u32, crop: core.backend.CropRect) PlaneTextures {
+    /// A typed failure on error, or `not_ready` while the readback ring warms.
+    pub fn import(self: *CpuCopySurfaceImporter, frame_info: core.backend.VideoFrame) ImportResult {
         var out: PlaneTextures = .{};
-        if (!self.initialized) return out;
-        const handle = native_handle orelse return out;
+        if (!self.initialized) return .transient_failure;
+        const handle = frame_info.native_handle orelse return .bad_frame;
         const decoded: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(handle));
 
         // Lazily bind to the SAME device the decoder texture lives on.
         if (self.device == null) {
             const bound = wic.bindDecoderDevice(decoded) orelse {
                 log.err("CPU-copy importer: ID3D11Texture2D.GetDevice failed.", .{});
-                return out;
+                return .transient_failure;
             };
             self.device = bound.device;
             self.context = bound.context;
@@ -140,12 +143,27 @@ pub const CpuCopySurfaceImporter = struct {
 
         var src_desc: d3d11.D3D11_TEXTURE2D_DESC = undefined;
         decoded.GetDesc(&src_desc);
-        const is_10bit = wic.detectBitDepth(src_desc.Format) orelse {
+        _ = wic.detectBitDepth(src_desc.Format) orelse {
             log.err("CPU-copy importer: decoder texture is not NV12 or P010.", .{});
-            return out;
+            return .bad_frame;
         };
         const width: com.UINT = src_desc.Width;
         const height: com.UINT = src_desc.Height;
+
+        // A ring generation has one physical shape/format. Never allow a slot
+        // from the previous generation to emerge beside metadata from a new
+        // decoder configuration.
+        if (width != self.source_width or height != self.source_height or src_desc.Format != self.source_format) {
+            for (&self.ring) |*slot| {
+                slot.staging.release();
+                slot.has_data = false;
+                slot.metadata = .{};
+            }
+            self.frame_index = 0;
+            self.source_width = width;
+            self.source_height = height;
+            self.source_format = src_desc.Format;
+        }
 
         const frame = self.frame_index;
         self.frame_index += 1;
@@ -157,7 +175,7 @@ pub const CpuCopySurfaceImporter = struct {
         const write = &self.ring[@as(usize, @intCast(write_slot))];
         if (!write.staging.ensure(device, width, height, src_desc.Format, d3d11.D3D11_USAGE_STAGING, 0, d3d11.D3D11_CPU_ACCESS_READ)) {
             log.err("CPU-copy importer: staging texture create failed.", .{});
-            return out;
+            return .transient_failure;
         }
         context.CopySubresourceRegion(
             write.staging.texture.?.asResource(),
@@ -166,20 +184,20 @@ pub const CpuCopySurfaceImporter = struct {
             0,
             0,
             decoded.asResource(),
-            @intCast(plane_slice),
+            @intCast(frame_info.plane_slice),
             null,
         );
         write.has_data = true;
-        write.crop = crop;
+        write.metadata = si.PresentationMetadata.fromFrame(frame_info);
 
         // --- Read back the oldest slot. Still warming up: nothing old enough.
         const read = &self.ring[@as(usize, @intCast(read_slot))];
-        if (!read.has_data) return out;
+        if (!read.has_data) return .not_ready;
 
         var mapped = std.mem.zeroes(d3d11.D3D11_MAPPED_SUBRESOURCE);
         if (com.FAILED(context.Map(read.staging.texture.?.asResource(), 0, d3d11.D3D11_MAP_READ, 0, &mapped))) {
             log.err("CPU-copy importer: staging texture Map failed.", .{});
-            return out;
+            return .transient_failure;
         }
 
         // Aligned (possibly macroblock-padded) dimensions of the physical
@@ -188,7 +206,11 @@ pub const CpuCopySurfaceImporter = struct {
         // the current call.
         const aligned_width: com.UINT = read.staging.width;
         const aligned_height: com.UINT = read.staging.height;
-        const rc = wic.resolveCrop(read.crop, aligned_width, aligned_height);
+        const rc = wic.resolveCrop(read.metadata.crop, aligned_width, aligned_height);
+        const read_is_10bit = wic.detectBitDepth(read.staging.format) orelse {
+            context.Unmap(read.staging.texture.?.asResource(), 0);
+            return .bad_frame;
+        };
         const row_pitch: usize = mapped.RowPitch;
 
         const luma_src: [*]const u8 = @ptrCast(mapped.pData.?);
@@ -196,7 +218,7 @@ pub const CpuCopySurfaceImporter = struct {
 
         var luma_bytes: PackedByteArray = undefined;
         var chroma_bytes: PackedByteArray = undefined;
-        if (is_10bit) {
+        if (read_is_10bit) {
             luma_bytes = packRows10bit(luma_src, row_pitch, rc.luma_x, rc.luma_y, rc.luma_width, rc.luma_height);
             // Interleaved U16+V16 per chroma sample.
             chroma_bytes = packRows10bit(chroma_src, row_pitch, @as(usize, rc.chroma_x) * 2, rc.chroma_y, @as(usize, rc.chroma_width) * 2, rc.chroma_height);
@@ -212,36 +234,37 @@ pub const CpuCopySurfaceImporter = struct {
 
         // --- Ordinary texture_create + texture_update — no aliased import.
         const rd = self.rd.?;
-        const luma_fmt = si.planeFormat(is_10bit, false);
-        const chroma_fmt = si.planeFormat(is_10bit, true);
+        const luma_fmt = si.planeFormat(read_is_10bit, false);
+        const chroma_fmt = si.planeFormat(read_is_10bit, true);
 
         const luma = createPlane(rd, luma_fmt, @intCast(rc.luma_width), @intCast(rc.luma_height));
         const chroma = createPlane(rd, chroma_fmt, @intCast(rc.chroma_width), @intCast(rc.chroma_height));
         if (!luma.isValid() or !chroma.isValid()) {
             si.freePlaneRids(rd, luma, chroma);
             log.err("CPU-copy importer: texture_create failed.", .{});
-            return out;
+            return .transient_failure;
         }
         if (rd.textureUpdate(luma, 0, luma_bytes) != .ok or rd.textureUpdate(chroma, 0, chroma_bytes) != .ok) {
             si.freePlaneRids(rd, luma, chroma);
             log.err("CPU-copy importer: texture_update failed.", .{});
-            return out;
+            return .transient_failure;
         }
 
         const release = si.boxPlaneRelease(self.allocator, rd, luma, chroma) catch {
             si.freePlaneRids(rd, luma, chroma);
-            return out;
+            return .transient_failure;
         };
 
         out.luma = luma;
         out.chroma = chroma;
         out.width = @intCast(rc.luma_width);
         out.height = @intCast(rc.luma_height);
+        out.metadata = read.metadata;
         out.release = release;
         // Honest accounting: this is the one import path allowed to violate
         // the zero-copy contract, so every frame it actually hands back counts.
         self.cpu_copy_count += 1;
-        return out;
+        return .{ .success = out };
     }
 
     /// Frames imported through this CPU-copy path so far this session.
