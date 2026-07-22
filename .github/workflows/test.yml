@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: ["main", "zig"]
+    branches: ["main", "zig", "zig-win"]
     paths:
       - "src/**"
       - "project/**"
@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -39,3 +39,24 @@ jobs:
 
       - name: Decode smoke test
         run: zig build decode-smoke
+
+  test-windows:
+    name: Build & Test (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Run core tests
+        run: zig build test --summary all
+
+      - name: Build extension
+        run: zig build --summary all

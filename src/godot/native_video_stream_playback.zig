@@ -23,6 +23,7 @@
 const NativeVideoStreamPlayback = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const godot = @import("godot");
@@ -35,7 +36,14 @@ const String = godot.builtin.String;
 const Dictionary = godot.builtin.Dictionary;
 const PackedFloat32Array = godot.builtin.PackedFloat32Array;
 
-const avf = @import("avf");
+// Platform decode backend, resolved at comptime: Media Foundation on Windows,
+// AVFoundation elsewhere. Both expose `create(allocator) !Backend`. build.zig
+// wires exactly one of these named module imports per target, so the branch not
+// taken never references a module that isn't present for this platform.
+const platform_backend = if (builtin.os.tag == .windows)
+    @import("mf")
+else
+    @import("avf");
 
 // Core types come through the "core" named module (build.zig-wired) so they
 // match the PlaybackController's module instance. A module's root restricts
@@ -60,6 +68,7 @@ const log = std.log.scoped(.native_video);
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStreamPlayback, r.allocator, .auto);
     class.addMethod("get_color_info", .auto);
+    class.addMethod("get_cpu_copy_count", .auto);
     // output_mode (SDR,HDR) enum property, backed by set/get methods.
     class.addProperty("output_mode", .{
         .hint = .property_hint_enum,
@@ -163,7 +172,7 @@ fn flushWarnings(self: *NativeVideoStreamPlayback) void {
 /// Returns null if the backend can't be constructed or open() fails; on
 /// success the caller owns the (already open) backend and must deinit() it.
 pub fn openBackendForPath(allocator: Allocator, path: String) ?Backend {
-    var backend = avf.create(allocator) catch return null;
+    var backend = platform_backend.create(allocator) catch return null;
 
     var os_path = ProjectSettings.globalizePath(path);
     defer os_path.deinit();
@@ -305,4 +314,13 @@ pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     // in an HDR viewport vs a native HDR clip.
     setDict(&info, "output_mode", @intFromEnum(self.present.outputMode()));
     return info;
+}
+
+/// Frames imported through the Windows CPU-copy path so far this playback
+/// session — the one sanctioned exception to the zero-copy contract, counted
+/// honestly whether this session ran CPU-copy from the start or degraded
+/// into it mid-flight from a failed D3D12 zero-copy attempt. Always 0 on
+/// macOS (Metal is always zero-copy).
+pub fn getCpuCopyCount(self: *NativeVideoStreamPlayback) i64 {
+    return @intCast(self.present.cpuCopyCount());
 }

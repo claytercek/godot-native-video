@@ -91,6 +91,35 @@ pub const PixelFormat = enum(u8) {
     bgra8, // Packed BGRA, 8 bpc — fallback software path
 };
 
+/// The display/clean-aperture rect within a decoded video surface's backing
+/// texture, in luma pixels. Some hardware decoders (Windows Media
+/// Foundation's DXVA path) allocate the backing texture macroblock-aligned
+/// (e.g. width rounded up to a multiple of 16 -- 853 wide content decodes
+/// into an 864-wide texture) and report the true display size separately;
+/// sampling or copying the full backing texture without cropping to this
+/// rect leaks decoder padding into the visible image.
+///
+/// `width == 0` is the "no crop metadata" sentinel: the backing texture is
+/// already exactly the frame's declared width x height, so consumers should
+/// treat the whole surface as the display rect (every backend that never
+/// sets this field, e.g. AVFoundation -- CVPixelBuffer already delivers
+/// display-cropped buffers -- gets this default and behaves exactly as
+/// before crop support existed).
+///
+/// Chroma half-pixel policy: 4:2:0 chroma planes are half resolution, so an
+/// odd luma offset/extent has no exact chroma counterpart. Consumers derive
+/// the chroma crop by flooring both offset and extent to the nearest even
+/// luma pixel pair (`/ 2` on each field) -- conservative in the sense that it
+/// never reads outside the luma crop's chroma footprint, at the cost of
+/// dropping up to one row/column of chroma at the aperture's trailing edge
+/// on odd dimensions.
+pub const CropRect = struct {
+    x: u32 = 0,
+    y: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+};
+
 /// One decoded video surface returned from the Backend.
 ///
 /// In Decoder mode the Backend hands us a native surface handle whose
@@ -112,6 +141,11 @@ pub const VideoFrame = struct {
     width: i32 = 0,
     height: i32 = 0,
     pixel_format: PixelFormat = .unknown,
+
+    /// The display rect within the backing texture named by native_handle /
+    /// plane_slice. See CropRect's doc comment for the sentinel default and
+    /// the chroma half-pixel policy.
+    crop: CropRect = .{},
 
     /// Populated from the decoder surface's color attachments by the Backend.
     color: Colorimetry = .{},
