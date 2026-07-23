@@ -13,6 +13,11 @@ pub fn build(b: *Build) !void {
     const env_godot = b.graph.environ_map.get("GODOT_PATH");
     const opt_godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot;
     const opt_godot_version = b.option([]const u8, "godot-version", "Godot version to download for bindgen (e.g. `4.6`)");
+    // Precision must match the Godot build the extension loads into: gdzig bakes
+    // the Variant/real_t layout in at compile time, so a `float` extension is a
+    // memory-layout mismatch in a `double` Godot. Prebuilt binaries ship `float`;
+    // double-precision users build from source with `-Dprecision=double`.
+    const opt_precision = b.option([]const u8, "precision", "Floating point precision, `float` or `double` [default: `float`]") orelse "float";
 
     // --- Core: pure Zig, no Godot dependency. ---
     const core_mod = b.createModule(.{
@@ -84,10 +89,12 @@ pub fn build(b: *Build) !void {
     const gdzig_dep = if (opt_godot_path) |p| b.dependency("gdzig", .{
         .target = target,
         .optimize = optimize,
+        .precision = opt_precision,
         .@"godot-path" = p,
     }) else b.dependency("gdzig", .{
         .target = target,
         .optimize = optimize,
+        .precision = opt_precision,
         .@"godot-version" = opt_godot_version orelse default_godot_version,
     });
 

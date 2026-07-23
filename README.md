@@ -122,6 +122,11 @@ GPU→CPU readback added before present.
 - **HEVC on Windows** depends on a decoder MFT being registered on the
   machine (typically the "HEVC Video Extensions" package) — not present on
   every Windows installation.
+- **Single precision only (prebuilt binaries)**: the released libraries are
+  built for the standard single-precision Godot. They will not load into a
+  double-precision (`precision=double`) Godot build — the two disagree on the
+  in-memory layout of core types. Double-precision users build from source
+  with `-Dprecision=double` (see [Building from source](#building-from-source)).
 
 ## Diagnostics
 
@@ -189,6 +194,10 @@ track with a differing rate is refused.
    arm64; Windows binary size hasn't been separately measured). Pass
    `-Doptimize=Debug` for a debug build, or `-Doptimize=ReleaseSmall` to
    trade some speed for an even smaller library.
+
+   To target a double-precision Godot build, add `-Dprecision=double`
+   (default is `float`). The precision must match the Godot the extension
+   loads into; a mismatch is a memory-layout error, not a graceful failure.
 
 3. Run the core unit tests (no Godot needed):
 
