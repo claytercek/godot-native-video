@@ -310,8 +310,16 @@ decode_marker_value() {
     local file="$1" n="$2" width="$3" height="$4" bits="$5"
     local tmp
     tmp="$(mktemp)"
-    ffmpeg -y -hide_banner -loglevel error -i "${file}" \
-        -vf "select=eq(n\,${n}),format=gray" -vsync 0 -f rawvideo -frames:v 1 "${tmp}" </dev/null
+    # -fps_mode, not -vsync: the latter was deprecated in ffmpeg 5 and removed
+    # in 9, and a rejected option here leaves ${tmp} empty rather than failing
+    # the script, so every marker silently decodes as 0.
+    if ! ffmpeg -y -hide_banner -loglevel error -i "${file}" \
+        -vf "select=eq(n\,${n}),format=gray" -fps_mode passthrough -f rawvideo -frames:v 1 "${tmp}" </dev/null \
+        || [[ ! -s "${tmp}" ]]; then
+        echo "ERROR: ffmpeg decoded no frame ${n} of ${file}" >&2
+        rm -f "${tmp}"
+        exit 1
+    fi
 
     local blockw=$(( width / bits ))
     local yoff=$(( (height / 2) * width ))
@@ -420,8 +428,15 @@ check_nonmod16_edge() {
     local file="${OUTPUT_DIR}/nonmod16_${width}x${NONMOD16_HEIGHT}.mp4"
     local tmp
     tmp="$(mktemp)"
-    ffmpeg -y -hide_banner -loglevel error -i "${file}" \
-        -vf "select=eq(n\,0),format=rgb24" -vsync 0 -f rawvideo -frames:v 1 "${tmp}" </dev/null
+    # See decode_marker_value for why this is -fps_mode and why an empty
+    # ${tmp} has to be an error rather than silently-zero pixel reads.
+    if ! ffmpeg -y -hide_banner -loglevel error -i "${file}" \
+        -vf "select=eq(n\,0),format=rgb24" -fps_mode passthrough -f rawvideo -frames:v 1 "${tmp}" </dev/null \
+        || [[ ! -s "${tmp}" ]]; then
+        echo "ERROR: ffmpeg decoded no frame 0 of ${file}" >&2
+        rm -f "${tmp}"
+        exit 1
+    fi
 
     local marker_off=$(( (width - 4) * 3 ))
     local body_off=$(( (width - 20) * 3 ))
