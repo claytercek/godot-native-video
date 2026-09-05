@@ -17,14 +17,29 @@ const Variant = godot.builtin.Variant;
 pub fn setDict(dict: *Dictionary, comptime key: [:0]const u8, value: anytype) void {
     var k = String.fromLatin1(key);
     defer k.deinit();
+    // Every Variant below is a temporary. `dict.set` copies both key and
+    // value into the Dictionary, so the Dictionary owns the surviving copies
+    // and each temporary must be deinit'd here -- otherwise its +1 on the
+    // boxed String's CoW buffer is never released.
     const kv = Variant.init(String, k);
+    defer kv.deinit();
     switch (@typeInfo(@TypeOf(value))) {
-        .bool => _ = dict.set(kv, Variant.init(bool, value)),
-        .int, .comptime_int => _ = dict.set(kv, Variant.init(i64, @intCast(value))),
+        .bool => {
+            const vv = Variant.init(bool, value);
+            defer vv.deinit();
+            _ = dict.set(kv, vv);
+        },
+        .int, .comptime_int => {
+            const vv = Variant.init(i64, @intCast(value));
+            defer vv.deinit();
+            _ = dict.set(kv, vv);
+        },
         .pointer => {
             var v = String.fromUtf8(value) catch String.fromLatin1(value);
             defer v.deinit();
-            _ = dict.set(kv, Variant.init(String, v));
+            const vv = Variant.init(String, v);
+            defer vv.deinit();
+            _ = dict.set(kv, vv);
         },
         else => @compileError("setDict: unsupported value type " ++ @typeName(@TypeOf(value))),
     }
