@@ -26,7 +26,8 @@ const NativeVideoStreamPlayback = @import("native_video_stream_playback.zig");
 const present_pipeline = @import("present_pipeline.zig");
 const OutputMode = present_pipeline.OutputMode;
 const setDict = @import("godot_dict.zig").setDict;
-const toEngineInt = @import("object_id.zig").toEngineInt;
+const object_id = @import("object_id.zig");
+const ObjectId = object_id.ObjectId;
 
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStream, r.allocator, .auto);
@@ -55,7 +56,7 @@ output_mode: OutputMode = .sdr,
 // Instance ids of playbacks instantiated from this stream. ObjectIDs, not
 // refs, on purpose: the stream must never extend a playback's lifetime.
 // Dead ids are pruned whenever the list is walked.
-playback_ids: std.ArrayList(u64) = .empty,
+playback_ids: std.ArrayList(ObjectId) = .empty,
 
 // The cached audio-track probe. null until getAudioTracks() has probed the
 // clip, whether or not the probe succeeded; a non-null (possibly empty) Array
@@ -107,8 +108,8 @@ fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
     self.playback_ids.shrinkRetainingCapacity(write);
 }
 
-fn resolvePlayback(id: u64) ?*NativeVideoStreamPlayback {
-    const obj = godot.general.instanceFromId(toEngineInt(id)) orelse return null;
+fn resolvePlayback(id: ObjectId) ?*NativeVideoStreamPlayback {
+    const obj = godot.general.instanceFromId(object_id.toEngineInt(id)) orelse return null;
     // Object -> engine VideoStreamPlayback (opaque cast) -> our bound instance.
     // godot.class.downcast rejects user-struct targets, so we go through the
     // engine class's asInstance() (the same seam Variant.as uses).
@@ -180,7 +181,7 @@ pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     // Prune dead ids, then record the new playback's id so setOutputMode() can
     // reach it later. The list stays bounded across many instantiations.
     self.pruneDeadPlaybacks();
-    self.playback_ids.append(self.allocator, playback.base.getInstanceId()) catch {};
+    self.playback_ids.append(self.allocator, object_id.fromRaw(playback.base.getInstanceId())) catch {};
 
     // VideoStream.getFile() holds the path the ResourceFormatLoader recorded.
     var file = self.base.getFile();
