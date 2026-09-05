@@ -50,6 +50,18 @@ pub fn unregister(r: *Registry) void {
     r.removeClass(NativeVideoStream);
 }
 
+/// One probed audio track, in plain Zig. Owns its `language`/`name`: the
+/// backend's AudioTrackInfo slices borrow shim-owned storage that is freed
+/// when the probe closes the backend, so they are duplicated into the
+/// stream's allocator here and freed in destroy().
+const AudioTrack = struct {
+    language: []const u8,
+    name: []const u8,
+    channels: i32,
+    sample_rate: i32,
+    is_default: bool,
+};
+
 allocator: Allocator,
 base: *VideoStream,
 
@@ -60,11 +72,18 @@ output_mode: OutputMode = .sdr,
 // Dead ids are pruned whenever the list is walked.
 playback_ids: std.ArrayList(ObjectId) = .empty,
 
-// The cached audio-track probe. null until getAudioTracks() has probed the
-// clip, whether or not the probe succeeded; a non-null (possibly empty) Array
-// afterwards. Distinguishes "not probed yet" from "probed and found no audio
+// The cached audio-track probe, held as plain Zig data rather than as a Godot
+// Array. A bound method returning an Array leaves through gdzig's ptrcall
+// path as a bitwise struct move with no refcount bump, so a typed GDScript
+// call would have the engine adopt -- and later release -- a reference this
+// struct still owns. getAudioTracks() therefore builds a fresh Array from
+// this table on every call and never hands out a cached one.
+audio_tracks: std.ArrayList(AudioTrack) = .empty,
+
+// Set once getAudioTracks() has probed the clip, whether or not the probe
+// succeeded. Distinguishes "not probed yet" from "probed and found no audio
 // tracks" so a failed probe or an audio-less clip doesn't re-open the file.
-cached_audio_tracks: ?Array = null,
+audio_tracks_probed: bool = false,
 
 pub fn create(allocator: *Allocator) !*NativeVideoStream {
     const self = try allocator.create(NativeVideoStream);
@@ -78,7 +97,12 @@ pub fn create(allocator: *Allocator) !*NativeVideoStream {
 
 pub fn destroy(self: *NativeVideoStream, allocator: *Allocator) void {
     self.playback_ids.deinit(self.allocator);
-    if (self.cached_audio_tracks) |*a| a.deinit();
+    // The cache owns its duplicated strings; nothing else points at them.
+    for (self.audio_tracks.items) |track| {
+        self.allocator.free(track.language);
+        self.allocator.free(track.name);
+    }
+    self.audio_tracks.deinit(self.allocator);
     self.base.destroy();
     allocator.destroy(self);
 }
@@ -151,43 +175,69 @@ pub fn getOutputMode(self: *NativeVideoStream) i64 {
     return @intFromEnum(self.output_mode);
 }
 
-/// Lazy, cached probe of audio track metadata. Probes exactly once; the result
-/// (including an empty Array for a failed probe or a legitimately audio-less
-/// clip) is cached for every subsequent call. Returns an Array of Dictionaries;
-/// array position is the track index for VideoStreamPlayer.audio_track.
+/// Lazy, cached probe of audio track metadata. The clip is opened at most once
+/// (a failed probe or a legitimately audio-less clip still counts as probed, so
+/// the file is never re-opened). Returns a freshly built Array of Dictionaries
+/// -- empty if the probe failed -- where array position is the track index for
+/// VideoStreamPlayer.audio_track. The Array is built per call, never cached and
+/// handed out, because the caller takes ownership of it on the ptrcall path.
 pub fn getAudioTracks(self: *NativeVideoStream) Array {
-    if (self.cached_audio_tracks) |cached| {
-        return cached;
-    }
+    self.probeAudioTracksOnce();
 
-    // Lazy probe: open the clip briefly to read audio track metadata, then
-    // close the backend. The result (including empty, on failure) is cached.
     var tracks = Array.init();
+    _ = tracks.resize(@intCast(self.audio_tracks.items.len));
+    for (self.audio_tracks.items, 0..) |track, i| {
+        // `dict` and the Variant boxing it are both temporaries: `tracks.set`
+        // copies the Variant in, so the Array holds the only surviving
+        // reference and both locals are released before the next iteration.
+        var dict = Dictionary.init();
+        defer dict.deinit();
+        setDict(&dict, "language", track.language);
+        setDict(&dict, "name", track.name);
+        setDict(&dict, "channels", track.channels);
+        setDict(&dict, "sample_rate", track.sample_rate);
+        setDict(&dict, "default", track.is_default);
+        const dv = Variant.init(Dictionary, dict);
+        defer dv.deinit();
+        tracks.set(@intCast(i), dv);
+    }
+    return tracks;
+}
+
+/// Open the clip briefly, copy out its audio-track metadata, close it again.
+/// Runs at most once per stream; the cached table owns everything it holds.
+fn probeAudioTracksOnce(self: *NativeVideoStream) void {
+    if (self.audio_tracks_probed) return;
+    // Mark probed up front so a failed open doesn't retry on every call.
+    self.audio_tracks_probed = true;
 
     var file = self.base.getFile();
     defer file.deinit();
-    var backend = NativeVideoStreamPlayback.openBackendForPath(self.allocator, file) catch {
-        self.cached_audio_tracks = tracks; // empty on failure
-        return tracks;
-    };
+    var backend = NativeVideoStreamPlayback.openBackendForPath(self.allocator, file) catch return;
     defer backend.deinit();
 
     const count: usize = @intCast(@max(backend.audioTrackCount(), 0));
-    _ = tracks.resize(@intCast(count));
+    self.audio_tracks.ensureTotalCapacity(self.allocator, count) catch return;
     for (0..count) |i| {
         const dinfo = backend.audioTrackInfo(@intCast(i));
-        var dict = Dictionary.init();
-        setDict(&dict, "language", dinfo.language);
-        setDict(&dict, "name", dinfo.name);
-        setDict(&dict, "channels", dinfo.channels);
-        setDict(&dict, "sample_rate", dinfo.sample_rate);
-        setDict(&dict, "default", dinfo.is_default);
-        tracks.set(@intCast(i), Variant.init(Dictionary, dict));
+        // dinfo.language/.name borrow storage the backend frees on close()
+        // below, so the cache takes its own copies. On OOM we keep the tracks
+        // recorded so far rather than failing the whole probe.
+        const language = self.allocator.dupe(u8, dinfo.language) catch return;
+        const name = self.allocator.dupe(u8, dinfo.name) catch {
+            self.allocator.free(language);
+            return;
+        };
+        self.audio_tracks.appendAssumeCapacity(.{
+            .language = language,
+            .name = name,
+            .channels = dinfo.channels,
+            .sample_rate = dinfo.sample_rate,
+            .is_default = dinfo.is_default,
+        });
     }
 
     backend.close();
-    self.cached_audio_tracks = tracks;
-    return tracks;
 }
 
 /// Called by NativeVideoStreamPlayback? No — the engine calls this virtual on
