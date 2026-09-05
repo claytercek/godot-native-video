@@ -237,7 +237,8 @@ pub fn setOutputMode(self: *NativeVideoStreamPlayback, mode: i64) void {
     self.applyOutputMode(om);
 }
 
-/// The REQUESTED output mode, so the inspector round-trips what was set. What
+/// The REQUESTED output mode — the pipeline never rewrites it, so the
+/// inspector round-trips what was set even if that mode failed to build. What
 /// is actually built is reported by get_color_info()'s "output_mode" key.
 pub fn getOutputMode(self: *NativeVideoStreamPlayback) i64 {
     return @intFromEnum(self.present.outputMode());
@@ -331,9 +332,11 @@ pub fn _getMixRate(self: *NativeVideoStreamPlayback) i32 {
 /// Returns a Dictionary with the parsed/negotiated colorimetry. Callable after
 /// load() succeeds. Untagged clips return BT.709 video-range defaults. Always
 /// includes an "output_mode" key (0 or 1) reporting the mode the present
-/// pipeline actually built — which lags the `output_mode` property until the
-/// next present(), and stays behind it permanently if the requested mode
-/// failed to build and fell back.
+/// pipeline actually built. Once something is built it lags the `output_mode`
+/// property until the next present(), and stays behind it until the request
+/// changes again if the requested mode failed to build and fell back to SDR.
+/// While nothing is built at all — before the first present(), in headless
+/// mode, or after a failed build — it reports the request instead.
 pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     const color: Colorimetry = self.controller.color;
     var info = Dictionary.init();
@@ -344,8 +347,11 @@ pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     setDict(&info, "bit_depth", color.bit_depth);
     // Report the mode actually built, not the requested one, so callers can
     // distinguish an SDR clip in an HDR viewport vs a native HDR clip — and
-    // see when an HDR request fell back to SDR.
-    setDict(&info, "output_mode", @intFromEnum(self.present.builtOutputMode()));
+    // see when an HDR request fell back to SDR. With nothing built there is no
+    // built mode to report, so fall back to the request rather than inventing
+    // an SDR default — that default was the regression this key had.
+    const built = self.present.builtOutputMode() orelse self.present.outputMode();
+    setDict(&info, "output_mode", @intFromEnum(built));
     return info;
 }
 
