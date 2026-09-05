@@ -94,6 +94,11 @@ const ResourceGeneration = struct {
     pipeline: Rid,
     sampler: Rid,
     ring: [ring_depth]RingSlot,
+    // The generation retired immediately before this one, if it had not yet
+    // been attached to a presented frame. Generations chain instead of racing
+    // for the single `pending_generation_release` slot, so a rebuild is always
+    // allowed and no closure is ever stranded.
+    prior: si.Closure = .{},
 };
 
 fn resourceGenerationTeardown(generation: *ResourceGeneration) void {
@@ -103,6 +108,9 @@ fn resourceGenerationTeardown(generation: *ResourceGeneration) void {
     if (generation.pipeline.isValid()) generation.rd.freeRid(generation.pipeline);
     if (generation.sampler.isValid()) generation.rd.freeRid(generation.sampler);
     if (generation.shader.isValid()) generation.rd.freeRid(generation.shader);
+    // Older generations are strictly older than this one, so they are safe to
+    // free once this one is. Runs last, exactly once.
+    generation.prior.call();
 }
 
 /// The pipeline's RD-resource lifecycle.
@@ -161,7 +169,8 @@ pub const PresentPipeline = struct {
     width: i32 = 0,
     height: i32 = 0,
     state: State = .unbuilt,
-    output_mode: OutputMode = .sdr,
+    output_mode: OutputMode = .sdr, // requested mode, applied at the next build
+    built_output_mode: OutputMode = .sdr, // mode of the last successful build
 
     pub fn init(allocator: std.mem.Allocator) PresentPipeline {
         return .{ .allocator = allocator, .push_scratch = PackedByteArray.init() };
@@ -175,8 +184,17 @@ pub const PresentPipeline = struct {
         return self.state == .ready;
     }
 
+    /// The REQUESTED output mode. May differ from what is currently built:
+    /// setOutputMode() only takes effect at the next present().
     pub fn outputMode(self: *const PresentPipeline) OutputMode {
         return self.output_mode;
+    }
+
+    /// The mode of the resources actually in use — what the viewport is being
+    /// fed right now. Differs from outputMode() while a request is pending, or
+    /// permanently if the requested mode failed to build and we fell back.
+    pub fn builtOutputMode(self: *const PresentPipeline) OutputMode {
+        return self.built_output_mode;
     }
 
     /// Frames imported through the CPU-copy path so far this session (always
@@ -187,10 +205,12 @@ pub const PresentPipeline = struct {
         return 0;
     }
 
-    /// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
-    /// next ensureReady() call — the ring texture format changes (rgba8 vs
-    /// rgba16f), so buildResources() rebuilds everything, shader included.
-    /// No-op if Disabled: there is nothing to rebuild.
+    /// Request an output mode (SDR or HDR). This is a REQUEST: it is applied
+    /// at the next ensureReady() (i.e. the next present()), which rebuilds
+    /// everything — the ring texture format changes (rgba8 vs rgba16f), so the
+    /// shader is recompiled too. If the requested mode fails to build, the
+    /// pipeline reverts to the last mode that built; builtOutputMode() reports
+    /// what is actually in use. No-op if Disabled: there is nothing to rebuild.
     pub fn setOutputMode(self: *PresentPipeline, mode: OutputMode) void {
         if (mode != self.output_mode) {
             self.output_mode = mode;
@@ -228,7 +248,19 @@ pub const PresentPipeline = struct {
         if (self.state == .ready or self.state == .rebuild_pending) {
             if (!self.retireResourceGeneration()) return false;
         }
-        return self.buildResources(width, height);
+        if (self.buildResources(width, height)) return true;
+        // The new mode does not build on this device (shader, pipeline, or an
+        // unsupported ring texture format). Revert to the last mode that did
+        // rather than retrying the same failing build every frame — a failed
+        // HDR switch degrades to SDR instead of going black. buildResources()
+        // frees the partial build at entry, and after the revert the two modes
+        // are equal, so this cannot recurse.
+        if (self.output_mode != self.built_output_mode) {
+            log.warn("{t} pipeline build failed — falling back to {t} output.", .{ self.output_mode, self.built_output_mode });
+            self.output_mode = self.built_output_mode;
+            return self.buildResources(width, height);
+        }
+        return false;
     }
 
     fn buildResources(self: *PresentPipeline, width: i32, height: i32) bool {
@@ -280,6 +312,7 @@ pub const PresentPipeline = struct {
         // the player's cached texture picks up the real dimensions.
         self.getTexture().setTextureRdRid(self.ring[0].rgba_rid);
         self.state = .ready;
+        self.built_output_mode = self.output_mode;
         return true;
     }
 
@@ -551,16 +584,18 @@ pub const PresentPipeline = struct {
 
     fn retireResourceGeneration(self: *PresentPipeline) bool {
         const rd = self.rd orelse return false;
-        if (self.pending_generation_release.func != null) {
-            log.err("cannot rebuild again before the previous GPU generation has been attached to a presented frame.", .{});
-            return false;
-        }
+        // A generation retired but not yet attached to a presented frame is
+        // chained onto this one rather than dropped: the retire ring only
+        // holds one closure per slot, so parking it separately would silently
+        // overwrite a live entry. On the catch path below, `prior` stays where
+        // it is — owned by exactly one holder at all times.
         const release = si.boxClosure(self.allocator, ResourceGeneration{
             .rd = rd,
             .shader = self.shader,
             .pipeline = self.pipeline,
             .sampler = self.sampler,
             .ring = self.ring,
+            .prior = self.pending_generation_release,
         }, resourceGenerationTeardown) catch {
             log.err("could not retain the current GPU resource generation for a safe rebuild.", .{});
             return false;
