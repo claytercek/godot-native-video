@@ -29,6 +29,8 @@ const setDict = @import("godot_dict.zig").setDict;
 const object_id = @import("object_id.zig");
 const ObjectId = object_id.ObjectId;
 
+const log = std.log.scoped(.native_video_stream);
+
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStream, r.allocator, .auto);
     // On macOS (and iOS) Metal-accelerated VideoToolbox produces 10-bit
@@ -98,16 +100,15 @@ pub fn hdrDecodeSupported(self: *NativeVideoStream) bool {
 // gdzig's instanceFromId + typed downcast.
 // -----------------------------------------------------------------------
 fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
-    var write: usize = 0;
-    for (self.playback_ids.items) |id| {
-        if (resolvePlayback(id) != null) {
-            self.playback_ids.items[write] = id;
-            write += 1;
-        }
-    }
-    self.playback_ids.shrinkRetainingCapacity(write);
+    self.walkLivePlaybacks({}, null);
 }
 
+// resolvePlayback can, in principle, resolve an id whose object is already
+// freed: Godot only drops an id from ObjectDB after the extension's
+// free_instance callback returns, so the window between allocator.destroy(self)
+// in NativeVideoStreamPlayback.destroy and Godot finishing ~Object() still
+// resolves. Only reachable if the unref lands on a different thread than the
+// setOutputMode() caller, which normal single-threaded script execution never does.
 fn resolvePlayback(id: ObjectId) ?*NativeVideoStreamPlayback {
     const obj = godot.general.instanceFromId(object_id.toEngineInt(id)) orelse return null;
     // Object -> engine VideoStreamPlayback (opaque cast) -> our bound instance.
@@ -117,16 +118,33 @@ fn resolvePlayback(id: ObjectId) ?*NativeVideoStreamPlayback {
     return vsp.asInstance(NativeVideoStreamPlayback);
 }
 
+// Single pass over playback_ids: compacts out dead ids as it goes, and, when
+// `action` is non-null, invokes it on every playback still resolvable. Doing
+// both in one walk avoids resolving each live id twice (once to prune, once
+// to act) and keeps the "dead" and "skipped" cases identical -- there is no
+// separate post-prune pass where a resolution failure could go unpruned.
+fn walkLivePlaybacks(self: *NativeVideoStream, context: anytype, comptime action: ?fn (@TypeOf(context), *NativeVideoStreamPlayback) void) void {
+    var write: usize = 0;
+    for (self.playback_ids.items) |id| {
+        if (resolvePlayback(id)) |playback| {
+            self.playback_ids.items[write] = id;
+            write += 1;
+            if (action) |apply| apply(context, playback);
+        }
+    }
+    self.playback_ids.shrinkRetainingCapacity(write);
+}
+
 pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
     const om = OutputMode.fromInt(mode) orelse return;
     self.output_mode = om;
-    // Forward to every still-alive playback instantiated from this stream.
-    self.pruneDeadPlaybacks();
-    for (self.playback_ids.items) |id| {
-        if (resolvePlayback(id)) |playback| {
-            playback.applyOutputMode(self.output_mode);
+    // Forward to every still-alive playback instantiated from this stream,
+    // pruning dead ids in the same pass.
+    self.walkLivePlaybacks(om, struct {
+        fn apply(output_mode: OutputMode, playback: *NativeVideoStreamPlayback) void {
+            playback.applyOutputMode(output_mode);
         }
-    }
+    }.apply);
 }
 
 pub fn getOutputMode(self: *NativeVideoStream) i64 {
@@ -181,7 +199,11 @@ pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     // Prune dead ids, then record the new playback's id so setOutputMode() can
     // reach it later. The list stays bounded across many instantiations.
     self.pruneDeadPlaybacks();
-    self.playback_ids.append(self.allocator, object_id.fromRaw(playback.base.getInstanceId())) catch {};
+    self.playback_ids.append(self.allocator, object_id.fromRaw(playback.base.getInstanceId())) catch {
+        // Degrade, don't fail: the playback still runs, but future
+        // setOutputMode() calls won't reach it until it's re-instantiated.
+        log.warn("failed to record playback id; it will not receive output_mode updates", .{});
+    };
 
     // VideoStream.getFile() holds the path the ResourceFormatLoader recorded.
     var file = self.base.getFile();
