@@ -26,6 +26,7 @@ const NativeVideoStreamPlayback = @import("native_video_stream_playback.zig");
 const present_pipeline = @import("present_pipeline.zig");
 const OutputMode = present_pipeline.OutputMode;
 const setDict = @import("godot_dict.zig").setDict;
+const toEngineInt = @import("object_id.zig").toEngineInt;
 
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStream, r.allocator, .auto);
@@ -107,7 +108,7 @@ fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
 }
 
 fn resolvePlayback(id: u64) ?*NativeVideoStreamPlayback {
-    const obj = godot.general.instanceFromId(@intCast(id)) orelse return null;
+    const obj = godot.general.instanceFromId(toEngineInt(id)) orelse return null;
     // Object -> engine VideoStreamPlayback (opaque cast) -> our bound instance.
     // godot.class.downcast rejects user-struct targets, so we go through the
     // engine class's asInstance() (the same seam Variant.as uses).
