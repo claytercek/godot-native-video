@@ -50,10 +50,10 @@ pub fn unregister(r: *Registry) void {
     r.removeClass(NativeVideoStream);
 }
 
-/// One probed audio track, in plain Zig. Owns its `language`/`name`: the
-/// backend's AudioTrackInfo slices borrow shim-owned storage that is freed
-/// when the probe closes the backend, so they are duplicated into the
-/// stream's allocator here and freed in destroy().
+/// One probed audio track, in plain Zig. `language`/`name` borrow storage
+/// owned by `owned_strings` below: the backend's AudioTrackInfo slices point
+/// at shim-owned storage that is freed when the probe closes the backend, so
+/// they are duplicated into that shared bucket instead.
 const AudioTrack = struct {
     language: []const u8,
     name: []const u8,
@@ -80,6 +80,11 @@ playback_ids: std.ArrayList(ObjectId) = .empty,
 // this table on every call and never hands out a cached one.
 audio_tracks: std.ArrayList(AudioTrack) = .empty,
 
+// Backs every `language`/`name` slice in audio_tracks: one bucket owning all
+// duplicated strings, freed in a single loop in destroy() rather than
+// per-field. AudioTrack itself holds plain borrowed slices into this.
+owned_strings: std.ArrayList([]u8) = .empty,
+
 // Set once getAudioTracks() has probed the clip, whether or not the probe
 // succeeded. Distinguishes "not probed yet" from "probed and found no audio
 // tracks" so a failed probe or an audio-less clip doesn't re-open the file.
@@ -97,11 +102,10 @@ pub fn create(allocator: *Allocator) !*NativeVideoStream {
 
 pub fn destroy(self: *NativeVideoStream, allocator: *Allocator) void {
     self.playback_ids.deinit(self.allocator);
-    // The cache owns its duplicated strings; nothing else points at them.
-    for (self.audio_tracks.items) |track| {
-        self.allocator.free(track.language);
-        self.allocator.free(track.name);
-    }
+    // owned_strings holds every duplicated language/name string exactly once;
+    // AudioTrack entries themselves borrow from it and own nothing.
+    for (self.owned_strings.items) |s| self.allocator.free(s);
+    self.owned_strings.deinit(self.allocator);
     self.audio_tracks.deinit(self.allocator);
     self.base.destroy();
     allocator.destroy(self);
@@ -123,8 +127,19 @@ pub fn hdrDecodeSupported(self: *NativeVideoStream) bool {
 // Resolve playback_ids to the playbacks still alive, pruning dead ids, using
 // gdzig's instanceFromId + typed downcast.
 // -----------------------------------------------------------------------
+// Single pass over playback_ids that compacts out dead ids as it goes. Pruning
+// in one walk keeps the "dead" and "skipped" cases identical -- there is no
+// separate post-prune pass where a resolution failure could skip a playback
+// without pruning it.
 fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
-    self.walkLivePlaybacks({}, null);
+    var write: usize = 0;
+    for (self.playback_ids.items) |id| {
+        if (resolvePlayback(id)) |_| {
+            self.playback_ids.items[write] = id;
+            write += 1;
+        }
+    }
+    self.playback_ids.shrinkRetainingCapacity(write);
 }
 
 // resolvePlayback can, in principle, resolve an id whose object is already
@@ -142,33 +157,22 @@ fn resolvePlayback(id: ObjectId) ?*NativeVideoStreamPlayback {
     return vsp.asInstance(NativeVideoStreamPlayback);
 }
 
-// Single pass over playback_ids: compacts out dead ids as it goes, and, when
-// `action` is non-null, invokes it on every playback still resolvable. Doing
-// both in one walk avoids resolving each live id twice (once to prune, once
-// to act) and keeps the "dead" and "skipped" cases identical -- there is no
-// separate post-prune pass where a resolution failure could go unpruned.
-fn walkLivePlaybacks(self: *NativeVideoStream, context: anytype, comptime action: ?fn (@TypeOf(context), *NativeVideoStreamPlayback) void) void {
+pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
+    const om = OutputMode.fromInt(mode) orelse return;
+    self.output_mode = om;
+    // Forward to every still-alive playback instantiated from this stream,
+    // pruning dead ids in the same pass: a SINGLE pass that compacts as it
+    // goes, so there is no separate post-prune pass where a resolution
+    // failure could skip a playback without pruning it.
     var write: usize = 0;
     for (self.playback_ids.items) |id| {
         if (resolvePlayback(id)) |playback| {
             self.playback_ids.items[write] = id;
             write += 1;
-            if (action) |apply| apply(context, playback);
+            playback.applyOutputMode(om);
         }
     }
     self.playback_ids.shrinkRetainingCapacity(write);
-}
-
-pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
-    const om = OutputMode.fromInt(mode) orelse return;
-    self.output_mode = om;
-    // Forward to every still-alive playback instantiated from this stream,
-    // pruning dead ids in the same pass.
-    self.walkLivePlaybacks(om, struct {
-        fn apply(output_mode: OutputMode, playback: *NativeVideoStreamPlayback) void {
-            playback.applyOutputMode(output_mode);
-        }
-    }.apply);
 }
 
 pub fn getOutputMode(self: *NativeVideoStream) i64 {
@@ -218,16 +222,20 @@ fn probeAudioTracksOnce(self: *NativeVideoStream) void {
 
     const count: usize = @intCast(@max(backend.audioTrackCount(), 0));
     self.audio_tracks.ensureTotalCapacity(self.allocator, count) catch return;
+    // Two owned strings per track, reserved up front so the appends below
+    // cannot fail and a freshly duped string can never be dropped on the floor
+    // between dupe and hand-off to the bucket.
+    self.owned_strings.ensureTotalCapacity(self.allocator, count * 2) catch return;
     for (0..count) |i| {
         const dinfo = backend.audioTrackInfo(@intCast(i));
         // dinfo.language/.name borrow storage the backend frees on close()
-        // below, so the cache takes its own copies. On OOM we keep the tracks
-        // recorded so far rather than failing the whole probe.
+        // below, so the cache takes its own copies, owned by owned_strings.
+        // On OOM we keep the tracks recorded so far rather than failing the
+        // whole probe.
         const language = self.allocator.dupe(u8, dinfo.language) catch return;
-        const name = self.allocator.dupe(u8, dinfo.name) catch {
-            self.allocator.free(language);
-            return;
-        };
+        self.owned_strings.appendAssumeCapacity(language);
+        const name = self.allocator.dupe(u8, dinfo.name) catch return;
+        self.owned_strings.appendAssumeCapacity(name);
         self.audio_tracks.appendAssumeCapacity(.{
             .language = language,
             .name = name,
