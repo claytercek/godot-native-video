@@ -26,6 +26,10 @@ const NativeVideoStreamPlayback = @import("native_video_stream_playback.zig");
 const present_pipeline = @import("present_pipeline.zig");
 const OutputMode = present_pipeline.OutputMode;
 const setDict = @import("godot_dict.zig").setDict;
+const object_id = @import("object_id.zig");
+const ObjectId = object_id.ObjectId;
+
+const log = std.log.scoped(.native_video_stream);
 
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStream, r.allocator, .auto);
@@ -46,6 +50,18 @@ pub fn unregister(r: *Registry) void {
     r.removeClass(NativeVideoStream);
 }
 
+/// One probed audio track, in plain Zig. `language`/`name` borrow storage
+/// owned by `owned_strings` below: the backend's AudioTrackInfo slices point
+/// at shim-owned storage that is freed when the probe closes the backend, so
+/// they are duplicated into that shared bucket instead.
+const AudioTrack = struct {
+    language: []const u8,
+    name: []const u8,
+    channels: i32,
+    sample_rate: i32,
+    is_default: bool,
+};
+
 allocator: Allocator,
 base: *VideoStream,
 
@@ -54,13 +70,25 @@ output_mode: OutputMode = .sdr,
 // Instance ids of playbacks instantiated from this stream. ObjectIDs, not
 // refs, on purpose: the stream must never extend a playback's lifetime.
 // Dead ids are pruned whenever the list is walked.
-playback_ids: std.ArrayList(u64) = .empty,
+playback_ids: std.ArrayList(ObjectId) = .empty,
 
-// The cached audio-track probe. null until getAudioTracks() has probed the
-// clip, whether or not the probe succeeded; a non-null (possibly empty) Array
-// afterwards. Distinguishes "not probed yet" from "probed and found no audio
+// The cached audio-track probe, held as plain Zig data rather than as a Godot
+// Array. A bound method returning an Array leaves through gdzig's ptrcall
+// path as a bitwise struct move with no refcount bump, so a typed GDScript
+// call would have the engine adopt -- and later release -- a reference this
+// struct still owns. getAudioTracks() therefore builds a fresh Array from
+// this table on every call and never hands out a cached one.
+audio_tracks: std.ArrayList(AudioTrack) = .empty,
+
+// Backs every `language`/`name` slice in audio_tracks: one bucket owning all
+// duplicated strings, freed in a single loop in destroy() rather than
+// per-field. AudioTrack itself holds plain borrowed slices into this.
+owned_strings: std.ArrayList([]u8) = .empty,
+
+// Set once getAudioTracks() has probed the clip, whether or not the probe
+// succeeded. Distinguishes "not probed yet" from "probed and found no audio
 // tracks" so a failed probe or an audio-less clip doesn't re-open the file.
-cached_audio_tracks: ?Array = null,
+audio_tracks_probed: bool = false,
 
 pub fn create(allocator: *Allocator) !*NativeVideoStream {
     const self = try allocator.create(NativeVideoStream);
@@ -74,7 +102,11 @@ pub fn create(allocator: *Allocator) !*NativeVideoStream {
 
 pub fn destroy(self: *NativeVideoStream, allocator: *Allocator) void {
     self.playback_ids.deinit(self.allocator);
-    if (self.cached_audio_tracks) |*a| a.deinit();
+    // owned_strings holds every duplicated language/name string exactly once;
+    // AudioTrack entries themselves borrow from it and own nothing.
+    for (self.owned_strings.items) |s| self.allocator.free(s);
+    self.owned_strings.deinit(self.allocator);
+    self.audio_tracks.deinit(self.allocator);
     self.base.destroy();
     allocator.destroy(self);
 }
@@ -95,10 +127,14 @@ pub fn hdrDecodeSupported(self: *NativeVideoStream) bool {
 // Resolve playback_ids to the playbacks still alive, pruning dead ids, using
 // gdzig's instanceFromId + typed downcast.
 // -----------------------------------------------------------------------
+// Single pass over playback_ids that compacts out dead ids as it goes. Pruning
+// in one walk keeps the "dead" and "skipped" cases identical -- there is no
+// separate post-prune pass where a resolution failure could skip a playback
+// without pruning it.
 fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
     var write: usize = 0;
     for (self.playback_ids.items) |id| {
-        if (resolvePlayback(id) != null) {
+        if (resolvePlayback(id)) |_| {
             self.playback_ids.items[write] = id;
             write += 1;
         }
@@ -106,8 +142,14 @@ fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
     self.playback_ids.shrinkRetainingCapacity(write);
 }
 
-fn resolvePlayback(id: u64) ?*NativeVideoStreamPlayback {
-    const obj = godot.general.instanceFromId(@intCast(id)) orelse return null;
+// resolvePlayback can, in principle, resolve an id whose object is already
+// freed: Godot only drops an id from ObjectDB after the extension's
+// free_instance callback returns, so the window between allocator.destroy(self)
+// in NativeVideoStreamPlayback.destroy and Godot finishing ~Object() still
+// resolves. Only reachable if the unref lands on a different thread than the
+// setOutputMode() caller, which normal single-threaded script execution never does.
+fn resolvePlayback(id: ObjectId) ?*NativeVideoStreamPlayback {
+    const obj = godot.general.instanceFromId(object_id.toEngineInt(id)) orelse return null;
     // Object -> engine VideoStreamPlayback (opaque cast) -> our bound instance.
     // godot.class.downcast rejects user-struct targets, so we go through the
     // engine class's asInstance() (the same seam Variant.as uses).
@@ -118,56 +160,92 @@ fn resolvePlayback(id: u64) ?*NativeVideoStreamPlayback {
 pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
     const om = OutputMode.fromInt(mode) orelse return;
     self.output_mode = om;
-    // Forward to every still-alive playback instantiated from this stream.
-    self.pruneDeadPlaybacks();
+    // Forward to every still-alive playback instantiated from this stream,
+    // pruning dead ids in the same pass: a SINGLE pass that compacts as it
+    // goes, so there is no separate post-prune pass where a resolution
+    // failure could skip a playback without pruning it.
+    var write: usize = 0;
     for (self.playback_ids.items) |id| {
         if (resolvePlayback(id)) |playback| {
-            playback.applyOutputMode(self.output_mode);
+            self.playback_ids.items[write] = id;
+            write += 1;
+            playback.applyOutputMode(om);
         }
     }
+    self.playback_ids.shrinkRetainingCapacity(write);
 }
 
 pub fn getOutputMode(self: *NativeVideoStream) i64 {
     return @intFromEnum(self.output_mode);
 }
 
-/// Lazy, cached probe of audio track metadata. Probes exactly once; the result
-/// (including an empty Array for a failed probe or a legitimately audio-less
-/// clip) is cached for every subsequent call. Returns an Array of Dictionaries;
-/// array position is the track index for VideoStreamPlayer.audio_track.
+/// Lazy, cached probe of audio track metadata. The clip is opened at most once
+/// (a failed probe or a legitimately audio-less clip still counts as probed, so
+/// the file is never re-opened). Returns a freshly built Array of Dictionaries
+/// -- empty if the probe failed -- where array position is the track index for
+/// VideoStreamPlayer.audio_track. The Array is built per call, never cached and
+/// handed out, because the caller takes ownership of it on the ptrcall path.
 pub fn getAudioTracks(self: *NativeVideoStream) Array {
-    if (self.cached_audio_tracks) |cached| {
-        return cached;
-    }
+    self.probeAudioTracksOnce();
 
-    // Lazy probe: open the clip briefly to read audio track metadata, then
-    // close the backend. The result (including empty, on failure) is cached.
     var tracks = Array.init();
+    _ = tracks.resize(@intCast(self.audio_tracks.items.len));
+    for (self.audio_tracks.items, 0..) |track, i| {
+        // `dict` and the Variant boxing it are both temporaries: `tracks.set`
+        // copies the Variant in, so the Array holds the only surviving
+        // reference and both locals are released before the next iteration.
+        var dict = Dictionary.init();
+        defer dict.deinit();
+        setDict(&dict, "language", track.language);
+        setDict(&dict, "name", track.name);
+        setDict(&dict, "channels", track.channels);
+        setDict(&dict, "sample_rate", track.sample_rate);
+        setDict(&dict, "default", track.is_default);
+        const dv = Variant.init(Dictionary, dict);
+        defer dv.deinit();
+        tracks.set(@intCast(i), dv);
+    }
+    return tracks;
+}
+
+/// Open the clip briefly, copy out its audio-track metadata, close it again.
+/// Runs at most once per stream; the cached table owns everything it holds.
+fn probeAudioTracksOnce(self: *NativeVideoStream) void {
+    if (self.audio_tracks_probed) return;
+    // Mark probed up front so a failed open doesn't retry on every call.
+    self.audio_tracks_probed = true;
 
     var file = self.base.getFile();
     defer file.deinit();
-    var backend = NativeVideoStreamPlayback.openBackendForPath(self.allocator, file) catch {
-        self.cached_audio_tracks = tracks; // empty on failure
-        return tracks;
-    };
+    var backend = NativeVideoStreamPlayback.openBackendForPath(self.allocator, file) catch return;
     defer backend.deinit();
 
     const count: usize = @intCast(@max(backend.audioTrackCount(), 0));
-    _ = tracks.resize(@intCast(count));
+    self.audio_tracks.ensureTotalCapacity(self.allocator, count) catch return;
+    // Two owned strings per track, reserved up front so the appends below
+    // cannot fail and a freshly duped string can never be dropped on the floor
+    // between dupe and hand-off to the bucket.
+    self.owned_strings.ensureTotalCapacity(self.allocator, count * 2) catch return;
     for (0..count) |i| {
         const dinfo = backend.audioTrackInfo(@intCast(i));
-        var dict = Dictionary.init();
-        setDict(&dict, "language", dinfo.language);
-        setDict(&dict, "name", dinfo.name);
-        setDict(&dict, "channels", dinfo.channels);
-        setDict(&dict, "sample_rate", dinfo.sample_rate);
-        setDict(&dict, "default", dinfo.is_default);
-        tracks.set(@intCast(i), Variant.init(Dictionary, dict));
+        // dinfo.language/.name borrow storage the backend frees on close()
+        // below, so the cache takes its own copies, owned by owned_strings.
+        // On OOM we keep the tracks recorded so far rather than failing the
+        // whole probe.
+        const language = self.allocator.dupe(u8, dinfo.language) catch return;
+        self.owned_strings.appendAssumeCapacity(language);
+        const name = self.allocator.dupe(u8, dinfo.name) catch return;
+        self.owned_strings.appendAssumeCapacity(name);
+        self.audio_tracks.appendAssumeCapacity(.{
+            .language = language,
+            .name = name,
+            .channels = dinfo.channels,
+            .sample_rate = dinfo.sample_rate,
+            .is_default = dinfo.is_default,
+        });
     }
 
     backend.close();
-    self.cached_audio_tracks = tracks;
-    return tracks;
 }
 
 /// Called by NativeVideoStreamPlayback? No — the engine calls this virtual on
@@ -179,7 +257,11 @@ pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     // Prune dead ids, then record the new playback's id so setOutputMode() can
     // reach it later. The list stays bounded across many instantiations.
     self.pruneDeadPlaybacks();
-    self.playback_ids.append(self.allocator, playback.base.getInstanceId()) catch {};
+    self.playback_ids.append(self.allocator, object_id.fromRaw(playback.base.getInstanceId())) catch {
+        // Degrade, don't fail: the playback still runs, but future
+        // setOutputMode() calls won't reach it until it's re-instantiated.
+        log.warn("failed to record playback id; it will not receive output_mode updates", .{});
+    };
 
     // VideoStream.getFile() holds the path the ResourceFormatLoader recorded.
     var file = self.base.getFile();

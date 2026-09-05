@@ -98,7 +98,14 @@ pub fn _load(
     _ = cache_mode;
     const stream = NativeVideoStream.create(&self.allocator) catch return Variant.nil;
     stream.base.setFile(path);
-    return Variant.init(*NativeVideoStream, stream);
+    // Two refs exist here: the one create() gave us, and the one
+    // Variant.init() took when it boxed the stream. Only the Variant's ref
+    // should outlive this call -- it is what we hand the engine -- so drop
+    // ours. Plain unreference(), not the `if (unreference()) destroy()` form:
+    // the Variant still holds a ref, so this can never reach zero.
+    const v = Variant.init(*NativeVideoStream, stream);
+    _ = stream.base.unreference();
+    return v;
 }
 
 const recognized_extensions = [_][:0]const u8{ "mp4", "mov", "m4v" };

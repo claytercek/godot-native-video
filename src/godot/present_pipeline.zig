@@ -94,6 +94,11 @@ const ResourceGeneration = struct {
     pipeline: Rid,
     sampler: Rid,
     ring: [ring_depth]RingSlot,
+    // The generation retired immediately before this one, if it had not yet
+    // been attached to a presented frame. Generations chain instead of racing
+    // for the single `pending_generation_release` slot, so a rebuild is always
+    // allowed and no closure is ever stranded.
+    prior: si.Closure = .{},
 };
 
 fn resourceGenerationTeardown(generation: *ResourceGeneration) void {
@@ -103,6 +108,9 @@ fn resourceGenerationTeardown(generation: *ResourceGeneration) void {
     if (generation.pipeline.isValid()) generation.rd.freeRid(generation.pipeline);
     if (generation.sampler.isValid()) generation.rd.freeRid(generation.sampler);
     if (generation.shader.isValid()) generation.rd.freeRid(generation.shader);
+    // Older generations are strictly older than this one, so they are safe to
+    // free once this one is. Runs last, exactly once.
+    generation.prior.call();
 }
 
 /// The pipeline's RD-resource lifecycle.
@@ -161,7 +169,16 @@ pub const PresentPipeline = struct {
     width: i32 = 0,
     height: i32 = 0,
     state: State = .unbuilt,
-    output_mode: OutputMode = .sdr,
+    // What script asked for. Written ONLY by setOutputMode(), so a build
+    // failure can never destroy the request and the property round-trips.
+    requested_output_mode: OutputMode = .sdr,
+    // The mode buildResources() actually builds. Follows the request, except
+    // that the build-failure fallback in ensureReady() reverts it to .sdr.
+    active_output_mode: OutputMode = .sdr,
+    // The mode of the resources currently live. Set only where state becomes
+    // .ready, cleared wherever those resources are released. Null means
+    // nothing is built (initial, headless, or after a failed build).
+    built_output_mode: ?OutputMode = null,
 
     pub fn init(allocator: std.mem.Allocator) PresentPipeline {
         return .{ .allocator = allocator, .push_scratch = PackedByteArray.init() };
@@ -175,8 +192,21 @@ pub const PresentPipeline = struct {
         return self.state == .ready;
     }
 
+    /// The REQUESTED output mode — exactly what was last passed to
+    /// setOutputMode(), never rewritten by the pipeline. May differ from what
+    /// is currently built: a request only takes effect at the next present(),
+    /// and a request that fails to build falls back to SDR.
     pub fn outputMode(self: *const PresentPipeline) OutputMode {
-        return self.output_mode;
+        return self.requested_output_mode;
+    }
+
+    /// The mode of the resources actually in use — what the viewport is being
+    /// fed right now. Null when nothing is built: before the first present(),
+    /// in headless mode, and after a failed build. Differs from outputMode()
+    /// while a request is pending, or until the request changes again if the
+    /// requested mode failed to build and we fell back to SDR.
+    pub fn builtOutputMode(self: *const PresentPipeline) ?OutputMode {
+        return self.built_output_mode;
     }
 
     /// Frames imported through the CPU-copy path so far this session (always
@@ -187,13 +217,18 @@ pub const PresentPipeline = struct {
         return 0;
     }
 
-    /// Set the output mode (SDR or HDR). Triggers a resource rebuild on the
-    /// next ensureReady() call — the ring texture format changes (rgba8 vs
-    /// rgba16f), so buildResources() rebuilds everything, shader included.
-    /// No-op if Disabled: there is nothing to rebuild.
+    /// Request an output mode (SDR or HDR). This is a REQUEST: it is applied
+    /// at the next ensureReady() (i.e. the next present()), which rebuilds
+    /// everything — the ring texture format changes (rgba8 vs rgba16f), so the
+    /// shader is recompiled too. If the requested mode fails to build, the
+    /// build falls back to SDR; the request itself is kept, and
+    /// builtOutputMode() reports what is actually in use. Repeating the
+    /// current request is a no-op, so a failed mode is not re-attempted every
+    /// time the property is written.
     pub fn setOutputMode(self: *PresentPipeline, mode: OutputMode) void {
-        if (mode != self.output_mode) {
-            self.output_mode = mode;
+        if (mode != self.requested_output_mode) {
+            self.requested_output_mode = mode;
+            self.active_output_mode = mode;
             if (self.state == .ready) {
                 self.state = .rebuild_pending;
             }
@@ -228,7 +263,20 @@ pub const PresentPipeline = struct {
         if (self.state == .ready or self.state == .rebuild_pending) {
             if (!self.retireResourceGeneration()) return false;
         }
-        return self.buildResources(width, height);
+        if (self.buildResources(width, height)) return true;
+        // The active mode does not build on this device (shader, pipeline, or
+        // an unsupported ring texture format). Retry once against the SDR
+        // baseline — never against "whatever built last", which would escalate
+        // a failed SDR build back up to HDR. A failed HDR switch degrades to
+        // SDR instead of going black. buildResources() frees the partial build
+        // at entry. If SDR fails too, that is a real problem: give up here
+        // rather than looping. The user's request is left untouched.
+        if (self.active_output_mode != .sdr) {
+            log.warn("{t} pipeline build failed — falling back to sdr output.", .{self.active_output_mode});
+            self.active_output_mode = .sdr;
+            return self.buildResources(width, height);
+        }
+        return false;
     }
 
     fn buildResources(self: *PresentPipeline, width: i32, height: i32) bool {
@@ -244,7 +292,7 @@ pub const PresentPipeline = struct {
         _ = self.push_scratch.resize(@intCast(push_constants.push_constant_size));
 
         // --- Compile the shader variant for the active output mode. ---
-        const want_hdr = self.output_mode == .hdr;
+        const want_hdr = self.active_output_mode == .hdr;
         const label = if (want_hdr) "nv12_to_rgb_hdr" else "nv12_to_rgb";
         self.shader = compileShader(rd, want_hdr);
         if (!self.shader.isValid()) return false;
@@ -280,6 +328,7 @@ pub const PresentPipeline = struct {
         // the player's cached texture picks up the real dimensions.
         self.getTexture().setTextureRdRid(self.ring[0].rgba_rid);
         self.state = .ready;
+        self.built_output_mode = self.active_output_mode;
         return true;
     }
 
@@ -545,22 +594,25 @@ pub const PresentPipeline = struct {
         }
         // Disabled is terminal — only downgrade Ready to Unbuilt.
         if (self.state == .ready) self.state = .unbuilt;
+        self.built_output_mode = null;
         self.width = 0;
         self.height = 0;
     }
 
     fn retireResourceGeneration(self: *PresentPipeline) bool {
         const rd = self.rd orelse return false;
-        if (self.pending_generation_release.func != null) {
-            log.err("cannot rebuild again before the previous GPU generation has been attached to a presented frame.", .{});
-            return false;
-        }
+        // A generation retired but not yet attached to a presented frame is
+        // chained onto this one rather than dropped: the retire ring only
+        // holds one closure per slot, so parking it separately would silently
+        // overwrite a live entry. On the catch path below, `prior` stays where
+        // it is — owned by exactly one holder at all times.
         const release = si.boxClosure(self.allocator, ResourceGeneration{
             .rd = rd,
             .shader = self.shader,
             .pipeline = self.pipeline,
             .sampler = self.sampler,
             .ring = self.ring,
+            .prior = self.pending_generation_release,
         }, resourceGenerationTeardown) catch {
             log.err("could not retain the current GPU resource generation for a safe rebuild.", .{});
             return false;
@@ -574,6 +626,7 @@ pub const PresentPipeline = struct {
         self.width = 0;
         self.height = 0;
         self.state = .unbuilt;
+        self.built_output_mode = null;
         self.pending_generation_release = release;
         return true;
     }
