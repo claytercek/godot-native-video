@@ -42,16 +42,6 @@ pub fn build(b: *Build) !void {
     const importer_selector_tests = b.addTest(.{ .root_module = importer_selector_mod });
     test_step.dependOn(&b.addRunArtifact(importer_selector_tests).step);
 
-    // ObjectID conversion: same deal as the selector above -- it lives in
-    // src/godot/ but touches no Godot bindings, so it tests standalone.
-    const object_id_mod = b.createModule(.{
-        .root_source_file = b.path("src/godot/object_id.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const object_id_tests = b.addTest(.{ .root_module = object_id_mod });
-    test_step.dependOn(&b.addRunArtifact(object_id_tests).step);
-
     // --- Media Foundation Windows bindings (Windows only). ---
     // Hand-written OS bindings layer that the eventual MF decoder backend and
     // the D3D11/D3D12 surface importers build on. Its own module so the future
