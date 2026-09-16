@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.1](https://github.com/claytercek/godot-native-video/compare/v0.3.0...v0.3.1) (2026-09-16)
+
+
+### Bug Fixes
+
+* bitcast object ids passed to instanceFromId ([9796c7c](https://github.com/claytercek/godot-native-video/commit/9796c7cd9c8d6388f711d741bacf0019ce1ce555)), closes [#22](https://github.com/claytercek/godot-native-video/issues/22)
+* **ci:** use fps_mode instead of ffmpeg's removed vsync option ([f84858d](https://github.com/claytercek/godot-native-video/commit/f84858d6f9ce3e815a4a5bccf24d2d32542079c1))
+* deinit the temporary Variants setDict boxes ([9b1eb13](https://github.com/claytercek/godot-native-video/commit/9b1eb13dd4e14939c23934c766bbad2e42d944d2))
+* keep output-mode changes from wedging the present pipeline ([1b4d955](https://github.com/claytercek/godot-native-video/commit/1b4d9553503f6eac0f22f101b37ede1b6b97e0b3))
+* keep the requested output mode when a build falls back ([0595ee5](https://github.com/claytercek/godot-native-video/commit/0595ee55e24fdb4c2e56d0644a1ab04167da02e9))
+* pin gdzig with the varcall return-value fix ([6cce286](https://github.com/claytercek/godot-native-video/commit/6cce286b8e8ad64e9edfa358ebfacb2bece09b29))
+* prune and forward output mode in one pass ([9015433](https://github.com/claytercek/godot-native-video/commit/90154339a53ebe347b7a0456ca422a270bcd8697))
+* release the stream reference _load hands to the engine ([2874651](https://github.com/claytercek/godot-native-video/commit/2874651eeda1771788a0a3831737733ffcaab687))
+* stop handing out the cached audio-track Array ([ea9d101](https://github.com/claytercek/godot-native-video/commit/ea9d1019ca312e4dee993897611c9c110f53fec7))
+
+
+### Refactoring
+
+* pool the probed audio-track strings ([49a6eba](https://github.com/claytercek/godot-native-video/commit/49a6eba2da13c85801a36b36d4c98d38bfb98d64))
+* trim object_id to the part that carries weight ([f74b13f](https://github.com/claytercek/godot-native-video/commit/f74b13f9ad06dcaa645515b9634bc7098e9fb830))
+* type playback ids so the bad cast can't come back ([331f66b](https://github.com/claytercek/godot-native-video/commit/331f66b62d8b23e3ba861fcd71492c766bad10bd))
+
 ## [0.3.0](https://github.com/claytercek/godot-native-video/compare/v0.2.1...v0.3.0) (2026-07-22)
 
 
