@@ -2,17 +2,17 @@ const std = @import("std");
 const Build = std.Build;
 const gdzig = @import("gdzig");
 
-// Downloaded by the build for bindgen when no local Godot binary is available
-// (e.g. CI, or a dev machine with neither -Dgodot-path nor -Dgodot-version
-// set). Resolves to the newest matching stable release.
-const default_godot_version = "4.6";
-
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
+    // gdzig no longer downloads Godot: it resolves the executable from
+    // -Dgodot-path, then GODOT_PATH, then `godot` on PATH, and panics at
+    // configure time if none of them hit. The binary is only used to run the
+    // demo and the smoke step -- bindings come from the Godot API description
+    // gdzig vendors -- but the lookup happens unconditionally, so every build
+    // host needs a Godot on hand.
     const env_godot = b.graph.environ_map.get("GODOT_PATH");
     const opt_godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot;
-    const opt_godot_version = b.option([]const u8, "godot-version", "Godot version to download for bindgen (e.g. `4.6`)");
     // Precision must match the Godot build the extension loads into: gdzig bakes
     // the Variant/real_t layout in at compile time, so a `float` extension is a
     // memory-layout mismatch in a `double` Godot. Prebuilt binaries ship `float`;
@@ -27,7 +27,7 @@ pub fn build(b: *Build) !void {
     });
 
     const core_tests = b.addTest(.{ .root_module = core_mod });
-    const test_step = b.step("test", "Run core unit tests (no Godot needed)");
+    const test_step = b.step("test", "Run core unit tests (no Godot code, but the build still resolves a Godot binary)");
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
     // Windows import-path selector: lives in src/godot/ (it picks between the
@@ -85,7 +85,8 @@ pub fn build(b: *Build) !void {
     }
 
     // --- Godot extension: gdzig glue + AVFoundation backend. ---
-    // Explicit path > explicit version > downloaded default version.
+    // Hand gdzig an explicit path when we have one; otherwise let it find
+    // `godot` on PATH itself.
     const gdzig_dep = if (opt_godot_path) |p| b.dependency("gdzig", .{
         .target = target,
         .optimize = optimize,
@@ -95,7 +96,6 @@ pub fn build(b: *Build) !void {
         .target = target,
         .optimize = optimize,
         .precision = opt_precision,
-        .@"godot-version" = opt_godot_version orelse default_godot_version,
     });
 
     // AVFoundation backend as its own module so src/avf can import "core"
