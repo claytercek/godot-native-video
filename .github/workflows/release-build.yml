@@ -29,13 +29,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+
+      # Never run here -- only present to satisfy gdzig's configure-time
+      # lookup, which panics when no Godot executable can be resolved.
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.1"
+          use-dotnet: false
 
       - name: Stage output dir
         run: mkdir -p staging
@@ -88,20 +94,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
-      # Zig's bundled MinGW toolchain can cross-compile every Windows target
-      # from Linux. GODOT_PATH is omitted so gdzig downloads the host Godot
-      # binary it needs for bindgen, as it does in test.yml.
+      # Never run here -- only present to satisfy gdzig's configure-time
+      # lookup, which panics when no Godot executable can be resolved.
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.1"
+          use-dotnet: false
+
       - name: Stage output dir
         run: mkdir -p staging
 
+      # Zig's bundled MinGW toolchain can cross-compile every Windows target
+      # from Linux.
       - name: Build Windows x86_64 (debug)
         run: |
           zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --summary all

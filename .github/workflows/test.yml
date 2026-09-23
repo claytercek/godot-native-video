@@ -7,8 +7,6 @@ on:
       - "src/**"
       - "project/**"
       - "tools/**"
-      - "vendor/**"
-      - ".gitmodules"
       - "build.zig"
       - "build.zig.zon"
       - ".github/workflows/test.yml"
@@ -18,19 +16,34 @@ on:
 
 jobs:
   test:
-    name: Build & Test (macOS)
+    name: Build & Test (macOS, Godot ${{ matrix.godot }})
     runs-on: macos-latest
+
+    # gdzig generates its bindings from the Godot 4.7 API description it
+    # vendors, but the extension still declares a 4.6 floor. Running the
+    # integration smoke on both ends keeps that floor honest: a 4.7-only
+    # method bind creeping into the extension fails the 4.6 leg.
+    strategy:
+      fail-fast: false
+      matrix:
+        godot: ["4.6.3", "4.7.1"]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+
+      # gdzig resolves a Godot executable at configure time and panics
+      # without one, so every job needs this even when it never runs Godot.
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: ${{ matrix.godot }}
+          use-dotnet: false
 
       - name: Run core tests
         run: zig build test --summary all
@@ -52,13 +65,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+
+      # Never run here -- only present to satisfy gdzig's configure-time
+      # lookup. The Windows leg has no Godot integration test.
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.1"
+          use-dotnet: false
 
       - name: Setup FFmpeg
         run: choco install ffmpeg --yes --no-progress
