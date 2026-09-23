@@ -54,6 +54,11 @@ Highlights:
   Zig versions are not supported: the extension is built against
   [gdzig](https://github.com/gdzig/gdzig), a pre-1.0 binding generator
   pinned to a specific commit and Zig version.
+- **A Godot executable resolvable at build time** (building from source
+  only; irrelevant if you use a released binary) — on `PATH`, or named by
+  `-Dgodot-path=/path/to/Godot` or `GODOT_PATH`. gdzig looks one up while
+  configuring the build and fails without it, even for steps that never
+  launch Godot.
 
 ## Releases
 
@@ -122,6 +127,14 @@ GPU→CPU readback added before present.
 - **HEVC on Windows** depends on a decoder MFT being registered on the
   machine (typically the "HEVC Video Extensions" package) — not present on
   every Windows installation.
+- **Three spurious errors on Godot 4.6**: gdzig generates its bindings from
+  Godot 4.7's API description, so at load it probes for three 4.7-only
+  interface functions (`variant_get_type_by_name`, `classdb_construct_object3`,
+  `classdb_register_extension_class6`). A 4.6 engine logs
+  `Attempt to get non-existent interface function` for each. gdzig never
+  calls them and falls back to the older entry points; playback is
+  unaffected. Nothing the extension binds changed hash between 4.6 and 4.7,
+  and CI runs the integration smoke against both.
 - **Single precision only (prebuilt binaries)**: the released libraries are
   built for the standard single-precision Godot. They will not load into a
   double-precision (`precision=double`) Godot build — the two disagree on the
@@ -177,7 +190,9 @@ track with a differing rate is refused.
 
 1. Install Zig 0.16.0 (`mise install` picks it up from
    [mise.toml](mise.toml), or install it directly — the system Zig on most
-   machines will be a newer, incompatible version).
+   machines will be a newer, incompatible version), and make a Godot
+   executable resolvable (`PATH`, `GODOT_PATH`, or `-Dgodot-path=`). Every
+   `zig build` invocation needs one, including `zig build test`.
 2. Build the extension:
 
    ```bash
@@ -187,8 +202,9 @@ track with a differing rate is refused.
    This compiles `libnative_video.dylib` (macOS) or `native_video.dll`
    (Windows) and installs it to `project/lib/`, where
    `project/native_video.gdextension` expects it. `build.zig` is the entire
-   build — one command, no other tooling required and no external SDK to
-   install; Media Foundation and D3D11/D3D12 are linked as system libraries.
+   build — one command, no build tooling beyond Zig and Godot, and no
+   external SDK to install; Media Foundation and D3D11/D3D12 are linked as
+   system libraries.
 
    Builds default to a stripped `ReleaseFast` binary (~380 KB on macOS
    arm64; Windows binary size hasn't been separately measured). Pass
@@ -199,7 +215,8 @@ track with a differing rate is refused.
    (default is `float`). The precision must match the Godot the extension
    loads into; a mismatch is a memory-layout error, not a graceful failure.
 
-3. Run the core unit tests (no Godot needed):
+3. Run the core unit tests (they exercise no Godot code, though the build
+   still resolves a Godot executable):
 
    ```bash
    zig build test
@@ -222,8 +239,8 @@ track with a differing rate is refused.
    ```
 
    (equivalent to `zig build run -- --smoke`, but headless). Both steps
-   download a matching Godot build for bindgen/running if `GODOT_PATH` or
-   `-Dgodot-path=/path/to/Godot` isn't set.
+   launch the Godot resolved from `-Dgodot-path`, `GODOT_PATH`, or `PATH`,
+   in that order.
 
 ## Project layout
 
