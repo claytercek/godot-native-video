@@ -344,14 +344,14 @@ pub const MfBackend = struct {
         const a = self.allocator;
         if (tag.len == 0) return a.dupe(u8, tag);
 
-        const tag_z = try a.dupeZ(u8, tag);
+        const tag_z = try a.dupeSentinel(u8, tag, 0);
         defer a.free(tag_z);
 
-        var wide: [com.LOCALE_NAME_MAX_LENGTH]u16 = [_]u16{0} ** com.LOCALE_NAME_MAX_LENGTH;
+        var wide: [com.LOCALE_NAME_MAX_LENGTH]u16 = @splat(0);
         if (com.MultiByteToWideChar(com.CP_UTF8, 0, tag_z.ptr, -1, &wide, @intCast(wide.len)) <= 0) {
             return a.dupe(u8, tag);
         }
-        var iso: [9]u16 = [_]u16{0} ** 9;
+        var iso: [9]u16 = @splat(0);
         if (com.GetLocaleInfoEx(@ptrCast(&wide), com.LOCALE_SISO639LANGNAME2, &iso, 9) <= 0) {
             return a.dupe(u8, tag);
         }

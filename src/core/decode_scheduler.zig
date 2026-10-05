@@ -70,7 +70,7 @@ pub const VideoFrame = backend_mod.VideoFrame;
 // debug / test builds and forced false in release, so release binaries cannot
 // accidentally run the synchronous path.
 pub const force_sync_available: bool = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => true,
+    .debug, .safe => true,
     else => false,
 };
 

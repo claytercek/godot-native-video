@@ -2,11 +2,11 @@
     .name = .native_video,
     .fingerprint = 0xd0024eda61a31314,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .gdzig = .{
-            .url = "git+https://github.com/gdzig/gdzig#a8ff0b7936cc3b8aab5d31763cd62e3c703afea7",
-            .hash = "godot-0.0.0-dev-q0GYjn5NCwA6OWJPs3Jsp5j9cRQdzFpaksugHOooJmes",
+            .url = "git+https://github.com/gdzig/gdzig#7e50fe4eeed6b6d6437e61706f25906f8a68eac7",
+            .hash = "godot-0.0.0-dev-q0GYjuSbwQBuWCSxjO_V1pYSWC7OEVw8d-bdpK1IFfea",
         },
     },
     .paths = .{

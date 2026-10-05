@@ -21,11 +21,11 @@ pub const ObjectId = enum(u64) { _ };
 
 /// Adopt a raw id as handed back by Object.getInstanceId().
 pub fn fromRaw(raw: u64) ObjectId {
-    return @enumFromInt(raw);
+    return @fromBackingInt(@intCast(raw));
 }
 
 /// Convert an ObjectID into the i64 that gdzig's generated utility-function
 /// bindings (instanceFromId) expect.
 pub fn toEngineInt(id: ObjectId) i64 {
-    return @bitCast(@intFromEnum(id));
+    return @bitCast(@backingInt(id));
 }

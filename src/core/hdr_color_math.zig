@@ -156,7 +156,7 @@ pub fn bt709Eotf(v: f64) f64 {
 // transfer: backend.TransferFunction.pq or .hlg, packed as the raw int this
 // mirrors in the compute shader's push constants (see push_constants.zig).
 // =======================================================================
-const transfer_pq: i32 = @intFromEnum(backend.TransferFunction.pq);
+const transfer_pq: i32 = @backingInt(backend.TransferFunction.pq);
 
 pub fn hdrToSdr(r: *f64, g: *f64, b: *f64, transfer: i32) void {
     // Step 1: EOTF (non-linear -> linear absolute luminance)

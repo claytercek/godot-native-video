@@ -3,7 +3,7 @@
 .godot/
 !project/.godot/
 
-# Zig 0.16 project-local dependency store
+# Zig project-local dependency store
 zig-pkg/
 project/.godot/*
 !project/.godot/extension_list.cfg
@@ -11,6 +11,11 @@ project/.godot/*
 # Zig build outputs
 .zig-cache/
 zig-out/
+
+# Personal devenv setup
+/devenv*
+/.devenv*
+/.envrc
 
 # Built extension library — keep the .gdextension manifest.
 project/lib/

@@ -4,7 +4,7 @@ const gdzig = @import("gdzig");
 
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast;
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
     // gdzig no longer downloads Godot: it resolves the executable from
     // -Dgodot-path, then GODOT_PATH, then `godot` on PATH, and panics at
     // configure time if none of them hit. The binary is only used to run the
@@ -80,7 +80,7 @@ pub fn build(b: *Build) !void {
         linkMfLibs(smoke_mod);
         const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
         const smoke_run = b.addRunArtifact(smoke_exe);
-        if (b.args) |args| smoke_run.addArgs(args);
+        smoke_run.addPassthruArgs();
         b.step("decode-smoke", "Pump the MF backend without Godot (pass a media path via -- <path>)").dependOn(&smoke_run.step);
     }
 
@@ -136,7 +136,7 @@ pub fn build(b: *Build) !void {
         .optimize = optimize,
     }) orelse return;
 
-    if (optimize != .Debug) {
+    if (optimize == .fast or optimize == .small) {
         extension.compile.root_module.strip = true;
         extension.compile.link_gc_sections = true;
     }
@@ -164,7 +164,7 @@ pub fn build(b: *Build) !void {
         linkAvfShim(b, smoke_mod);
         const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
         const smoke_run = b.addRunArtifact(smoke_exe);
-        smoke_run.addArg(b.pathFromRoot("project/synthetic.mp4"));
+        smoke_run.addFileArg(b.path("project/synthetic.mp4"));
         b.step("decode-smoke", "Pump the AVF backend without Godot").dependOn(&smoke_run.step);
     }
 
@@ -175,10 +175,8 @@ pub fn build(b: *Build) !void {
     run.addFileArg(gdzig_dep.namedLazyPath("godot"));
     run.addArg("--path");
     run.addDirectoryArg(b.path("./project"));
-    if (b.args) |args| {
-        run.addArg("--");
-        run.addArgs(args);
-    }
+    run.addArg("--");
+    run.addPassthruArgs();
     run.step.dependOn(&install.step);
     b.step("run", "Run the demo project in Godot (forwards `-- <args>` to the demo's CLI, e.g. a clip path or --file=<path>)").dependOn(&run.step);
 
@@ -187,11 +185,11 @@ pub fn build(b: *Build) !void {
     // cannot exercise texture import or the conversion shader.
     const smoke = Build.Step.Run.create(b, "run godot demo smoke test");
     smoke.addFileArg(gdzig_dep.namedLazyPath("godot"));
-    smoke.addArgs(&.{ "--log-file", b.pathFromRoot(".zig-cache/godot-smoke.log"), "--path" });
+    smoke.addArg("--path");
     smoke.addDirectoryArg(b.path("./project"));
     smoke.addArgs(&.{ "--", "--smoke" });
     smoke.step.dependOn(&install.step);
-    b.step("smoke", "Run the demo project's headless --smoke pass/fail check").dependOn(&smoke.step);
+    b.step("smoke", "Run the demo project's --smoke pass/fail check (requires display/GPU)").dependOn(&smoke.step);
 }
 
 /// Link the Windows system libraries the Media Foundation backend needs.

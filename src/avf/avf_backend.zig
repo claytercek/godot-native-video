@@ -122,19 +122,19 @@ extern fn nv_avf_frame_release(pixel_buffer: ?*anyopaque) void;
 
 // -----------------------------------------------------------------------
 // Colorimetry / pixel-format translation. The shim returns integer tags that
-// share numeric values with the core enums, so this is a direct @enumFromInt.
+// share numeric values with the core enums, so this is a direct @fromBackingInt.
 // -----------------------------------------------------------------------
 fn toColorimetry(c: c_colorimetry) core.Colorimetry {
     return .{
-        .matrix = @enumFromInt(@as(u8, @intCast(c.matrix))),
-        .primaries = @enumFromInt(@as(u8, @intCast(c.primaries))),
-        .transfer = @enumFromInt(@as(u8, @intCast(c.transfer))),
-        .range = @enumFromInt(@as(u8, @intCast(c.range))),
+        .matrix = @fromBackingInt(@intCast(@as(u8, @intCast(c.matrix)))),
+        .primaries = @fromBackingInt(@intCast(@as(u8, @intCast(c.primaries)))),
+        .transfer = @fromBackingInt(@intCast(@as(u8, @intCast(c.transfer)))),
+        .range = @fromBackingInt(@intCast(@as(u8, @intCast(c.range)))),
         .bit_depth = @intCast(c.bit_depth),
     };
 }
 
-// The @enumFromInt calls above (and the pixel_format one in
+// The @fromBackingInt calls above (and the pixel_format one in
 // nextVideoFrameImpl) only work because avf_shim.h documents its
 // NV_AVF_MATRIX_*/PRIM_*/TRANSFER_*/RANGE_*/PIXFMT_* tags as matching these
 // core enums' numeric values bit-for-bit. Since the header's #defines
@@ -142,31 +142,31 @@ fn toColorimetry(c: c_colorimetry) core.Colorimetry {
 // so either side moving out of step is a compile error, not a silently
 // wrong color on screen.
 comptime {
-    std.debug.assert(@intFromEnum(core.ColorMatrix.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.ColorMatrix.bt709) == 1);
-    std.debug.assert(@intFromEnum(core.ColorMatrix.bt601) == 2);
-    std.debug.assert(@intFromEnum(core.ColorMatrix.bt2020) == 3);
+    std.debug.assert(@backingInt(core.ColorMatrix.unspecified) == 0);
+    std.debug.assert(@backingInt(core.ColorMatrix.bt709) == 1);
+    std.debug.assert(@backingInt(core.ColorMatrix.bt601) == 2);
+    std.debug.assert(@backingInt(core.ColorMatrix.bt2020) == 3);
 
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt709) == 1);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt601_625) == 2);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt601_525) == 3);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.bt2020) == 4);
-    std.debug.assert(@intFromEnum(core.ColorPrimaries.dci_p3) == 5);
+    std.debug.assert(@backingInt(core.ColorPrimaries.unspecified) == 0);
+    std.debug.assert(@backingInt(core.ColorPrimaries.bt709) == 1);
+    std.debug.assert(@backingInt(core.ColorPrimaries.bt601_625) == 2);
+    std.debug.assert(@backingInt(core.ColorPrimaries.bt601_525) == 3);
+    std.debug.assert(@backingInt(core.ColorPrimaries.bt2020) == 4);
+    std.debug.assert(@backingInt(core.ColorPrimaries.dci_p3) == 5);
 
-    std.debug.assert(@intFromEnum(core.TransferFunction.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.TransferFunction.bt709) == 1);
-    std.debug.assert(@intFromEnum(core.TransferFunction.pq) == 2);
-    std.debug.assert(@intFromEnum(core.TransferFunction.hlg) == 3);
+    std.debug.assert(@backingInt(core.TransferFunction.unspecified) == 0);
+    std.debug.assert(@backingInt(core.TransferFunction.bt709) == 1);
+    std.debug.assert(@backingInt(core.TransferFunction.pq) == 2);
+    std.debug.assert(@backingInt(core.TransferFunction.hlg) == 3);
 
-    std.debug.assert(@intFromEnum(core.ColorRange.unspecified) == 0);
-    std.debug.assert(@intFromEnum(core.ColorRange.video) == 1);
-    std.debug.assert(@intFromEnum(core.ColorRange.full) == 2);
+    std.debug.assert(@backingInt(core.ColorRange.unspecified) == 0);
+    std.debug.assert(@backingInt(core.ColorRange.video) == 1);
+    std.debug.assert(@backingInt(core.ColorRange.full) == 2);
 
-    std.debug.assert(@intFromEnum(core.PixelFormat.unknown) == 0);
-    std.debug.assert(@intFromEnum(core.PixelFormat.nv12) == 1);
-    std.debug.assert(@intFromEnum(core.PixelFormat.x420) == 2);
-    std.debug.assert(@intFromEnum(core.PixelFormat.bgra8) == 3);
+    std.debug.assert(@backingInt(core.PixelFormat.unknown) == 0);
+    std.debug.assert(@backingInt(core.PixelFormat.nv12) == 1);
+    std.debug.assert(@backingInt(core.PixelFormat.x420) == 2);
+    std.debug.assert(@backingInt(core.PixelFormat.bgra8) == 3);
 }
 
 // Whether every field of `T` sits at the offset the shim's compiler put it
@@ -176,10 +176,10 @@ comptime {
 // changes at least one of these offsets, so it doesn't slip through.
 fn structMatchesAbi(comptime T: type, expected_size: usize, expected_offsets: []const usize) bool {
     if (expected_size != @sizeOf(T)) return false;
-    const fields = @typeInfo(T).@"struct".fields;
-    if (fields.len != expected_offsets.len) return false;
-    inline for (fields, 0..) |field, i| {
-        if (@offsetOf(T, field.name) != expected_offsets[i]) return false;
+    const field_names = @typeInfo(T).@"struct".field_names;
+    if (field_names.len != expected_offsets.len) return false;
+    inline for (field_names, 0..) |name, i| {
+        if (@offsetOf(T, name) != expected_offsets[i]) return false;
     }
     return true;
 }
@@ -273,7 +273,7 @@ pub const AvfBackend = struct {
         self.closeImpl();
 
         // NUL-terminate the path for the C boundary.
-        const path_z = try self.allocator.dupeZ(u8, url_or_path);
+        const path_z = try self.allocator.dupeSentinel(u8, url_or_path, 0);
         defer self.allocator.free(path_z);
 
         var info: c_open_info = undefined;
@@ -394,7 +394,7 @@ pub const AvfBackend = struct {
             .plane_slice = 0, // per-frame CVPixelBuffer handles
             .width = @intCast(cf.width),
             .height = @intCast(cf.height),
-            .pixel_format = @enumFromInt(@as(u8, @intCast(cf.pixel_format))),
+            .pixel_format = @fromBackingInt(@intCast(@as(u8, @intCast(cf.pixel_format)))),
             .color = toColorimetry(cf.color),
             // The CVPixelBufferRef carries a +1 retain; release drops it once.
             .release_hook = .{ .ctx = cf.pixel_buffer, .func = frameRelease },
@@ -527,7 +527,7 @@ fn logAudioNegotiation(track_index: i32, declared_channels: i32, declared_rate: 
 /// ptr+vtable interface. The returned Backend owns its heap allocation and the
 /// shim handle; Backend.deinit() releases both.
 pub fn create(allocator: std.mem.Allocator) !core.Backend {
-    if (builtin.mode == .Debug) assertAbi();
+    if (builtin.mode == .debug) assertAbi();
 
     const shim = nv_avf_create() orelse return error.ShimCreateFailed;
     errdefer nv_avf_destroy(shim);

@@ -170,7 +170,7 @@ test "multi-stream stress: per-stream order preserved, no corruption" {
 
         // Consume every frame of every stream on the main thread. Assert each
         // stream's frames arrive strictly in index order and carry that id.
-        var next_expected = [_]i32{0} ** kStreams;
+        var next_expected: [kStreams]i32 = @splat(0);
         var total_consumed: i32 = 0;
         const total_expected: i32 = kStreams * kFramesPerStream;
 
@@ -427,7 +427,7 @@ test "force-synchronous mode: no workers, deterministic in-order decode" {
         ));
     }
 
-    var expected = [_]i32{0} ** kStreams;
+    var expected: [kStreams]i32 = @splat(0);
     var consumed: i32 = 0;
     const total: i32 = kStreams * kFrames;
     while (consumed < total) {
