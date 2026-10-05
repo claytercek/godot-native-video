@@ -159,7 +159,7 @@ test "AudioRing round-trips interleaved stereo frames" {
     try std.testing.expectEqual(3, r.write(&in, 3));
     try std.testing.expectEqual(3, r.availableFrames());
 
-    var out = [_]f32{-1.0} ** 6;
+    var out: [6]f32 = @splat(-1.0);
     try std.testing.expectEqual(3, r.readFrames(&out, 3));
     try std.testing.expectEqualSlices(f32, &in, &out);
     try std.testing.expect(r.empty());
@@ -171,7 +171,7 @@ test "AudioRing underrun produces silence and reports real frame count" {
     const in = [_]f32{ 7, 8 };
     try std.testing.expectEqual(2, r.write(&in, 2));
 
-    var out = [_]f32{99.0} ** 5;
+    var out: [5]f32 = @splat(99.0);
     // Ask for 5 mono frames but only 2 are available.
     const real = r.readFrames(&out, 5);
     try std.testing.expectEqual(2, real);
@@ -186,7 +186,7 @@ test "AudioRing underrun produces silence and reports real frame count" {
 test "AudioRing full read on empty ring is all silence" {
     var r = try AudioRing.init(std.testing.allocator, 2, 16);
     defer r.deinit();
-    var out = [_]f32{1.0} ** 8;
+    var out: [8]f32 = @splat(1.0);
     try std.testing.expectEqual(0, r.readFrames(&out, 4));
     for (out) |v| {
         try std.testing.expectApproxEqAbs(0.0, v, 1e-6);
@@ -279,20 +279,20 @@ test "AudioRing peekFrames copies without consuming; consume advances exactly" {
     try std.testing.expectEqual(2, r.write(&in, 2));
 
     // Peek both frames — the cursor must not move.
-    var out = [_]f32{-1.0} ** 12;
+    var out: [12]f32 = @splat(-1.0);
     try std.testing.expectEqual(2, r.peekFrames(&out, 2));
     try std.testing.expectEqualSlices(f32, &in, &out);
     try std.testing.expectEqual(2, r.availableFrames());
 
     // A second peek returns identical data (proves non-destructive).
-    var out2 = [_]f32{0.0} ** 12;
+    var out2: [12]f32 = @splat(0.0);
     try std.testing.expectEqual(2, r.peekFrames(&out2, 2));
     try std.testing.expectEqualSlices(f32, &in, &out2);
 
     // Consume ONE frame; the second must remain buffered and readable.
     try std.testing.expectEqual(1, r.consume(1));
     try std.testing.expectEqual(1, r.availableFrames());
-    var out3 = [_]f32{0.0} ** 6;
+    var out3: [6]f32 = @splat(0.0);
     try std.testing.expectEqual(1, r.peekFrames(&out3, 1));
     try std.testing.expectEqualSlices(f32, in[6..12], &out3);
 }
@@ -365,13 +365,13 @@ test "AudioRing wraps around correctly" {
     defer r.deinit();
     const a = [_]f32{ 1, 2, 3, 4, 5, 6 };
     _ = r.write(&a, 6);
-    var out = [_]f32{0.0} ** 4;
+    var out: [4]f32 = @splat(0.0);
     _ = r.readFrames(&out, 4); // consume 4 -> head advances
     // Now write 6 more, forcing wrap-around past the buffer end.
     const b = [_]f32{ 10, 11, 12, 13, 14, 15 };
     const stored = r.write(&b, 6);
     // remaining: {5,6} + as many of b as fit.
-    var drained = [_]f32{0.0} ** 16;
+    var drained: [16]f32 = @splat(0.0);
     const real = r.readFrames(&drained, 2 + stored);
     try std.testing.expectEqual(2 + stored, real);
     try std.testing.expectApproxEqAbs(5.0, drained[0], 1e-6);

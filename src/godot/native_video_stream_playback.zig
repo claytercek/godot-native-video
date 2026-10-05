@@ -241,7 +241,7 @@ pub fn setOutputMode(self: *NativeVideoStreamPlayback, mode: i64) void {
 /// inspector round-trips what was set even if that mode failed to build. What
 /// is actually built is reported by get_color_info()'s "output_mode" key.
 pub fn getOutputMode(self: *NativeVideoStreamPlayback) i64 {
-    return @intFromEnum(self.present.outputMode());
+    return @backingInt(self.present.outputMode());
 }
 
 /// Applies an already-resolved OutputMode, bypassing the Variant boundary
@@ -340,10 +340,10 @@ pub fn _getMixRate(self: *NativeVideoStreamPlayback) i32 {
 pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     const color: Colorimetry = self.controller.color;
     var info = Dictionary.init();
-    setDict(&info, "matrix", @intFromEnum(color.matrix));
-    setDict(&info, "primaries", @intFromEnum(color.primaries));
-    setDict(&info, "transfer", @intFromEnum(color.transfer));
-    setDict(&info, "range", @intFromEnum(color.range));
+    setDict(&info, "matrix", @backingInt(color.matrix));
+    setDict(&info, "primaries", @backingInt(color.primaries));
+    setDict(&info, "transfer", @backingInt(color.transfer));
+    setDict(&info, "range", @backingInt(color.range));
     setDict(&info, "bit_depth", color.bit_depth);
     // Report the mode actually built, not the requested one, so callers can
     // distinguish an SDR clip in an HDR viewport vs a native HDR clip — and
@@ -351,7 +351,7 @@ pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     // built mode to report, so fall back to the request rather than inventing
     // an SDR default — that default was the regression this key had.
     const built = self.present.builtOutputMode() orelse self.present.outputMode();
-    setDict(&info, "output_mode", @intFromEnum(built));
+    setDict(&info, "output_mode", @backingInt(built));
     return info;
 }
 

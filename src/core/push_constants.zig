@@ -76,11 +76,11 @@ pub fn packPushConstants(
     const pc: PushConstants = .{
         .out_width = width,
         .out_height = height,
-        .matrix_select = @intFromEnum(color.matrix),
-        .range_select = @intFromEnum(color.range),
+        .matrix_select = @backingInt(color.matrix),
+        .range_select = @backingInt(color.range),
         .bit_depth = @bitCast(color.bit_depth),
-        .transfer_select = @intFromEnum(color.transfer),
-        .primaries_select = @intFromEnum(color.primaries),
+        .transfer_select = @backingInt(color.transfer),
+        .primaries_select = @backingInt(color.primaries),
     };
     @memcpy(region, std.mem.asBytes(&pc));
 }
@@ -117,7 +117,7 @@ test "Push constant: all-zero inputs produce zero-filled buffer" {
         .bit_depth = 0,
     };
 
-    const expected = [_]u8{0} ** push_constant_size;
+    const expected: [push_constant_size]u8 = @splat(0);
     try checkPackedBytes(0, 0, color, &expected);
 }
 
@@ -292,12 +292,12 @@ test "GLSL push-constant layout matches PushConstants field order" {
     const members = try parseGlslMembers(allocator, block);
     defer allocator.free(members);
 
-    const zig_fields = @typeInfo(PushConstants).@"struct".fields;
-    try testing.expectEqual(zig_fields.len, members.len);
+    const zig_info = @typeInfo(PushConstants).@"struct";
+    try testing.expectEqual(zig_info.field_names.len, members.len);
 
-    inline for (zig_fields, 0..) |field, i| {
+    inline for (zig_info.field_names, zig_info.field_types, 0..) |name, T, i| {
         const m = members[i];
-        try testing.expectEqualStrings(field.name, m.field_name);
-        try testing.expect(glslTypeMatchesZig(m.type_name, field.type));
+        try testing.expectEqualStrings(name, m.field_name);
+        try testing.expect(glslTypeMatchesZig(m.type_name, T));
     }
 }

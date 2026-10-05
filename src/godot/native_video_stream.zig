@@ -176,7 +176,7 @@ pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
 }
 
 pub fn getOutputMode(self: *NativeVideoStream) i64 {
-    return @intFromEnum(self.output_mode);
+    return @backingInt(self.output_mode);
 }
 
 /// Lazy, cached probe of audio track metadata. The clip is opened at most once

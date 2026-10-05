@@ -50,8 +50,8 @@ Highlights:
 - **Godot 4.6+**, **Forward+ or Mobile renderer** (the RenderingDevice
   renderers). The Compatibility/OpenGL renderer is not supported on either
   platform — there is no CPU present path for it.
-- **Zig 0.16.0** to build from source (see [mise.toml](mise.toml)). Other
-  Zig versions are not supported: the extension is built against
+- **Zig 0.17.0** to build from source. Other Zig versions are not supported:
+  the extension is built against
   [gdzig](https://github.com/gdzig/gdzig), a pre-1.0 binding generator
   pinned to a specific commit and Zig version.
 - **A Godot executable resolvable at build time** (building from source
@@ -77,8 +77,8 @@ automatically. It bundles:
 Both a debug and a release binary ship for every platform/arch, matching
 Godot's `template_debug`/`template_release` export split — the `.gdextension`
 routes each automatically based on how the exported project was built.
-Debug binaries are built with `-Doptimize=ReleaseSafe` (safety checks kept
-in, unstripped); release binaries with `-Doptimize=ReleaseFast` (stripped).
+Debug binaries are built with `-Doptimize=safe` (safety checks kept
+in, unstripped); release binaries with `-Doptimize=fast` (stripped).
 
 **iOS** builds and links (produces a valid iOS Mach-O `dylib`), but is not
 shipped in releases: Godot's iOS export conventionally expects a static
@@ -188,11 +188,11 @@ track with a differing rate is refused.
 
 ## Building from source
 
-1. Install Zig 0.16.0 (`mise install` picks it up from
-   [mise.toml](mise.toml), or install it directly — the system Zig on most
-   machines will be a newer, incompatible version), and make a Godot
-   executable resolvable (`PATH`, `GODOT_PATH`, or `-Dgodot-path=`). Every
-   `zig build` invocation needs one, including `zig build test`.
+1. Install Zig 0.17.0, then make a Godot executable resolvable via
+   `GODOT_PATH`, `-Dgodot-path=`, or `PATH`.
+   For example, with gdvm: `export GODOT_PATH="$(gdvm show 4.7.1)"`.
+   Or use the path to your installed Godot executable. Every `zig build`
+   invocation needs Godot, including `zig build test`.
 2. Build the extension:
 
    ```bash
@@ -206,9 +206,9 @@ track with a differing rate is refused.
    external SDK to install; Media Foundation and D3D11/D3D12 are linked as
    system libraries.
 
-   Builds default to a stripped `ReleaseFast` binary (~380 KB on macOS
+   Builds default to a stripped `fast` binary (~380 KB on macOS
    arm64; Windows binary size hasn't been separately measured). Pass
-   `-Doptimize=Debug` for a debug build, or `-Doptimize=ReleaseSmall` to
+   `-Doptimize=debug` for a debug build, or `-Doptimize=small` to
    trade some speed for an even smaller library.
 
    To target a double-precision Godot build, add `-Dprecision=double`
@@ -230,7 +230,7 @@ track with a differing rate is refused.
    zig build run
    ```
 
-   For a headless pass/fail check instead — loads a clip, plays it, polls
+   For an unattended pass/fail check instead — loads a clip, plays it, polls
    for a presented video texture, does a pixel-content sanity check, and
    quits with exit 0 (PASS) / 1 (FAIL) — use the dedicated smoke step:
 
@@ -238,8 +238,9 @@ track with a differing rate is refused.
    zig build smoke
    ```
 
-   (equivalent to `zig build run -- --smoke`, but headless). Both steps
-   launch the Godot resolved from `-Dgodot-path`, `GODOT_PATH`, or `PATH`,
+   (equivalent to `zig build run -- --smoke`; a display/GPU is required
+   to test texture import). Both steps launch the Godot resolved from
+   `-Dgodot-path`, `GODOT_PATH`, or `PATH`,
    in that order.
 
 ## Project layout
@@ -266,7 +267,7 @@ track with a differing rate is refused.
 - `project/` — the example/verification Godot project and dev harness.
   `main.gd`/`main.tscn` are a single entry point with two modes selected by
   CLI flag: interactive playback UI (`zig build run`, the default) or
-  headless pass/fail verification (`zig build smoke`, `--smoke`).
+  unattended pass/fail verification (`zig build smoke`, `--smoke`).
 - `addon/` — the shipped `.gdextension` template packaged into release
   zips (see [Releases](#releases) below). Not used by `zig build`; the dev
   harness in `project/` has its own `native_video.gdextension` pointing at

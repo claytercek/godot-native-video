@@ -35,7 +35,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # gdzig resolves a Godot executable at configure time and panics
       # without one, so every job needs this even when it never runs Godot.
@@ -69,7 +69,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # Never run here -- only present to satisfy gdzig's configure-time
       # lookup. The Windows leg has no Godot integration test.

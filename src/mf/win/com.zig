@@ -202,7 +202,7 @@ pub const PROPVARIANT = extern struct {
     },
 
     pub fn zeroed() PROPVARIANT {
-        return .{ .vt = 0, .val = .{ ._pad = [_]u8{0} ** 16 } };
+        return .{ .vt = 0, .val = .{ ._pad = @splat(0) } };
     }
 };
 

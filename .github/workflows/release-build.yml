@@ -33,7 +33,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # Never run here -- only present to satisfy gdzig's configure-time
       # lookup, which panics when no Godot executable can be resolved.
@@ -48,22 +48,22 @@ jobs:
 
       - name: Build macOS arm64 (debug)
         run: |
-          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe --summary all
+          zig build -Dtarget=aarch64-macos -Doptimize=safe --summary all
           cp project/lib/libnative_video.dylib staging/libnative_video.macos-arm64.debug.dylib
 
       - name: Build macOS arm64 (release)
         run: |
-          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast --summary all
+          zig build -Dtarget=aarch64-macos -Doptimize=fast --summary all
           cp project/lib/libnative_video.dylib staging/libnative_video.macos-arm64.release.dylib
 
       - name: Build macOS x86_64 (debug)
         run: |
-          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe --summary all
+          zig build -Dtarget=x86_64-macos -Doptimize=safe --summary all
           cp project/lib/libnative_video.dylib staging/libnative_video.macos-x86_64.debug.dylib
 
       - name: Build macOS x86_64 (release)
         run: |
-          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast --summary all
+          zig build -Dtarget=x86_64-macos -Doptimize=fast --summary all
           cp project/lib/libnative_video.dylib staging/libnative_video.macos-x86_64.release.dylib
 
       - name: Lipo universal macOS binaries
@@ -98,7 +98,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # Never run here -- only present to satisfy gdzig's configure-time
       # lookup, which panics when no Godot executable can be resolved.
@@ -115,32 +115,32 @@ jobs:
       # from Linux.
       - name: Build Windows x86_64 (debug)
         run: |
-          zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --summary all
+          zig build -Dtarget=x86_64-windows-gnu -Doptimize=safe --summary all
           cp project/lib/native_video.dll staging/native_video.windows.debug.x86_64.dll
 
       - name: Build Windows x86_64 (release)
         run: |
-          zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast --summary all
+          zig build -Dtarget=x86_64-windows-gnu -Doptimize=fast --summary all
           cp project/lib/native_video.dll staging/native_video.windows.release.x86_64.dll
 
       - name: Build Windows x86_32 (debug)
         run: |
-          zig build -Dtarget=x86-windows-gnu -Doptimize=ReleaseSafe --summary all
+          zig build -Dtarget=x86-windows-gnu -Doptimize=safe --summary all
           cp project/lib/native_video.dll staging/native_video.windows.debug.x86_32.dll
 
       - name: Build Windows x86_32 (release)
         run: |
-          zig build -Dtarget=x86-windows-gnu -Doptimize=ReleaseFast --summary all
+          zig build -Dtarget=x86-windows-gnu -Doptimize=fast --summary all
           cp project/lib/native_video.dll staging/native_video.windows.release.x86_32.dll
 
       - name: Build Windows arm64 (debug)
         run: |
-          zig build -Dtarget=aarch64-windows-gnu -Doptimize=ReleaseSafe --summary all
+          zig build -Dtarget=aarch64-windows-gnu -Doptimize=safe --summary all
           cp project/lib/native_video.dll staging/native_video.windows.debug.arm64.dll
 
       - name: Build Windows arm64 (release)
         run: |
-          zig build -Dtarget=aarch64-windows-gnu -Doptimize=ReleaseFast --summary all
+          zig build -Dtarget=aarch64-windows-gnu -Doptimize=fast --summary all
           cp project/lib/native_video.dll staging/native_video.windows.release.arm64.dll
 
       - name: Upload Windows binaries
