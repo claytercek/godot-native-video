@@ -48,15 +48,18 @@ const retire_ring = core.retire_ring;
 const shaders = core.shaders;
 
 const si = @import("surface_importer.zig");
+const preview_policy = @import("preview_presentation.zig");
 const PlaneTextures = si.PlaneTextures;
 
 // The concrete surface importer is chosen at comptime per platform. On Windows
 // the WindowsSurfaceImporter itself picks between the D3D12 zero-copy and
-// CPU-copy paths at runtime; on macOS the Metal importer is the only path.
-// Both present the same value-held interface (init/initialize/import/deinit),
-// so the pipeline below stays platform-agnostic.
+// CPU-copy paths at runtime; Linux uploads GStreamer's CPU-readable planes;
+// on macOS the Metal importer is the only path. All present the same
+// value-held interface, so the pipeline below stays platform-agnostic.
 const SurfaceImporter = if (builtin.os.tag == .windows)
     @import("windows_surface_importer.zig").WindowsSurfaceImporter
+else if (builtin.os.tag == .linux)
+    @import("linux_surface_importer.zig").LinuxSurfaceImporter
 else
     @import("metal_surface_importer.zig").MetalSurfaceImporter;
 
@@ -147,6 +150,7 @@ pub const PresentPipeline = struct {
 
     rd: ?*RenderingDevice = null, // borrowed: the global RD
     importer: ?SurfaceImporter = null, // built at first buildResources
+    last_submission: u64 = 0,
 
     shader: Rid = si.rid_invalid,
     pipeline: Rid = si.rid_invalid,
@@ -426,72 +430,61 @@ pub const PresentPipeline = struct {
         return true;
     }
 
-    /// Present one decoded frame: import its NV12 planes zero-copy, run the
-    /// NV12->RGB compute pass into the next RGBA ring slot, and retire surfaces
-    /// that have aged out. The frame's own release() is parked in the ring.
-    /// Returns true if a GPU pass ran.
+    /// Allocate a presentation identity independently of decoder timestamps.
+    pub fn nextSubmission(self: *PresentPipeline) u64 {
+        self.last_submission +%= 1;
+        if (self.last_submission == 0) self.last_submission = 1;
+        return self.last_submission;
+    }
+
+    /// Normal playback preserves delayed-import behavior and always consumes
+    /// frame, either immediately on failure or via the GPU retire ring.
     pub fn present(self: *PresentPipeline, frame: VideoFrame) bool {
-        if (!self.ensureImporter()) {
-            frame.release();
-            return false;
-        }
+        const result = self.presentSubmission(frame, self.nextSubmission(), false);
+        if (result != .presented) frame.release();
+        return result == .presented;
+    }
+
+    /// Preview retries borrow frame until matching output is ready. Only
+    /// .presented transfers ownership to the retire ring. Stale delayed output
+    /// is discarded without dispatch, even when its PTS equals this request.
+    pub fn presentPreview(self: *PresentPipeline, frame: VideoFrame, submission: u64) preview_policy.Result {
+        return self.presentSubmission(frame, submission, true);
+    }
+
+    fn presentSubmission(self: *PresentPipeline, frame: VideoFrame, submission: u64, require_match: bool) preview_policy.Result {
+        if (!self.ensureImporter()) return .failed;
         const importer = &self.importer.?;
 
-        // Age the retire-ring by one rendered frame BEFORE parking this frame's
-        // surfaces. advance() releases whatever was parked frame_latency ago.
         self.retire.advance();
-
-        // Import the decoder surface zero-copy into two RD plane textures,
-        // cropped to the frame's display aperture (see core.backend.CropRect)
-        // so decoder padding from a macroblock-aligned backing texture never
-        // reaches the planes the present shader samples.
-        var planes = switch (importer.import(frame)) {
+        var planes = switch (importer.import(frame, submission)) {
             .success => |value| value,
-            .not_ready, .bad_frame, .transient_failure, .capability_unavailable => {
-                frame.release();
-                return false;
-            },
+            .not_ready => return .pending,
+            .bad_frame, .transient_failure, .capability_unavailable => return .failed,
         };
+        if (require_match and !preview_policy.matches(submission, planes.metadata.submission)) {
+            planes.discard();
+            return .pending;
+        }
         if (!self.ensureReady(planes.width, planes.height)) {
             planes.discard();
-            frame.release();
-            return false;
+            return .failed;
         }
         const rd = self.rd.?;
 
-        // Advance the output ring slot.
         self.ring_index = (self.ring_index + 1) % ring_depth;
         const slot = self.ring[self.ring_index];
-
         const uniform_set = self.buildUniformSet(rd, planes, slot);
         if (!uniform_set.isValid()) {
             planes.discard();
-            frame.release();
-            return false;
+            return .failed;
         }
-
-        // Push constant: output dimensions + colorimetry + bit depth (std430,
-        // push_constant_size bytes). Repacked into the reusable, pre-sized
-        // scratch buffer — no per-frame alloc.
         self.packPushConstants(planes);
 
-        // --- ONE compute dispatch: NV12 -> RGBA into the engine-owned slot. ---
-        const gx: u32 = @intCast(@divTrunc(self.width + 7, 8));
-        const gy: u32 = @intCast(@divTrunc(self.height + 7, 8));
-
-        const cl = rd.computeListBegin();
-        rd.computeListBindComputePipeline(cl, self.pipeline);
-        rd.computeListBindUniformSet(cl, uniform_set, 0);
-        rd.computeListSetPushConstant(cl, self.push_scratch, push_constants.push_constant_size);
-        rd.computeListDispatch(cl, gx, gy, 1);
-        rd.computeListEnd();
-
-        // Re-point the stable output texture at the slot the dispatch wrote.
-        self.getTexture().setTextureRdRid(slot.rgba_rid);
-
-        // Park this frame's surfaces (plane textures + uniform set + the
-        // decoder VideoFrame's own release) for frame_latency frames. They are
-        // freed together once the GPU is guaranteed done (N frames later).
+        // Allocate/retain BEFORE dispatch or publishing Texture2DRD.changed.
+        // A synchronous signal handler can replace the owner's stream or free
+        // the player. The binding holds its playback alive during this call;
+        // no resource/frame ownership remains ambiguous across that signal.
         const release = si.boxClosure(self.allocator, RetireValue{
             .rd = rd,
             .uniform_set = uniform_set,
@@ -499,15 +492,25 @@ pub const PresentPipeline = struct {
             .frame = frame,
             .generation_release = self.pending_generation_release,
         }, retireTeardown) catch {
-            // Out of memory: free everything now rather than leaking.
-            if (uniform_set.isValid()) rd.freeRid(uniform_set);
-            planes.release.call();
-            frame.release();
-            return true;
+            rd.freeRid(uniform_set);
+            planes.discard();
+            return .failed;
         };
         self.pending_generation_release = .{};
+
+        const gx: u32 = @intCast(@divTrunc(self.width + 7, 8));
+        const gy: u32 = @intCast(@divTrunc(self.height + 7, 8));
+        const cl = rd.computeListBegin();
+        rd.computeListBindComputePipeline(cl, self.pipeline);
+        rd.computeListBindUniformSet(cl, uniform_set, 0);
+        rd.computeListSetPushConstant(cl, self.push_scratch, push_constants.push_constant_size);
+        rd.computeListDispatch(cl, gx, gy, 1);
+        rd.computeListEnd();
+
         self.retire.retain(release);
-        return true;
+        // Last access to pipeline state: this emits a synchronous signal.
+        self.getTexture().setTextureRdRid(slot.rgba_rid);
+        return .presented;
     }
 
     /// Build the uniform set binding the decoded planes and the output ring

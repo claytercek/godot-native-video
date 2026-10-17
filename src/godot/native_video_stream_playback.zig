@@ -31,20 +31,23 @@ const Registry = godot.extension.Registry;
 const VideoStreamPlayback = godot.class.VideoStreamPlayback;
 const Texture2d = godot.class.Texture2d;
 const AudioServer = godot.class.AudioServer;
+const Engine = godot.class.Engine;
+const SceneTree = godot.class.SceneTree;
+const Callable = godot.builtin.Callable;
 const ProjectSettings = godot.class.ProjectSettings;
 const String = godot.builtin.String;
 const Dictionary = godot.builtin.Dictionary;
 const PackedFloat32Array = godot.builtin.PackedFloat32Array;
 const Variant = godot.builtin.Variant;
 
-// Platform decode backend, resolved at comptime: Media Foundation on Windows,
-// AVFoundation elsewhere. Both expose `create(allocator) !Backend`. build.zig
-// wires exactly one of these named module imports per target, so the branch not
-// taken never references a module that isn't present for this platform.
-const platform_backend = if (builtin.os.tag == .windows)
-    @import("mf")
-else
-    @import("avf");
+// Each backend exposes `create(allocator) !Backend`. build.zig wires only
+// the target's named import; unsupported platforms fail explicitly.
+const platform_backend = switch (builtin.os.tag) {
+    .windows => @import("mf"),
+    .linux => @import("gst"),
+    .macos, .ios => @import("avf"),
+    else => @compileError("Native Video supports macOS, iOS, Windows, and Linux only"),
+};
 
 // Core types come through the "core" named module (build.zig-wired) so they
 // match the PlaybackController's module instance. A module's root restricts
@@ -63,6 +66,8 @@ const PresentPipeline = present_pipeline.PresentPipeline;
 const OutputMode = present_pipeline.OutputMode;
 const extension = @import("extension.zig");
 const setDict = @import("godot_dict.zig").setDict;
+const object_id = @import("object_id.zig");
+const preview_policy = @import("preview_presentation.zig");
 
 const log = std.log.scoped(.native_video);
 
@@ -70,6 +75,7 @@ pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStreamPlayback, r.allocator, .auto);
     class.addMethod("get_color_info", .auto);
     class.addMethod("get_cpu_copy_count", .auto);
+    class.addMethod("process_paused_preview", .auto);
     // output_mode (SDR,HDR) enum property, backed by set/get methods.
     class.addProperty("output_mode", .{
         .hint = .property_hint_enum,
@@ -85,6 +91,11 @@ allocator: Allocator,
 base: *VideoStreamPlayback,
 controller: PlaybackController,
 present: PresentPipeline,
+// A weak SceneTree ObjectID, never a raw callback pointer or owning reference.
+// Connected only until the latest paused seek/settle has been presented.
+preview_tree_id: ?object_id.ObjectId = null,
+preview: preview_policy.Pending(backend_mod.VideoFrame) = .{},
+preview_processing: bool = false,
 
 // GodotMixSink scratch buffer, resized as needed, never per-tick — the seam
 // costs nothing beyond the copy from the controller's plain-float scratch into
@@ -105,6 +116,7 @@ pub fn create(allocator: *Allocator) !*NativeVideoStreamPlayback {
 }
 
 pub fn destroy(self: *NativeVideoStreamPlayback, allocator: *Allocator) void {
+    self.cancelPreviewWork();
     // Unregister from the shared pool first: this blocks until any in-flight
     // decode slice for our stream completes and releases every buffered
     // surface, so no worker can touch our Backend after this returns.
@@ -209,6 +221,7 @@ fn reportLoadFailure(path: String, err: anyerror) void {
 
 /// Open the media file. Returns true on success. Called by NativeVideoStream.
 pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
+    self.cancelPreviewWork();
     var backend = openBackendForPath(self.allocator, path) catch |e| {
         self.flushWarnings();
         reportLoadFailure(path, e);
@@ -254,11 +267,13 @@ pub fn applyOutputMode(self: *NativeVideoStreamPlayback, mode: OutputMode) void 
 // --- VideoStreamPlayback overrides ---
 
 pub fn _play(self: *NativeVideoStreamPlayback) void {
+    self.cancelPreviewWork();
     self.controller.play(nowMs());
     self.flushWarnings();
 }
 
 pub fn _stop(self: *NativeVideoStreamPlayback) void {
+    self.cancelPreviewWork();
     self.controller.stop();
     self.flushWarnings();
 }
@@ -269,6 +284,7 @@ pub fn _isPlaying(self: *NativeVideoStreamPlayback) bool {
 
 pub fn _setPaused(self: *NativeVideoStreamPlayback, paused: bool) void {
     self.controller.setPaused(paused);
+    if (!paused) self.cancelPreviewWork();
 }
 
 pub fn _isPaused(self: *NativeVideoStreamPlayback) bool {
@@ -284,8 +300,93 @@ pub fn _getPlaybackPosition(self: *NativeVideoStreamPlayback) f64 {
 }
 
 pub fn _seek(self: *NativeVideoStreamPlayback, time: f64) void {
+    self.cancelPreviewWork();
     self.controller.seek(time, nowMs());
     self.flushWarnings();
+    if (self.controller.needsPausedPreview()) {
+        self.preview.begin(self.present.nextSubmission(), nowMs().ms);
+        self.connectPausedPreview();
+    }
+}
+
+/// VideoStreamPlayer stops _update while paused. Drive only outstanding seek
+/// previews from the SceneTree's normal main-thread frame signal instead.
+/// This callback carries no old target/frame; the controller owns the latest
+/// request and the scheduler serializes seek/flush against in-flight decode.
+pub fn processPausedPreview(self: *NativeVideoStreamPlayback) void {
+    // An ObjectID-bound callable is weak. Texture2DRD.changed is synchronous:
+    // its handlers may replace the stream/free the player during present().
+    // This owned Variant uses gdzig's RefCounted ownership adapter; its final
+    // deinit MUST happen after every other defer and every access to self.
+    var keep_alive = Variant.init(*VideoStreamPlayback, self.base);
+    defer keep_alive.deinit();
+    if (self.preview_processing) return;
+    self.preview_processing = true;
+    defer self.preview_processing = false;
+
+    const now = nowMs();
+    if (self.preview.expired(now.ms)) {
+        self.controller.cancelPausedPreview();
+        self.cancelPreviewWork();
+        log.err("Paused seek preview timed out waiting for presentation.", .{});
+        return;
+    }
+    if (self.controller.pollPausedPreview(now)) |frame| {
+        // An exact settle can supersede a keyframe still waiting in a delayed
+        // importer. Same PTS is not identity: allocate a fresh submission token.
+        self.preview.begin(self.present.nextSubmission(), now.ms);
+        self.preview.setFrame(frame);
+    }
+    if (self.preview.take()) |attempt| {
+        // Ownership is temporarily local, not in self.preview. Reentrant
+        // cancellation cannot release a frame already consumed by the GPU.
+        const result = self.present.presentPreview(attempt.frame, attempt.token);
+        const still_current = self.preview.token == attempt.token;
+        self.preview.finish(attempt, result);
+        if (result == .failed and still_current) {
+            self.controller.cancelPausedPreview();
+            log.err("Paused seek preview presentation failed.", .{});
+        }
+    }
+    self.flushWarnings();
+    if (self.preview.frame == null and !self.controller.needsPausedPreview()) self.cancelPreviewWork();
+}
+
+fn cancelPreviewWork(self: *NativeVideoStreamPlayback) void {
+    self.preview.cancel();
+    self.disconnectPausedPreview();
+}
+
+fn connectPausedPreview(self: *NativeVideoStreamPlayback) void {
+    if (self.preview_tree_id != null) return;
+    const main_loop = Engine.getMainLoop() orelse return;
+    const tree = SceneTree.downcast(main_loop) orelse return;
+    var callback = self.pausedPreviewCallback();
+    defer callback.deinit();
+    tree.connect(SceneTree.ProcessFrame, callback) catch {
+        log.err("Could not schedule paused seek preview.", .{});
+        return;
+    };
+    self.preview_tree_id = object_id.fromRaw(tree.getInstanceId());
+}
+
+fn disconnectPausedPreview(self: *NativeVideoStreamPlayback) void {
+    const id = self.preview_tree_id orelse return;
+    self.preview_tree_id = null;
+    const object = godot.general.instanceFromId(object_id.toEngineInt(id)) orelse return;
+    const tree = SceneTree.downcast(object) orelse return;
+    var callback = self.pausedPreviewCallback();
+    defer callback.deinit();
+    tree.disconnect(SceneTree.ProcessFrame, callback);
+}
+
+fn pausedPreviewCallback(self: *NativeVideoStreamPlayback) Callable {
+    // Do not use gdzig's fromClosure here: it destructs a cached static
+    // StringName. This name is borrowed and stays alive for the process.
+    return Callable.initObjectMethod(
+        godot.class.Object.upcast(self.base),
+        .fromComptimeLatin1("process_paused_preview"),
+    );
 }
 
 pub fn _setAudioTrack(self: *NativeVideoStreamPlayback, idx: i32) void {
@@ -307,6 +408,12 @@ pub fn _getTexture(self: *NativeVideoStreamPlayback) ?*Texture2d {
 }
 
 pub fn _update(self: *NativeVideoStreamPlayback, delta: f64) void {
+    // Also use the retained/token-checked path if an engine/client explicitly
+    // updates paused playback; never lose a delayed preview to normal present.
+    if (self.controller.paused) {
+        self.processPausedPreview();
+        return;
+    }
     const sink = self.mixSinkAdapter();
     const frame = self.controller.tick(delta, nowMs(), sink);
     self.flushWarnings();

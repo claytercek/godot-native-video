@@ -341,7 +341,7 @@ pub const MetalSurfaceImporter = struct {
     /// CVPixelBufferGetWidthOfPlane/HeightOfPlane calls below, both of which
     /// already read the cropped size), so there is no decoder padding here to
     /// crop away.
-    pub fn import(self: *MetalSurfaceImporter, frame_info: core.backend.VideoFrame) si.ImportResult {
+    pub fn import(self: *MetalSurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) si.ImportResult {
         var out: PlaneTextures = .{};
         if (self.texture_cache == null) return .transient_failure;
         if (frame_info.native_handle == null) return .bad_frame;
@@ -409,7 +409,7 @@ pub const MetalSurfaceImporter = struct {
         out.chroma = chroma;
         out.width = @intCast(CVPixelBufferGetWidthOfPlane(pb, 0));
         out.height = @intCast(CVPixelBufferGetHeightOfPlane(pb, 0));
-        out.metadata = si.PresentationMetadata.fromFrame(frame_info);
+        out.metadata = si.PresentationMetadata.fromFrame(frame_info, submission);
         out.release = release;
         return .{ .success = out };
     }

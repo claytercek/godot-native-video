@@ -84,6 +84,10 @@ pub const PlaybackController = struct {
     loaded: bool = false,
     playing: bool = false,
     paused: bool = false,
+    // A successful paused seek owes exactly one preview. A later seek flushes
+    // the scheduler queue before rearming this flag, so callbacks never retain
+    // frames or targets from an older seek generation.
+    preview_pending: bool = false,
     // Video EOS is tracked by the shared scheduler (atEnd()), so this only
     // tracks audio EOS for the end-of-playback condition.
     audio_eos: bool = false,
@@ -172,6 +176,7 @@ pub const PlaybackController = struct {
         // stop() or an EOS tick already reported (the common case) and only
         // fires for real on a close/unload that skipped both.
         self.audio_telemetry.reportFinal(self.last_tick_wall_ms, self.mediaTime());
+        self.preview_pending = false;
         if (self.stream) |s| {
             self.sched.unregisterStream(s);
             self.stream = null;
@@ -238,6 +243,7 @@ pub const PlaybackController = struct {
         }
 
         self.loaded = true;
+        self.preview_pending = false;
         self.position = 0.0;
         self.audio_eos = false;
         self.track_switch = .{};
@@ -267,6 +273,7 @@ pub const PlaybackController = struct {
         const was_playing = self.playing;
         self.playing = true;
         self.paused = false;
+        self.preview_pending = false;
         if (self.master()) |c| c.setPaused(false);
         // Resuming after a scrub: force an exact resolve at the last scrub target
         // so play starts from the precise frame, not an approximate keyframe one.
@@ -279,6 +286,7 @@ pub const PlaybackController = struct {
         self.audio_telemetry.reportFinal(self.last_tick_wall_ms, self.mediaTime());
         self.playing = false;
         self.paused = false;
+        self.preview_pending = false;
         self.audio_eos = false;
         self.position = 0.0;
         if (self.master()) |c| c.setTime(0.0);
@@ -296,6 +304,7 @@ pub const PlaybackController = struct {
 
     pub fn setPaused(self: *PlaybackController, paused: bool) void {
         self.paused = paused;
+        if (!paused) self.preview_pending = false;
         if (self.master()) |c| c.setPaused(paused);
     }
 
@@ -343,9 +352,42 @@ pub const PlaybackController = struct {
         if (!self.playing) self.reconcileAudioTrack();
     }
 
-    // Returns the frame to present this tick (BY VALUE), or null when not loaded
-    // / not playing / paused. The caller owns the GPU present and the frame's
-    // release().
+    /// Whether a paused seek still needs decoder delivery or its exact settle.
+    /// This does not acknowledge GPU presentation; the binding retains the
+    /// delivered frame until its own submission token has been presented.
+    /// Bindings must pump pollPausedPreview independently of player updates:
+    /// Godot's VideoStreamPlayer suppresses _update while paused.
+    pub fn needsPausedPreview(self: *const PlaybackController) bool {
+        return self.loaded and self.playing and self.paused and self.stream != null and
+            (self.preview_pending or self.scrubber.settle_pending);
+    }
+
+    pub fn cancelPausedPreview(self: *PlaybackController) void {
+        self.preview_pending = false;
+        self.scrubber.settle_pending = false;
+    }
+
+    /// Poll only seek-preview work, never the clock or audio sink. A worker may
+    /// still be producing the keyframe; an empty queue is not completion/EOS.
+    /// The returned frame transfers ownership exactly as tick() does.
+    pub fn pollPausedPreview(self: *PlaybackController, now: WallClockMs) ?VideoFrame {
+        if (!self.needsPausedPreview()) return null;
+        self.settleScrub(now);
+        self.reconcileAudioTrack();
+        if (!self.preview_pending) return null;
+        const stream = self.stream.?;
+        const frame = self.sched.nextFrame(stream) orelse {
+            if (self.sched.atEnd(stream)) self.preview_pending = false;
+            return null;
+        };
+        self.preview_pending = false;
+        self.position = frame.pts_seconds;
+        return frame;
+    }
+
+    // Returns the frame to present this tick (BY VALUE). Paused playback only
+    // emits a requested seek preview; ordinary pause holds the current image.
+    // The caller owns the GPU present and the frame's release().
     pub fn tick(self: *PlaybackController, delta_seconds: f64, now: WallClockMs, sink: MixSink) ?VideoFrame {
         const clock = self.master();
         if (!self.loaded or clock == null or self.stream == null) return null;
@@ -360,7 +402,8 @@ pub const PlaybackController = struct {
         // requested mid-pause (or during a scrub) is picked up promptly.
         self.reconcileAudioTrack();
 
-        if (!self.playing or self.paused) return null;
+        if (!self.playing) return null;
+        if (self.paused) return self.pollPausedPreview(now);
         const sched = self.sched;
 
         const media_now = self.advanceClock(delta_seconds, now, sink, c);
@@ -606,6 +649,7 @@ pub const PlaybackController = struct {
     }
 
     fn applyScrubResolve(self: *PlaybackController, resolve: ScrubResolve) void {
+        self.preview_pending = false; // invalidate any earlier unresolved preview
         const c = self.master() orelse return;
         if (self.stream == null) return;
         const target = @max(resolve.target_seconds, 0.0);
@@ -643,6 +687,7 @@ pub const PlaybackController = struct {
         c.setTime(resolved_target); // re-anchor only to a resolved/clamped target
         self.position = resolved_target;
         self.audio_eos = false;
+        self.preview_pending = self.paused;
 
         // Reconcile any pending track switch at the resolved position (position
         // == target here) so a new selection is primed at the correct spot.
@@ -722,6 +767,59 @@ pub const PlaybackController = struct {
         }
     };
 };
+
+test "paused preview: deterministic empty worker queue stays pending until delivery" {
+    // Model a busy producer without spawning a worker: it has not published
+    // its frame yet, and scheduler notification cannot start another producer.
+    var scheduler: DecodeScheduler = .{ .allocator = std.testing.allocator };
+    var stream: decode_scheduler.DecodeStream = .{ .busy = true };
+    var controller: PlaybackController = .{
+        .sched = &scheduler,
+        .stream = &stream,
+        .loaded = true,
+        .playing = true,
+        .paused = true,
+        .preview_pending = true,
+        .clock = ClockBridge.init(null, MonotonicClock.init(0), false),
+    };
+    const clock_before = controller.mediaTime();
+    try std.testing.expect(controller.pollPausedPreview(.{ .ms = 1000 }) == null);
+    try std.testing.expect(controller.needsPausedPreview());
+    try std.testing.expect(controller.pollPausedPreview(.{ .ms = 2000 }) == null);
+    try std.testing.expect(controller.needsPausedPreview());
+    var releases = std.atomic.Value(i32).init(0);
+    const support = @import("test_support.zig");
+    try std.testing.expect(stream.queue.push(.{
+        .pts_seconds = 2.5,
+        .release_hook = support.countingRelease(&releases),
+    }));
+    const frame = controller.pollPausedPreview(.{ .ms = 3000 }).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), controller.position, 1e-9);
+    try std.testing.expectEqual(clock_before, controller.mediaTime());
+    try std.testing.expect(!controller.needsPausedPreview());
+    try std.testing.expect(controller.pollPausedPreview(.{ .ms = 4000 }) == null);
+    try std.testing.expectEqual(@as(i32, 0), releases.load(.monotonic));
+    frame.release();
+    try std.testing.expectEqual(@as(i32, 1), releases.load(.monotonic));
+}
+
+test "paused preview: terminal presentation cancellation suppresses settle and dequeue" {
+    var stream: decode_scheduler.DecodeStream = .{};
+    var controller: PlaybackController = .{
+        .stream = &stream,
+        .loaded = true,
+        .playing = true,
+        .paused = true,
+        .preview_pending = true,
+    };
+    controller.scrubber.settle_pending = true;
+    controller.cancelPausedPreview();
+    try std.testing.expect(!controller.needsPausedPreview());
+    try std.testing.expect(!controller.scrubber.settle_pending);
+    // No scheduler is initialized: cancellation must not touch it or decode.
+    try std.testing.expect(controller.pollPausedPreview(.{ .ms = 10000 }) == null);
+    try std.testing.expect(controller.playing and controller.paused);
+}
 
 test {
     _ = @import("playback_controller_test.zig");

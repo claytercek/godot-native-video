@@ -27,6 +27,9 @@ const Rid = godot.builtin.Rid;
 const core = @import("core");
 
 pub const PresentationMetadata = struct {
+    /// Presentation identity, preserved through delayed importer slots. This is
+    /// not decoder state: equal PTS can belong to different seek submissions.
+    submission: u64 = 0,
     pts_seconds: f64 = 0.0,
     width: i32 = 0,
     height: i32 = 0,
@@ -34,8 +37,9 @@ pub const PresentationMetadata = struct {
     crop: core.backend.CropRect = .{},
     color: core.backend.Colorimetry = .{},
 
-    pub fn fromFrame(frame: core.backend.VideoFrame) PresentationMetadata {
+    pub fn fromFrame(frame: core.backend.VideoFrame, submission: u64) PresentationMetadata {
         return .{
+            .submission = submission,
             .pts_seconds = frame.pts_seconds,
             .width = frame.width,
             .height = frame.height,

@@ -17,6 +17,10 @@ windows.release.x86_32 = "native_video.windows.release.x86_32.dll"
 windows.debug.arm64 = "native_video.windows.debug.arm64.dll"
 windows.release.arm64 = "native_video.windows.release.arm64.dll"
 
+; Linux builds natively against system GStreamer (not bundled).
+linux.debug.x86_64 = "libnative_video.linux.debug.x86_64.so"
+linux.release.x86_64 = "libnative_video.linux.release.x86_64.so"
+
 ; iOS builds and links but is not shipped here: Godot's iOS export
 ; conventionally expects a static library / .xcframework, not a plain
 ; .dylib, and only link-time (not on-device runtime) has been verified.
