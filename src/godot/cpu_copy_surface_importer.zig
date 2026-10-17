@@ -123,7 +123,7 @@ pub const CpuCopySurfaceImporter = struct {
     /// into two RD plane textures via a GPU->CPU readback, CROPPED to `crop`
     /// (the frame's display aperture -- see core.backend.CropRect). Returns an
     /// A typed failure on error, or `not_ready` while the readback ring warms.
-    pub fn import(self: *CpuCopySurfaceImporter, frame_info: core.backend.VideoFrame) ImportResult {
+    pub fn import(self: *CpuCopySurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) ImportResult {
         var out: PlaneTextures = .{};
         if (!self.initialized) return .transient_failure;
         const handle = frame_info.native_handle orelse return .bad_frame;
@@ -188,7 +188,7 @@ pub const CpuCopySurfaceImporter = struct {
             null,
         );
         write.has_data = true;
-        write.metadata = si.PresentationMetadata.fromFrame(frame_info);
+        write.metadata = si.PresentationMetadata.fromFrame(frame_info, submission);
 
         // --- Read back the oldest slot. Still warming up: nothing old enough.
         const read = &self.ring[@as(usize, @intCast(read_slot))];

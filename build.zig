@@ -4,6 +4,10 @@ const gdzig = @import("gdzig");
 
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
+    switch (target.result.os.tag) {
+        .linux, .windows, .macos, .ios => {},
+        else => return error.UnsupportedPlatform,
+    }
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
     // gdzig no longer downloads Godot: it resolves the executable from
     // -Dgodot-path, then GODOT_PATH, then `godot` on PATH, and panics at
@@ -27,8 +31,22 @@ pub fn build(b: *Build) !void {
     });
 
     const core_tests = b.addTest(.{ .root_module = core_mod });
-    const test_step = b.step("test", "Run core unit tests (no Godot code, but the build still resolves a Godot binary)");
+    const test_step = b.step("test", "Run core, platform backend, and pure importer tests (build resolves a Godot binary)");
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
+
+    const paused_preview_mod = b.createModule(.{
+        .root_source_file = b.path("tools/core_paused_preview_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core_mod }},
+    });
+    const paused_preview_tests = b.addTest(.{
+        .root_module = paused_preview_mod,
+        .filters = &.{"paused preview:"},
+    });
+    const paused_preview_run = b.addRunArtifact(paused_preview_tests);
+    b.step("test-paused-preview", "Run focused core paused-seek preview tests").dependOn(&paused_preview_run.step);
+    test_step.dependOn(&paused_preview_run.step);
 
     // Windows import-path selector: lives in src/godot/ (it picks between the
     // D3D12 zero-copy and CPU-copy surface importers) but is a pure function
@@ -41,6 +59,32 @@ pub fn build(b: *Build) !void {
     });
     const importer_selector_tests = b.addTest(.{ .root_module = importer_selector_mod });
     test_step.dependOn(&b.addRunArtifact(importer_selector_tests).step);
+
+    // Preview submission/retry ownership is pure policy: test delayed importer
+    // tokens and retained-frame release without Godot or platform backends.
+    const preview_presentation_mod = b.createModule(.{
+        .root_source_file = b.path("src/godot/preview_presentation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const preview_presentation_tests = b.addTest(.{ .root_module = preview_presentation_mod });
+    const preview_presentation_run = b.addRunArtifact(preview_presentation_tests);
+    b.step("test-preview-presentation", "Run pure paused-preview presentation policy tests").dependOn(&preview_presentation_run.step);
+    test_step.dependOn(&preview_presentation_run.step);
+
+    // Linux plane packing is pure Zig: exercise stride validation and P010
+    // normalization without needing a RenderingDevice or GStreamer runtime.
+    if (target.result.os.tag == .linux) {
+        const packing_mod = b.createModule(.{
+            .root_source_file = b.path("src/godot/linux_plane_packing.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const packing_tests = b.addTest(.{ .root_module = packing_mod });
+        const packing_run = b.addRunArtifact(packing_tests);
+        b.step("test-linux-packing", "Run pure Linux NV12/P010 plane packing tests").dependOn(&packing_run.step);
+        test_step.dependOn(&packing_run.step);
+    }
 
     // --- Media Foundation Windows bindings (Windows only). ---
     // Hand-written OS bindings layer that the eventual MF decoder backend and
@@ -84,7 +128,57 @@ pub fn build(b: *Build) !void {
         b.step("decode-smoke", "Pump the MF backend without Godot (pass a media path via -- <path>)").dependOn(&smoke_run.step);
     }
 
-    // --- Godot extension: gdzig glue + AVFoundation backend. ---
+    // --- GStreamer Linux backend, shared by the extension and CLI harness. ---
+    var gst_mod: ?*Build.Module = null;
+    if (target.result.os.tag == .linux) {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/gst/gst_backend.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "core", .module = core_mod }},
+        });
+        m.addIncludePath(b.path("src/gst"));
+        m.addCSourceFile(.{ .file = b.path("src/gst/gst_shim.c"), .flags = &.{"-std=c11"} });
+        linkGstLibs(m);
+        gst_mod = m;
+
+        const gst_tests = b.addTest(.{ .root_module = m });
+        const gst_test_run = b.addRunArtifact(gst_tests);
+        b.step("test-gst", "Run Linux GStreamer backend tests").dependOn(&gst_test_run.step);
+        test_step.dependOn(&gst_test_run.step);
+
+        const smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/gst/decode_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "gst", .module = m },
+            },
+        });
+        linkGstLibs(smoke_mod);
+        const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
+        const smoke_run = b.addRunArtifact(smoke_exe);
+        smoke_run.addPassthruArgs();
+        b.step("decode-smoke", "Pump the GStreamer backend without Godot (pass a media path via -- <path>)").dependOn(&smoke_run.step);
+
+        const regression_mod = b.createModule(.{
+            .root_source_file = b.path("tools/linux_decode_regression.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "core", .module = core_mod },
+                .{ .name = "gst", .module = m },
+            },
+        });
+        linkGstLibs(regression_mod);
+        const regression_exe = b.addExecutable(.{ .name = "linux-decode-regression", .root_module = regression_mod });
+        const regression_run = b.addRunArtifact(regression_exe);
+        regression_run.addPassthruArgs();
+        b.step("linux-decode-regression", "Run the Linux backend acceptance harness (pass fixture arguments after --)").dependOn(&regression_run.step);
+    }
+
+    // --- Godot extension: gdzig glue + the target's media backend. ---
     // Hand gdzig an explicit path when we have one; otherwise let it find
     // `godot` on PATH itself.
     const gdzig_dep = if (opt_godot_path) |p| b.dependency("gdzig", .{
@@ -98,18 +192,15 @@ pub fn build(b: *Build) !void {
         .precision = opt_precision,
     });
 
-    // AVFoundation backend as its own module so src/avf can import "core"
-    // without escaping a module root. Off Windows only — the extension's backend
-    // seam picks `mf` on Windows and `avf` elsewhere at comptime, and a named
-    // module import must exist for exactly the platform that imports it.
-    const avf_mod = if (target.result.os.tag == .windows) null else b.createModule(.{
+    // AVFoundation is Apple-only, not a fallback for every non-Windows OS.
+    const avf_mod = if (target.result.os.tag == .macos or target.result.os.tag == .ios) b.createModule(.{
         .root_source_file = b.path("src/avf/avf_backend.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core", .module = core_mod },
         },
-    });
+    }) else null;
 
     const ext_mod = b.createModule(.{
         .root_source_file = b.path("src/godot/extension.zig"),
@@ -126,6 +217,10 @@ pub fn build(b: *Build) !void {
     // comptime switch in native_video_stream_playback.zig has its import.
     if (mf_mod) |m| ext_mod.addImport("mf", m);
     if (avf_mod) |m| ext_mod.addImport("avf", m);
+    if (gst_mod) |m| {
+        ext_mod.addImport("gst", m);
+        linkGstLibs(ext_mod);
+    }
 
     const extension = gdzig.addExtension(b, .{
         .name = "native_video",
@@ -187,9 +282,26 @@ pub fn build(b: *Build) !void {
     smoke.addFileArg(gdzig_dep.namedLazyPath("godot"));
     smoke.addArg("--path");
     smoke.addDirectoryArg(b.path("./project"));
+    // The Linux CI/render smoke checks textures and mixer progress, not an
+    // audio device. Avoid unrelated ALSA/PulseAudio failures on build hosts.
+    if (target.result.os.tag == .linux) smoke.addArgs(&.{ "--audio-driver", "Dummy" });
     smoke.addArgs(&.{ "--", "--smoke" });
     smoke.step.dependOn(&install.step);
     b.step("smoke", "Run the demo project's --smoke pass/fail check (requires display/GPU)").dependOn(&smoke.step);
+}
+
+/// Resolve both headers (including @cImport translation) and link flags from
+/// the same pkg-config packages. GStreamer is a system dependency on Linux;
+/// forcing pkg-config prevents a missing development package going unnoticed.
+/// The backend module carries this configuration into tests and the extension.
+pub fn linkGstLibs(mod: *Build.Module) void {
+    mod.link_libc = true;
+    for ([_][]const u8{
+        "gstreamer-1.0",       "gstreamer-app-1.0",     "gstreamer-video-1.0",
+        "gstreamer-audio-1.0", "gstreamer-pbutils-1.0",
+    }) |lib| {
+        mod.linkSystemLibrary(lib, .{ .use_pkg_config = .force });
+    }
 }
 
 /// Link the Windows system libraries the Media Foundation backend needs.

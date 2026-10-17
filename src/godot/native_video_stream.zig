@@ -33,10 +33,9 @@ const log = std.log.scoped(.native_video_stream);
 
 pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStream, r.allocator, .auto);
-    // On macOS (and iOS) Metal-accelerated VideoToolbox produces 10-bit
-    // biplanar surfaces we import zero-copy: always supported here. Registered
-    // as an instance method (gdzig has no static-method seam); GDScript calls
-    // it on an instance.
+    // Reports 10-bit decode/import capability, not HDR display support or
+    // availability of a decoder for a particular codec. Registered as an
+    // instance method (gdzig has no static-method seam).
     class.addMethod("hdr_decode_supported", .auto);
     class.addMethod("get_audio_tracks", .auto);
     // output_mode (SDR,HDR) enum property, backed by set/get methods.
@@ -111,12 +110,13 @@ pub fn destroy(self: *NativeVideoStream, allocator: *Allocator) void {
     allocator.destroy(self);
 }
 
-/// True only on targets where this extension has both a 10-bit hardware decode
-/// path and a matching P010/x420 surface importer.
+/// True on targets with a 10-bit decode path and matching P010/x420 importer.
+/// Linux uses CPU upload; installed GStreamer plugins determine codec support.
+/// This does not report hardware decoding or HDR display availability.
 pub fn hdrDecodeSupported(self: *NativeVideoStream) bool {
     _ = self;
     return switch (builtin.os.tag) {
-        .macos, .ios, .windows => true,
+        .macos, .ios, .windows, .linux => true,
         else => false,
     };
 }

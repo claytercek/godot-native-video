@@ -404,7 +404,7 @@ pub const D3D12SurfaceImporter = struct {
     /// into two RD plane textures, zero-copy (GPU-only), CROPPED to `crop`
     /// (the frame's display aperture -- see core.backend.CropRect). Does NOT
     /// take ownership of the decoder texture.
-    pub fn import(self: *D3D12SurfaceImporter, frame_info: core.backend.VideoFrame) si.ImportResult {
+    pub fn import(self: *D3D12SurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) si.ImportResult {
         var out: PlaneTextures = .{};
         if (!self.initialized) return .transient_failure;
         const handle = frame_info.native_handle orelse return .bad_frame;
@@ -589,7 +589,7 @@ pub const D3D12SurfaceImporter = struct {
         out.chroma = chroma;
         out.width = @intCast(rc.luma_width);
         out.height = @intCast(rc.luma_height);
-        out.metadata = si.PresentationMetadata.fromFrame(frame_info);
+        out.metadata = si.PresentationMetadata.fromFrame(frame_info, submission);
         out.release = release;
         self.imported_once = true;
         return .{ .success = out };

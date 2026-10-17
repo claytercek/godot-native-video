@@ -94,11 +94,11 @@ pub const WindowsSurfaceImporter = struct {
         };
     }
 
-    pub fn import(self: *WindowsSurfaceImporter, frame_info: core.backend.VideoFrame) ImportResult {
+    pub fn import(self: *WindowsSurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) ImportResult {
         const c = &(self.concrete orelse return .transient_failure);
         switch (c.*) {
             .d3d12 => |*imp| {
-                const result = imp.import(frame_info);
+                const result = imp.import(frame_info, submission);
                 switch (result) {
                     .capability_unavailable => {},
                     else => return result,
@@ -106,9 +106,9 @@ pub const WindowsSurfaceImporter = struct {
                 log.warn("D3D12 zero-copy capability unavailable; falling back to CPU-copy import permanently.", .{});
                 const rd = self.rd orelse return .transient_failure;
                 if (!self.degradeToCpuCopy(rd)) return .transient_failure;
-                return self.concrete.?.cpu_copy.import(frame_info);
+                return self.concrete.?.cpu_copy.import(frame_info, submission);
             },
-            .cpu_copy => |*imp| return imp.import(frame_info),
+            .cpu_copy => |*imp| return imp.import(frame_info, submission),
         }
     }
 
