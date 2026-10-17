@@ -5,28 +5,32 @@ on:
     branches: ["main"]
     paths:
       - "src/**"
+      - "tests/**"
+      - "addon/**"
       - "project/**"
       - "tools/**"
       - "build.zig"
       - "build.zig.zon"
-      - ".github/workflows/test.yml"
+      - ".github/workflows/**"
   pull_request:
     branches: ["main"]
   workflow_dispatch:
 
 jobs:
   test:
-    name: Build & Test (macOS, Godot ${{ matrix.godot }})
-    runs-on: macos-latest
-
-    # gdzig generates its bindings from the Godot 4.7 API description it
-    # vendors, but the extension still declares a 4.6 floor. Running the
-    # integration smoke on both ends keeps that floor honest: a 4.7-only
-    # method bind creeping into the extension fails the 4.6 leg.
+    name: Build & Smoke (${{ matrix.os }}, Godot ${{ matrix.godot }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    # Bindings target 4.7; the rendered smoke also enforces the 4.6 floor.
+    # Native tests do not run Godot, so run them only on the primary version.
     strategy:
       fail-fast: false
       matrix:
-        godot: ["4.6.3", "4.7.1"]
+        os: [macos-latest, ubuntu-22.04, windows-latest]
+        godot: ["4.7.2", "4.6.3"]
 
     steps:
       - name: Checkout
@@ -37,64 +41,116 @@ jobs:
         with:
           version: 0.17.0
 
-      # gdzig resolves a Godot executable at configure time and panics
-      # without one, so every job needs this even when it never runs Godot.
-      - name: Setup Godot
+      # gdzig resolves Godot at build configure time, even for native tests.
+      - name: Setup stock Godot
         uses: chickensoft-games/setup-godot@v2
         with:
           version: ${{ matrix.godot }}
           use-dotnet: false
 
-      - name: Run core tests
-        run: zig build test --summary all
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Record versions
+        run: |
+          mkdir -p ci-logs
+          { zig version; godot --version; python --version; } 2>&1 | tee ci-logs/versions.log
+
+      - name: Test shared smoke runner
+        if: runner.os == 'Linux' && matrix.godot == '4.7.2'
+        timeout-minutes: 1
+        run: python -m unittest discover -s tools -p test_run_smoke.py -v 2>&1 | tee ci-logs/smoke-runner-tests.log
+
+      - name: Install Linux GStreamer and software Vulkan
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # Ubuntu runner's LLVM unwinder conflicts with libunwind-dev.
+          sudo apt-get remove -y libunwind-14-dev
+          sudo apt-get install -y pkg-config libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-tools \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            xvfb xauth mesa-vulkan-drivers libvulkan1
+          pkg-config --modversion gstreamer-1.0 gstreamer-app-1.0 \
+            gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-pbutils-1.0 | tee ci-logs/gstreamer-versions.log
+          gst-inspect-1.0 avdec_h264 > ci-logs/h264-decoder.log
+          gst-inspect-1.0 avdec_aac > ci-logs/aac-decoder.log
 
       - name: Build extension
-        run: zig build --summary all
+        run: zig build --summary all 2>&1 | tee ci-logs/build.log
 
-      - name: Decode smoke test
-        run: zig build decode-smoke
+      - name: Reject unresolved Linux symbols
+        if: runner.os == 'Linux'
+        run: |
+          ldd -r project/lib/libnative_video.so 2>&1 | tee ci-logs/ldd.log
+          if grep -E 'undefined symbol|not found' ci-logs/ldd.log; then exit 1; fi
 
-      - name: Godot integration smoke test
+      # One short synthetic pixel/progress smoke on every OS/version, not the
+      # extended fixture suite. No headless or Compatibility rendering fallback.
+      - name: Rendered Godot smoke
         timeout-minutes: 2
-        run: zig build smoke
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+              export VK_ICD_FILENAMES="$VK_DRIVER_FILES" LIBGL_ALWAYS_SOFTWARE=1
+              test -f "$VK_DRIVER_FILES"
+              export XDG_RUNTIME_DIR="$RUNNER_TEMP/native-video-runtime"
+              mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+              prefix=(xvfb-run -a -e ci-logs/xvfb.log -s '-screen 0 640x480x24 -nolisten tcp')
+              driver=vulkan
+              display=(--display-driver x11)
+              ;;
+            macOS)
+              prefix=(); driver=default; display=()
+              ;;
+            Windows)
+              # DXGI may expose a software adapter. Do not presume a GPU or
+              # invent a force-WARP switch: this required smoke verifies CI.
+              prefix=(); driver=d3d12; display=()
+              ;;
+          esac
+          "${prefix[@]}" python tools/run_smoke.py --driver "$driver" \
+            --log ci-logs/smoke.log -- "${display[@]}"
 
-  test-windows:
-    name: Build & Test (Windows)
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0
-
-      # Never run here -- only present to satisfy gdzig's configure-time
-      # lookup. The Windows leg has no Godot integration test.
-      - name: Setup Godot
-        uses: chickensoft-games/setup-godot@v2
-        with:
-          version: "4.7.1"
-          use-dotnet: false
-
-      - name: Setup FFmpeg
+      - name: Setup Windows FFmpeg
+        if: runner.os == 'Windows' && matrix.godot == '4.7.2'
         run: choco install ffmpeg --yes --no-progress
 
-      - name: Generate mandatory decode fixtures
-        shell: bash
+      - name: Generate mandatory Windows native-test fixtures
+        if: runner.os == 'Windows' && matrix.godot == '4.7.2'
+        timeout-minutes: 3
         run: |
-          bash tools/gen_stress_media.sh --duration 3
+          bash tools/gen_stress_media.sh --duration 3 2>&1 | tee ci-logs/fixtures.log
           cp tests/fixtures/stress/bframes.mp4 project/bframes.mp4
           test -s project/bframes.mp4
           test -s tests/fixtures/stress/nonmod16_854x480.mp4
 
-      - name: Run core tests
-        run: zig build test --summary all
+      - name: Run native tests (primary Godot only)
+        if: matrix.godot == '4.7.2'
+        timeout-minutes: 5
+        run: zig build test --summary all --test-timeout 120s 2>&1 | tee ci-logs/native-tests.log
 
-      - name: Build extension
-        run: zig build --summary all
+      - name: Decode smoke (primary Godot only)
+        if: matrix.godot == '4.7.2'
+        timeout-minutes: 2
+        run: |
+          args=()
+          case "$RUNNER_OS" in
+            Linux) args=(-- project/synthetic.mp4);;
+            Windows) args=(-- project/bframes.mp4);;
+          esac
+          zig build decode-smoke "${args[@]}" 2>&1 | tee ci-logs/decode-smoke.log
 
-      - name: Decode smoke test
-        run: zig build decode-smoke -- project/bframes.mp4
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.os }}-godot-${{ matrix.godot }}
+          path: |
+            ci-logs/*.log
+            ci-logs/*.json
+          if-no-files-found: warn

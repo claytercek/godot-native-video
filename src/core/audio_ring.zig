@@ -347,7 +347,7 @@ test "AudioRing 6ch chunked fill + back-pressure conserves every decoded frame" 
 
         // Drive side: offer up to 4096 frames; the sink accepts only ~1/6.
         // Consume ONLY the accepted count — the surplus stays buffered.
-        const request = @min(r.availableFrames(), 4096);
+        const request: usize = @min(r.availableFrames(), 4096);
         const real = r.peekFrames(drain[0 .. request * channels], request);
         try std.testing.expectEqual(request, real);
         const accepted = real / 6; // per-channel back-pressure

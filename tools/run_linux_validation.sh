@@ -134,14 +134,39 @@ if (( rendered )); then
       export VK_DRIVER_FILES="$lvp" VK_ICD_FILENAMES="$lvp" LIBGL_ALWAYS_SOFTWARE=1
       export XDG_RUNTIME_DIR="$results/runtime"
       mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+      # Clear stale readiness before spawning; a nonempty file alone does not
+      # imply that Xvfb has finished writing its newline-terminated display.
+      : > "$results/xvfb-display"
       Xvfb -displayfd 3 -screen 0 640x480x24 -nolisten tcp 3> "$results/xvfb-display" > "$results/xvfb.log" 2>&1 &
       xvfb_pid=$!
-      for ((i=0; i<50; i++)); do
-        [[ -s "$results/xvfb-display" ]] && break
-        kill -0 "$xvfb_pid" 2>/dev/null || { echo 'Xvfb failed' >&2; exit 1; }
+      xvfb_deadline=$((SECONDS + 30))
+      xvfb_failure=
+      while :; do
+        if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+          xvfb_status=0
+          wait "$xvfb_pid" || xvfb_status=$?
+          xvfb_failure="exited before readiness (status $xvfb_status)"
+          break
+        fi
+        # Guard read under set -e: EOF without a newline is not readiness.
+        if IFS= read -r display < "$results/xvfb-display"; then
+          if [[ "$display" =~ ^[0-9]+$ ]]; then break; fi
+          printf -v xvfb_failure 'reported invalid display number: %q' "$display"
+          break
+        fi
+        if (( SECONDS >= xvfb_deadline )); then
+          xvfb_failure='timed out after 30s waiting for a complete display number'
+          break
+        fi
         sleep 0.1
       done
-      read -r display < "$results/xvfb-display"
+      if [[ -n "$xvfb_failure" ]]; then
+        echo "Xvfb startup failed: $xvfb_failure (pid $xvfb_pid)" >&2
+        echo "Display readiness file: $results/xvfb-display" >&2
+        echo "Xvfb log: $results/xvfb.log (last 60 lines)" >&2
+        if [[ -s "$results/xvfb.log" ]]; then tail -60 "$results/xvfb.log" >&2; else echo '(empty)' >&2; fi
+        exit 1
+      fi
       export DISPLAY=:$display
       display_args=(--display-driver x11)
       echo 'LINUX_VALIDATION_RENDERER software lavapipe/Xvfb (not physical-GPU proof)'
