@@ -43,10 +43,6 @@ const core = @import("core");
 
 const godot = @import("godot");
 const RenderingDevice = godot.class.RenderingDevice;
-const RdTextureFormat = godot.class.RdTextureFormat;
-const RdTextureView = godot.class.RdTextureView;
-const Rid = godot.builtin.Rid;
-const PackedByteArray = godot.builtin.PackedByteArray;
 
 const win = @import("mf").win;
 const com = win.com;
@@ -54,8 +50,9 @@ const dxgi = win.dxgi;
 const d3d11 = win.d3d11;
 
 const si = @import("surface_importer.zig");
-const PlaneTextures = si.PlaneTextures;
 const ImportResult = si.ImportResult;
+const packing = @import("cpu_plane_packing.zig");
+const upload = @import("cpu_plane_upload.zig");
 
 const wic = @import("windows_import_common.zig");
 const CachedTex2D = wic.CachedTex2D;
@@ -124,7 +121,6 @@ pub const CpuCopySurfaceImporter = struct {
     /// (the frame's display aperture -- see core.backend.CropRect). Returns an
     /// A typed failure on error, or `not_ready` while the readback ring warms.
     pub fn import(self: *CpuCopySurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) ImportResult {
-        var out: PlaneTextures = .{};
         if (!self.initialized) return .transient_failure;
         const handle = frame_info.native_handle orelse return .bad_frame;
         const decoded: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(handle));
@@ -194,73 +190,52 @@ pub const CpuCopySurfaceImporter = struct {
         const read = &self.ring[@as(usize, @intCast(read_slot))];
         if (!read.has_data) return .not_ready;
 
-        var mapped = std.mem.zeroes(d3d11.D3D11_MAPPED_SUBRESOURCE);
-        if (com.FAILED(context.Map(read.staging.texture.?.asResource(), 0, d3d11.D3D11_MAP_READ, 0, &mapped))) {
-            log.err("CPU-copy importer: staging texture Map failed.", .{});
-            return .transient_failure;
-        }
+        // Keep staging/Map lifetime platform-specific. Shared packing borrows
+        // the mapping only inside this scope; RD upload happens after Unmap.
+        var packed_planes = mapped_planes: {
+            var mapped = std.mem.zeroes(d3d11.D3D11_MAPPED_SUBRESOURCE);
+            if (com.FAILED(context.Map(read.staging.texture.?.asResource(), 0, d3d11.D3D11_MAP_READ, 0, &mapped))) {
+                log.err("CPU-copy importer: staging texture Map failed.", .{});
+                return .transient_failure;
+            }
+            defer context.Unmap(read.staging.texture.?.asResource(), 0);
 
-        // Aligned (possibly macroblock-padded) dimensions of the physical
-        // readback -- the crop is resolved against THESE, and against the
-        // crop THIS slot's frame carried (read.crop), not the crop passed to
-        // the current call.
-        const aligned_width: com.UINT = read.staging.width;
-        const aligned_height: com.UINT = read.staging.height;
-        const rc = wic.resolveCrop(read.metadata.crop, aligned_width, aligned_height);
-        const read_is_10bit = wic.detectBitDepth(read.staging.format) orelse {
-            context.Unmap(read.staging.texture.?.asResource(), 0);
-            return .bad_frame;
+            // Resolve THIS delayed slot's crop against its physical dimensions,
+            // preserving Windows' existing clamp/fallback geometry policy.
+            const aligned_width = std.math.cast(i32, read.staging.width) orelse return .bad_frame;
+            const aligned_height = std.math.cast(i32, read.staging.height) orelse return .bad_frame;
+            const rc = wic.resolveCrop(read.metadata.crop, read.staging.width, read.staging.height);
+            const read_is_10bit = wic.detectBitDepth(read.staging.format) orelse return .bad_frame;
+            const layout = packing.frameLayout(aligned_width, aligned_height, .{
+                .x = rc.luma_x,
+                .y = rc.luma_y,
+                .width = rc.luma_width,
+                .height = rc.luma_height,
+            }, if (read_is_10bit) .p010_le else .nv12) catch return .bad_frame;
+            const row_pitch: usize = mapped.RowPitch;
+            const data: [*]const u8 = @ptrCast(mapped.pData orelse return .bad_frame);
+            // D3D guarantees one contiguous mapping, with UV immediately after
+            // all aligned Y rows. Bound each plane separately before packing.
+            const luma_size = std.math.mul(usize, row_pitch, read.staging.height) catch return .bad_frame;
+            const chroma_size = std.math.mul(usize, row_pitch, @as(usize, read.staging.height) / 2) catch return .bad_frame;
+            _ = std.math.add(usize, luma_size, chroma_size) catch return .bad_frame;
+            const cpu_view = packing.BiplanarView.init(.{
+                data[0..luma_size],
+                (data + luma_size)[0..chroma_size],
+            }, .{ row_pitch, row_pitch }, layout) catch |err| {
+                log.err("CPU-copy importer: invalid mapped planes: {s}.", .{@errorName(err)});
+                return .bad_frame;
+            };
+            break :mapped_planes upload.PackedPlanes.init(cpu_view) catch |err| {
+                log.err("CPU-copy importer: plane packing failed: {s}.", .{@errorName(err)});
+                return .transient_failure;
+            };
         };
-        const row_pitch: usize = mapped.RowPitch;
-
-        const luma_src: [*]const u8 = @ptrCast(mapped.pData.?);
-        const chroma_src: [*]const u8 = luma_src + row_pitch * @as(usize, aligned_height);
-
-        var luma_bytes: PackedByteArray = undefined;
-        var chroma_bytes: PackedByteArray = undefined;
-        if (read_is_10bit) {
-            luma_bytes = packRows10bit(luma_src, row_pitch, rc.luma_x, rc.luma_y, rc.luma_width, rc.luma_height);
-            // Interleaved U16+V16 per chroma sample.
-            chroma_bytes = packRows10bit(chroma_src, row_pitch, @as(usize, rc.chroma_x) * 2, rc.chroma_y, @as(usize, rc.chroma_width) * 2, rc.chroma_height);
-        } else {
-            luma_bytes = packRows8bit(luma_src, row_pitch, rc.luma_x, rc.luma_y, rc.luma_width, rc.luma_height);
-            // Interleaved U8+V8 per chroma sample.
-            chroma_bytes = packRows8bit(chroma_src, row_pitch, @as(usize, rc.chroma_x) * 2, rc.chroma_y, @as(usize, rc.chroma_width) * 2, rc.chroma_height);
-        }
-        defer luma_bytes.deinit();
-        defer chroma_bytes.deinit();
-
-        context.Unmap(read.staging.texture.?.asResource(), 0);
-
-        // --- Ordinary texture_create + texture_update — no aliased import.
-        const rd = self.rd.?;
-        const luma_fmt = si.planeFormat(read_is_10bit, false);
-        const chroma_fmt = si.planeFormat(read_is_10bit, true);
-
-        const luma = createPlane(rd, luma_fmt, @intCast(rc.luma_width), @intCast(rc.luma_height));
-        const chroma = createPlane(rd, chroma_fmt, @intCast(rc.chroma_width), @intCast(rc.chroma_height));
-        if (!luma.isValid() or !chroma.isValid()) {
-            si.freePlaneRids(rd, luma, chroma);
-            log.err("CPU-copy importer: texture_create failed.", .{});
-            return .transient_failure;
-        }
-        if (rd.textureUpdate(luma, 0, luma_bytes) != .ok or rd.textureUpdate(chroma, 0, chroma_bytes) != .ok) {
-            si.freePlaneRids(rd, luma, chroma);
-            log.err("CPU-copy importer: texture_update failed.", .{});
-            return .transient_failure;
-        }
-
-        const release = si.boxPlaneRelease(self.allocator, rd, luma, chroma) catch {
-            si.freePlaneRids(rd, luma, chroma);
+        defer packed_planes.deinit();
+        const out = packed_planes.upload(self.allocator, self.rd.?, read.metadata) catch |err| {
+            log.err("CPU-copy importer: plane texture upload failed: {s}.", .{@errorName(err)});
             return .transient_failure;
         };
-
-        out.luma = luma;
-        out.chroma = chroma;
-        out.width = @intCast(rc.luma_width);
-        out.height = @intCast(rc.luma_height);
-        out.metadata = read.metadata;
-        out.release = release;
         // Honest accounting: this is the one import path allowed to violate
         // the zero-copy contract, so every frame it actually hands back counts.
         self.cpu_copy_count += 1;
@@ -285,63 +260,3 @@ pub const CpuCopySurfaceImporter = struct {
         self.initialized = false;
     }
 };
-
-/// Pack 8-bit plane rows tightly, cropped to `row_bytes` bytes per row
-/// starting at byte offset `x_offset`, for `rows` rows starting at row
-/// `y_offset` (RowPitch may exceed the tight row width even before cropping).
-fn packRows8bit(src: [*]const u8, row_pitch: usize, x_offset: usize, y_offset: usize, row_bytes: usize, rows: usize) PackedByteArray {
-    var out = PackedByteArray.init();
-    _ = out.resize(@intCast(row_bytes * rows));
-    const dst: [*]u8 = @ptrCast(out.index(0));
-    var y: usize = 0;
-    while (y < rows) : (y += 1) {
-        const src_row = src + (y + y_offset) * row_pitch + x_offset;
-        @memcpy(dst[y * row_bytes ..][0..row_bytes], src_row[0..row_bytes]);
-    }
-    return out;
-}
-
-/// Pack 10-bit (P010) plane rows tightly AND shift each 16-bit sample right by
-/// 6, converting P010's left-justified layout to the right-justified 10-bit-in-
-/// 16 layout the shared present shader expects (matching macOS x420). Cropped
-/// to `samples_per_row` 16-bit samples per row starting at sample offset
-/// `x_offset`, for `rows` rows starting at row `y_offset`.
-fn packRows10bit(src: [*]const u8, row_pitch: usize, x_offset: usize, y_offset: usize, samples_per_row: usize, rows: usize) PackedByteArray {
-    var out = PackedByteArray.init();
-    _ = out.resize(@intCast(samples_per_row * rows * @sizeOf(u16)));
-    const dst: [*]u16 = @ptrCast(@alignCast(out.index(0)));
-    var y: usize = 0;
-    while (y < rows) : (y += 1) {
-        const src_row: [*]const u8 = src + (y + y_offset) * row_pitch;
-        const dst_row = dst + y * samples_per_row;
-        var x: usize = 0;
-        while (x < samples_per_row) : (x += 1) {
-            // Read the little-endian 16-bit sample without assuming alignment.
-            const sx = x + x_offset;
-            const lo = src_row[sx * 2];
-            const hi = src_row[sx * 2 + 1];
-            const sample: u16 = (@as(u16, hi) << 8) | @as(u16, lo);
-            dst_row[x] = sample >> 6;
-        }
-    }
-    return out;
-}
-
-/// Create one RD plane texture (sampling + can-update) at w x h.
-fn createPlane(rd: *RenderingDevice, format: RenderingDevice.DataFormat, w: i64, h: i64) Rid {
-    const tf = RdTextureFormat.init();
-    defer if (tf.unreference()) tf.destroy();
-    tf.setFormat(format);
-    tf.setWidth(@intCast(w));
-    tf.setHeight(@intCast(h));
-    tf.setDepth(1);
-    tf.setArrayLayers(1);
-    tf.setMipmaps(1);
-    tf.setTextureType(.texture_type_2d);
-    tf.setUsageBits(.{ .texture_usage_sampling_bit = true, .texture_usage_can_update_bit = true });
-
-    const view = RdTextureView.init();
-    defer if (view.unreference()) view.destroy();
-
-    return rd.textureCreate(tf, view, .{});
-}

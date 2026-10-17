@@ -48,6 +48,16 @@ pub fn build(b: *Build) !void {
     b.step("test-paused-preview", "Run focused core paused-seek preview tests").dependOn(&paused_preview_run.step);
     test_step.dependOn(&paused_preview_run.step);
 
+    const fixture_pts_mod = b.createModule(.{
+        .root_source_file = b.path("tools/linux_fixture_pts.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fixture_pts_tests = b.addTest(.{ .root_module = fixture_pts_mod });
+    const fixture_pts_run = b.addRunArtifact(fixture_pts_tests);
+    b.step("test-linux-fixture-pts", "Run indexed Linux fixture PTS oracle tests").dependOn(&fixture_pts_run.step);
+    test_step.dependOn(&fixture_pts_run.step);
+
     // Windows import-path selector: lives in src/godot/ (it picks between the
     // D3D12 zero-copy and CPU-copy surface importers) but is a pure function
     // with zero Godot dependencies, so its tests run standalone here rather
@@ -72,19 +82,18 @@ pub fn build(b: *Build) !void {
     b.step("test-preview-presentation", "Run pure paused-preview presentation policy tests").dependOn(&preview_presentation_run.step);
     test_step.dependOn(&preview_presentation_run.step);
 
-    // Linux plane packing is pure Zig: exercise stride validation and P010
-    // normalization without needing a RenderingDevice or GStreamer runtime.
-    if (target.result.os.tag == .linux) {
-        const packing_mod = b.createModule(.{
-            .root_source_file = b.path("src/godot/linux_plane_packing.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const packing_tests = b.addTest(.{ .root_module = packing_mod });
-        const packing_run = b.addRunArtifact(packing_tests);
-        b.step("test-linux-packing", "Run pure Linux NV12/P010 plane packing tests").dependOn(&packing_run.step);
-        test_step.dependOn(&packing_run.step);
-    }
+    // Shared CPU plane packing is pure Zig: exercise independent strides and
+    // P010/x420 normalization without a RenderingDevice or platform runtime.
+    const packing_mod = b.createModule(.{
+        .root_source_file = b.path("src/godot/cpu_plane_packing.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const packing_tests = b.addTest(.{ .root_module = packing_mod });
+    const packing_run = b.addRunArtifact(packing_tests);
+    b.step("test-cpu-packing", "Run pure shared CPU plane packing tests").dependOn(&packing_run.step);
+    b.step("test-linux-packing", "Alias for test-cpu-packing").dependOn(&packing_run.step);
+    test_step.dependOn(&packing_run.step);
 
     // --- Media Foundation Windows bindings (Windows only). ---
     // Hand-written OS bindings layer that the eventual MF decoder backend and

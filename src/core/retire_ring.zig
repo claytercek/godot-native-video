@@ -1,244 +1,259 @@
-//! RetireRing(N) — bounded surface-lifetime guard (the memory-safety core).
+//! GPU lifetime retirement, paced by the engine's rendered-frame counter.
 //!
-//! Problem: when we import a decoder surface (CVPixelBuffer / IOSurface) into
-//! the GPU and run a present pass that samples it, the GPU may still be
-//! reading that surface for some number of frames after we issued the work.
-//! If the Backend recycles the surface immediately, the GPU reads freed
-//! memory — a use-after-free that corrupts the frame or crashes.
+//! Every submitted frame and replaced resource generation is held for N
+//! rendered epochs. All payloads submitted in one epoch share a FIFO batch:
+//! retries never age lifetimes, and multiple submissions never overwrite one
+//! another. A skipped epoch gap can release old batches in bounded time.
 //!
-//! We deliberately do NOT use per-platform GPU fences. Instead we hold each
-//! source surface's release closure for exactly N *rendered* frames: a
-//! bounded ring keyed on Godot's frame latency. After a surface has survived
-//! N calls to advance(), the GPU is guaranteed to be done with it and we run
-//! its release closure exactly once.
-//!
-//! Design rules:
-//!  - Pure logic. No Godot, RenderingDevice, Metal, or CoreVideo types. The
-//!    retained payload is a type-erased release closure, so this component is
-//!    fully unit-testable headlessly.
-//!  - Holds a surface for EXACTLY N frames and releases it EXACTLY once.
-//!  - Fixed capacity N slots: a surface parked this frame is released on the
-//!    N-th advance() that follows (when the ring head cycles back to its
-//!    slot), so there is no heap allocation on the present path.
-//!
-//! Usage (once per rendered frame, on the render thread):
-//!   ring.advance();              // ages everything; releases the oldest slot
-//!   ring.retain(frame.release);  // park this frame's surface for N frames
-//!
-//! Non-copyable: it owns release closures whose duplication would release a
-//! surface twice. Callers should hold this by pointer.
+//! Retention allocates and transfers ownership before GPU dispatch; allocation
+//! failure leaves every resource with the caller. Non-copyable. `drain` is an
+//! immediate teardown operation, NOT a GPU fence or a latency wait.
 
 const std = @import("std");
 
-/// A parked surface-release closure. An empty value (func == null) is the
-/// "no closure" state, accepted and ignored by retain().
-pub const ReleaseFn = @import("backend.zig").VoidClosure;
+/// Output-slot pacing is by submitting epoch, not by elapsed time. Multiple
+/// dispatches before one draw share a slot; the first dispatch after a pause
+/// uses a different slot from the texture still sampled in the previous draw.
+pub fn EpochSlots(comptime N: usize) type {
+    if (N < 2) @compileError("Output requires at least 2 slots");
+    return struct {
+        epoch: ?u64 = null,
+        index: usize = 0,
 
+        pub fn select(self: *@This(), epoch: u64) usize {
+            if (self.epoch != epoch) {
+                self.index = (self.index + 1) % N;
+                self.epoch = epoch;
+            }
+            return self.index;
+        }
+    };
+}
+
+/// Render-epoch retirement with any number of payloads per epoch. Repeated
+/// imports/presents neither age resources nor overwrite a payload. Allocation and
+/// ownership transfer happen atomically, BEFORE the caller submits GPU work.
+///
+/// `epoch` must be the canonical rendered-frame counter, not a process tick or
+/// an import-attempt count. Call advance even when no new frame is presented.
+/// Non-copyable; drain before destroying the allocator or rendering device.
 pub fn RetireRing(comptime N: usize) type {
-    comptime {
-        if (N < 1) @compileError("Retire latency must be at least 1 frame");
-    }
-
+    if (N < 1) @compileError("Retire latency must be at least 1 frame");
     return struct {
         const Self = @This();
-        // N slots: parking one surface per advance() keeps the ring full,
-        // and the slot reused N advances later is exactly the surface that
-        // has now survived its N frames of GPU latency.
-        const capacity: usize = N;
+        const Node = struct {
+            next: ?*Node = null,
+            release: *const fn (*Node) void,
+        };
+        const Batch = struct { first: ?*Node = null, last: ?*Node = null };
 
-        slots: [capacity]ReleaseFn = @splat(.{}),
+        slots: [N]Batch = @splat(.{}),
         head: usize = 0,
+        epoch: ?u64 = null,
+        count: usize = 0,
 
-        pub const init: Self = .{};
-
-        pub fn deinit(self: *Self) void {
-            self.drain();
-        }
-
-        /// Park a surface's release closure for N frames. Call once per
-        /// presented frame, AFTER advance(). An empty ReleaseFn{} is accepted
-        /// and ignored (e.g. a CPU/test frame with no native surface to
-        /// retire).
-        pub fn retain(self: *Self, release: ReleaseFn) void {
-            // The current write slot is `head`. advance() has already aged
-            // out whatever previously occupied it, so it is guaranteed empty
-            // here.
-            self.slots[self.head] = release;
-        }
-
-        /// Age the ring by one rendered frame. The slot that has now survived
-        /// N frames (the one we are about to reuse for this frame's
-        /// retain()) is released exactly once. Call once per rendered frame,
-        /// BEFORE retain().
-        pub fn advance(self: *Self) void {
-            self.head = (self.head + 1) % capacity;
-            // `head` now points at the slot filled N frames ago. Release it
-            // before it is overwritten so the surface is freed exactly once
-            // and only after the GPU has had N frames to finish reading it.
-            self.releaseSlot(self.head);
-        }
-
-        /// Release every still-parked surface immediately (teardown / stop),
-        /// in FIFO (oldest-first) order so drain preserves the same release
-        /// ordering as steady-state aging. After this the ring holds
-        /// nothing. Idempotent.
-        pub fn drain(self: *Self) void {
-            // The oldest surface sits in the slot advance() would next reuse,
-            // i.e. (head + 1). Walk forward from there so we release oldest
-            // -> newest.
-            for (0..capacity) |k| {
-                self.releaseSlot((self.head + 1 + k) % capacity);
+        pub fn advance(self: *Self, epoch: u64) void {
+            const previous = self.epoch orelse {
+                self.epoch = epoch;
+                return;
+            };
+            std.debug.assert(epoch >= previous);
+            self.epoch = epoch;
+            // After N epochs every old batch is safe; don't walk an unbounded
+            // gap when a stopped player resumes or a window was hidden.
+            const elapsed = @min(epoch - previous, N);
+            for (0..@intCast(elapsed)) |_| {
+                self.head = (self.head + 1) % N;
+                self.releaseSlot(self.head);
             }
         }
 
-        /// Number of surfaces currently parked (for tests / instrumentation).
+        pub fn retain(self: *Self, allocator: std.mem.Allocator, value: anytype, comptime teardown: fn (*@TypeOf(value)) void) !void {
+            std.debug.assert(self.epoch != null);
+            const Box = struct {
+                node: Node = .{ .release = release },
+                allocator: std.mem.Allocator,
+                value: @TypeOf(value),
+                fn release(node: *Node) void {
+                    const box: *@This() = @fieldParentPtr("node", node);
+                    teardown(&box.value);
+                    box.allocator.destroy(box);
+                }
+            };
+            const box = try allocator.create(Box);
+            box.* = .{ .allocator = allocator, .value = value };
+            const batch = &self.slots[self.head];
+            if (batch.last) |last| last.next = &box.node else batch.first = &box.node;
+            batch.last = &box.node;
+            self.count += 1;
+        }
+
+        pub fn currentEpoch(self: *const Self) u64 {
+            return self.epoch.?;
+        }
+
         pub fn liveCount(self: *const Self) usize {
-            var n: usize = 0;
-            for (self.slots) |slot| {
-                if (slot.func != null) n += 1;
-            }
-            return n;
+            return self.count;
         }
 
-        pub fn latencyFrames() usize {
-            return N;
+        pub fn drain(self: *Self) void {
+            for (0..N) |k| self.releaseSlot((self.head + 1 + k) % N);
         }
 
-        fn releaseSlot(self: *Self, i: usize) void {
-            const slot = self.slots[i];
-            if (slot.func != null) {
-                self.slots[i] = .{}; // clear before invoking so re-entrancy is safe
-                slot.call();
+        fn releaseSlot(self: *Self, index: usize) void {
+            var next = self.slots[index].first;
+            self.slots[index] = .{}; // detach the entire batch before teardown
+            while (next) |node| {
+                next = node.next;
+                self.count -= 1;
+                node.release(node);
             }
         }
     };
 }
 
-test "a surface is held for exactly N frames then released once" {
-    const N = 3;
-    var ring: RetireRing(N) = .init;
-
-    var releases: i32 = 0;
-    const Ctx = struct {
-        fn bump(p: ?*anyopaque) void {
-            const r: *i32 = @ptrCast(@alignCast(p.?));
-            r.* += 1;
-        }
-    };
-
-    // Frame 0: park a surface.
-    ring.advance();
-    ring.retain(.{ .ctx = &releases, .func = Ctx.bump });
-    try std.testing.expectEqual(1, ring.liveCount());
-
-    // It must survive the next N-1 advances...
-    var f: usize = 1;
-    while (f < N) : (f += 1) {
-        ring.advance();
-        ring.retain(.{}); // no new surface this frame
-        try std.testing.expectEqual(0, releases); // still alive
+const EpochTestValue = struct {
+    releases: *usize,
+    fn release(value: *EpochTestValue) void {
+        value.releases.* += 1;
     }
+};
 
-    // ...and be released on the N-th advance after it was parked.
-    ring.advance();
-    try std.testing.expectEqual(1, releases);
-    try std.testing.expectEqual(0, ring.liveCount());
-
-    // And never released again.
-    var i: i32 = 0;
-    while (i < 10) : (i += 1) {
-        ring.advance();
-        ring.retain(.{});
+test "epoch batches retain every same-frame preview and resumed submission" {
+    var releases: usize = 0;
+    var ring: RetireRing(3) = .{};
+    defer ring.drain();
+    ring.advance(100);
+    const preview_epoch = ring.currentEpoch();
+    // Preview dispatch; synchronous changed resumes playback; _update then
+    // dispatches another frame in the SAME rendered epoch, plus a rebuild.
+    for (0..12) |_| {
+        ring.advance(100);
+        try ring.retain(std.testing.allocator, EpochTestValue{ .releases = &releases }, EpochTestValue.release);
+        try std.testing.expectEqual(preview_epoch, ring.currentEpoch());
     }
-    try std.testing.expectEqual(1, releases);
-}
-
-test "each frame's surface is released exactly once, in order" {
-    const N = 2;
-    var ring: RetireRing(N) = .init;
-
-    var released_order = std.ArrayList(i32).empty;
-    defer released_order.deinit(std.testing.allocator);
-
-    const Ctx = struct {
-        list: *std.ArrayList(i32),
-        value: i32,
-
-        fn release(p: ?*anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(p.?));
-            self.list.append(std.testing.allocator, self.value) catch unreachable;
-        }
-    };
-
-    // Park a distinct surface every frame for many frames.
-    const kFrames = 20;
-    var ctxs: [kFrames]Ctx = undefined;
-    var i: i32 = 0;
-    while (i < kFrames) : (i += 1) {
-        ctxs[@intCast(i)] = .{ .list = &released_order, .value = i };
-        ring.advance();
-        ring.retain(.{ .ctx = &ctxs[@intCast(i)], .func = Ctx.release });
-    }
-
-    // Drain the tail so every parked surface gets released.
+    try std.testing.expectEqual(@as(usize, 12), ring.liveCount());
+    // not_ready/transient retries in this same frame cannot age the batch.
+    for (0..100) |_| ring.advance(100);
+    try std.testing.expectEqual(@as(usize, 0), releases);
+    ring.advance(101);
+    try std.testing.expect(preview_epoch != ring.currentEpoch());
+    ring.advance(102);
+    try std.testing.expectEqual(@as(usize, 0), releases);
+    // The pump still advances while paused/stopped, without new submissions.
+    ring.advance(103);
+    try std.testing.expectEqual(@as(usize, 12), releases);
+    try std.testing.expectEqual(@as(usize, 0), ring.liveCount());
+    ring.advance(104);
     ring.drain();
-
-    // Every surface released exactly once...
-    try std.testing.expectEqual(kFrames, released_order.items.len);
-    // ...and in FIFO order.
-    i = 0;
-    while (i < kFrames) : (i += 1) {
-        try std.testing.expectEqual(i, released_order.items[@intCast(i)]);
-    }
+    try std.testing.expectEqual(@as(usize, 12), releases);
 }
 
-test "drain releases all parked surfaces and is idempotent" {
-    var ring: RetireRing(4) = .init;
-    var releases: i32 = 0;
-
-    const Ctx = struct {
-        fn bump(p: ?*anyopaque) void {
-            const r: *i32 = @ptrCast(@alignCast(p.?));
-            r.* += 1;
+test "epoch retirement releases FIFO across frames and idle gaps" {
+    var order = std.ArrayList(usize).empty;
+    defer order.deinit(std.testing.allocator);
+    const Value = struct {
+        order: *std.ArrayList(usize),
+        id: usize,
+        fn release(value: *@This()) void {
+            value.order.append(std.testing.allocator, value.id) catch unreachable;
         }
     };
-
-    var i: i32 = 0;
-    while (i < 3) : (i += 1) {
-        ring.advance();
-        ring.retain(.{ .ctx = &releases, .func = Ctx.bump });
+    var ring: RetireRing(3) = .{};
+    defer ring.drain();
+    var id: usize = 0;
+    for (0..3) |epoch| {
+        ring.advance(epoch);
+        for (0..2) |_| {
+            try ring.retain(std.testing.allocator, Value{ .order = &order, .id = id }, Value.release);
+            id += 1;
+        }
     }
-    try std.testing.expectEqual(0, releases);
-
-    ring.drain();
-    try std.testing.expectEqual(3, releases);
-
-    // Second drain must not double-release.
-    ring.drain();
-    try std.testing.expectEqual(3, releases);
+    try std.testing.expectEqual(@as(usize, 0), order.items.len);
+    ring.advance(10000); // no retry-count aging, no unbounded gap loop
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4, 5 }, order.items);
+    try ring.retain(std.testing.allocator, Value{ .order = &order, .id = 6 }, Value.release);
+    ring.advance(10002);
+    try std.testing.expectEqual(@as(usize, 6), order.items.len);
+    ring.advance(10003);
+    try std.testing.expectEqual(@as(usize, 7), order.items.len);
 }
 
-test "deinit releases outstanding surfaces (no leak)" {
-    // deinit() invokes the still-parked closure exactly once, so any
-    // resource it owns is released without the ring holding on to it.
-    var released = false;
-    const Ctx = struct {
-        fn markReleased(p: ?*anyopaque) void {
-            const flag: *bool = @ptrCast(@alignCast(p.?));
-            flag.* = true;
+test "epoch retention allocation failure leaves caller ownership intact" {
+    var releases: usize = 0;
+    var ring: RetireRing(3) = .{};
+    ring.advance(0);
+    var buffer: [0]u8 = .{};
+    var failing = std.heap.FixedBufferAllocator.init(&buffer);
+    try std.testing.expectError(error.OutOfMemory, ring.retain(failing.allocator(), EpochTestValue{ .releases = &releases }, EpochTestValue.release));
+    ring.drain();
+    try std.testing.expectEqual(@as(usize, 0), releases);
+    try std.testing.expectEqual(@as(usize, 0), ring.liveCount());
+    // The frame/import/generation was never transferred; caller cleans up.
+    var value: EpochTestValue = .{ .releases = &releases };
+    EpochTestValue.release(&value);
+    try std.testing.expectEqual(@as(usize, 1), releases);
+}
+
+test "epoch drain releases complete batches once and permits reuse" {
+    var releases: usize = 0;
+    var ring: RetireRing(3) = .{};
+    ring.advance(10);
+    for (0..5) |_| try ring.retain(std.testing.allocator, EpochTestValue{ .releases = &releases }, EpochTestValue.release);
+    ring.drain();
+    ring.drain();
+    try std.testing.expectEqual(@as(usize, 5), releases);
+    try ring.retain(std.testing.allocator, EpochTestValue{ .releases = &releases }, EpochTestValue.release);
+    ring.advance(12);
+    try std.testing.expectEqual(@as(usize, 5), releases);
+    ring.advance(13);
+    try std.testing.expectEqual(@as(usize, 6), releases);
+}
+
+test "output slots do not lap in one epoch or overwrite displayed slot after pause" {
+    var slots: EpochSlots(3) = .{};
+    const first = slots.select(10);
+    for (0..100) |_| try std.testing.expectEqual(first, slots.select(10));
+    const second = slots.select(11);
+    try std.testing.expect(first != second);
+    const third = slots.select(12);
+    try std.testing.expect(first != third and second != third);
+    try std.testing.expectEqual(first, slots.select(13));
+    // During a long pause the most recent output remains sampled every draw.
+    // The number of elapsed epochs must not select that same displayed slot.
+    const resumed = slots.select(10000);
+    try std.testing.expect(resumed != first);
+    for (0..100) |_| try std.testing.expectEqual(resumed, slots.select(10000));
+}
+
+test "replaced generations retire without a later successful frame" {
+    var frame_releases: usize = 0;
+    var generation_releases: usize = 0;
+    const Generation = struct {
+        frame_releases: *usize,
+        generation_releases: *usize,
+        fn release(value: *@This()) void {
+            // Shader/output resources must outlive uniforms/imports/surfaces
+            // from the generation's most recent use, not the next new frame.
+            std.debug.assert(value.frame_releases.* == 1);
+            value.generation_releases.* += 1;
         }
     };
-    {
-        var ring: RetireRing(3) = .init;
-        ring.advance();
-        ring.retain(.{ .ctx = &released, .func = Ctx.markReleased });
-        try std.testing.expect(!released);
-        ring.deinit();
-    }
-    try std.testing.expect(released);
-}
-
-test "latency_frames reports the configured N" {
-    try std.testing.expectEqual(1, RetireRing(1).latencyFrames());
-    try std.testing.expectEqual(5, RetireRing(5).latencyFrames());
+    var ring: RetireRing(3) = .{};
+    defer ring.drain();
+    ring.advance(8);
+    try ring.retain(std.testing.allocator, EpochTestValue{ .releases = &frame_releases }, EpochTestValue.release);
+    ring.advance(9);
+    // Two rebuilds, then replacement build/import never succeeds. Both old
+    // generations still release, with no generation chain or future carrier.
+    for (0..2) |_| try ring.retain(std.testing.allocator, Generation{
+        .frame_releases = &frame_releases,
+        .generation_releases = &generation_releases,
+    }, Generation.release);
+    ring.advance(11);
+    try std.testing.expectEqual(@as(usize, 1), frame_releases);
+    try std.testing.expectEqual(@as(usize, 0), generation_releases);
+    ring.advance(12);
+    try std.testing.expectEqual(@as(usize, 2), generation_releases);
+    try std.testing.expectEqual(@as(usize, 0), ring.liveCount());
 }

@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 
 const godot = @import("godot");
 const RenderingServer = godot.class.RenderingServer;
+const Engine = godot.class.Engine;
 const RenderingDevice = godot.class.RenderingDevice;
 const RdShaderSource = godot.class.RdShaderSource;
 const RdSamplerState = godot.class.RdSamplerState;
@@ -97,11 +98,6 @@ const ResourceGeneration = struct {
     pipeline: Rid,
     sampler: Rid,
     ring: [ring_depth]RingSlot,
-    // The generation retired immediately before this one, if it had not yet
-    // been attached to a presented frame. Generations chain instead of racing
-    // for the single `pending_generation_release` slot, so a rebuild is always
-    // allowed and no closure is ever stranded.
-    prior: si.Closure = .{},
 };
 
 fn resourceGenerationTeardown(generation: *ResourceGeneration) void {
@@ -111,9 +107,6 @@ fn resourceGenerationTeardown(generation: *ResourceGeneration) void {
     if (generation.pipeline.isValid()) generation.rd.freeRid(generation.pipeline);
     if (generation.sampler.isValid()) generation.rd.freeRid(generation.sampler);
     if (generation.shader.isValid()) generation.rd.freeRid(generation.shader);
-    // Older generations are strictly older than this one, so they are safe to
-    // free once this one is. Runs last, exactly once.
-    generation.prior.call();
 }
 
 /// The pipeline's RD-resource lifecycle.
@@ -127,7 +120,7 @@ const State = enum(u8) {
 // -----------------------------------------------------------------------
 // The retire-ring payload: freeing one presented frame's transient surfaces
 // (the uniform set RID, the imported plane textures, and the decoder frame
-// itself). Heap-boxed by si.boxClosure() and run by the retire ring once the
+// itself). Heap-boxed and run by the epoch retire ring once the
 // frame has survived its GPU latency window.
 // -----------------------------------------------------------------------
 const RetireValue = struct {
@@ -135,14 +128,12 @@ const RetireValue = struct {
     uniform_set: Rid,
     plane_release: si.Closure,
     frame: VideoFrame,
-    generation_release: si.Closure,
 };
 
 fn retireTeardown(v: *RetireValue) void {
     if (v.uniform_set.isValid()) v.rd.freeRid(v.uniform_set);
     v.plane_release.call();
     v.frame.release();
-    v.generation_release.call();
 }
 
 pub const PresentPipeline = struct {
@@ -161,14 +152,13 @@ pub const PresentPipeline = struct {
     push_scratch: PackedByteArray,
 
     ring: [ring_depth]RingSlot = @splat(.{}),
-    ring_index: usize = 0,
+    output_ring: retire_ring.EpochSlots(ring_depth) = .{},
 
     // Lazily created in getTexture(); identity stable for the pipeline's
     // lifetime. VideoStreamPlayer caches this ref once and draws it forever.
     current_texture: ?*Texture2drd = null,
 
     retire: retire_ring.RetireRing(frame_latency) = .{},
-    pending_generation_release: si.Closure = .{},
 
     width: i32 = 0,
     height: i32 = 0,
@@ -327,7 +317,7 @@ pub const PresentPipeline = struct {
 
         self.width = width;
         self.height = height;
-        self.ring_index = 0;
+        self.output_ring = .{};
         // Point the stable output texture at slot 0. This fires `changed`, so
         // the player's cached texture picks up the real dimensions.
         self.getTexture().setTextureRdRid(self.ring[0].rgba_rid);
@@ -430,6 +420,19 @@ pub const PresentPipeline = struct {
         return true;
     }
 
+    /// Engine.getFramesDrawn increments only when Godot draws, after the
+    /// SceneTree process phase (main/main.cpp). Thus process_frame previews,
+    /// reentrant resume, and VideoStreamPlayer._update share one epoch. Process
+    /// ticks while rendering is disabled do NOT age GPU resources. The binding
+    /// pumps this even after playback/preview stops until all batches retire.
+    pub fn advanceRenderEpoch(self: *PresentPipeline) void {
+        self.retire.advance(@intCast(Engine.getFramesDrawn()));
+    }
+
+    pub fn hasRetirements(self: *const PresentPipeline) bool {
+        return self.retire.liveCount() != 0;
+    }
+
     /// Allocate a presentation identity independently of decoder timestamps.
     pub fn nextSubmission(self: *PresentPipeline) u64 {
         self.last_submission +%= 1;
@@ -453,14 +456,13 @@ pub const PresentPipeline = struct {
     }
 
     fn presentSubmission(self: *PresentPipeline, frame: VideoFrame, submission: u64, require_match: bool) preview_policy.Result {
+        self.advanceRenderEpoch();
         if (!self.ensureImporter()) return .failed;
         const importer = &self.importer.?;
-
-        self.retire.advance();
-        var planes = switch (importer.import(frame, submission)) {
+        const imported = importer.import(frame, submission);
+        var planes = switch (imported) {
             .success => |value| value,
-            .not_ready => return .pending,
-            .bad_frame, .transient_failure, .capability_unavailable => return .failed,
+            else => return preview_policy.importFailure(std.meta.activeTag(imported)),
         };
         if (require_match and !preview_policy.matches(submission, planes.metadata.submission)) {
             planes.discard();
@@ -472,8 +474,10 @@ pub const PresentPipeline = struct {
         }
         const rd = self.rd.?;
 
-        self.ring_index = (self.ring_index + 1) % ring_depth;
-        const slot = self.ring[self.ring_index];
+        // Select locally, commit only after fallible preparation succeeds.
+        // Same-epoch dispatches write one texture in GPU command order.
+        var output_ring = self.output_ring;
+        const slot = self.ring[output_ring.select(self.retire.currentEpoch())];
         const uniform_set = self.buildUniformSet(rd, planes, slot);
         if (!uniform_set.isValid()) {
             planes.discard();
@@ -485,19 +489,18 @@ pub const PresentPipeline = struct {
         // A synchronous signal handler can replace the owner's stream or free
         // the player. The binding holds its playback alive during this call;
         // no resource/frame ownership remains ambiguous across that signal.
-        const release = si.boxClosure(self.allocator, RetireValue{
+        self.retire.retain(self.allocator, RetireValue{
             .rd = rd,
             .uniform_set = uniform_set,
             .plane_release = planes.release,
             .frame = frame,
-            .generation_release = self.pending_generation_release,
         }, retireTeardown) catch {
             rd.freeRid(uniform_set);
             planes.discard();
             return .failed;
         };
-        self.pending_generation_release = .{};
 
+        self.output_ring = output_ring;
         const gx: u32 = @intCast(@divTrunc(self.width + 7, 8));
         const gy: u32 = @intCast(@divTrunc(self.height + 7, 8));
         const cl = rd.computeListBegin();
@@ -507,7 +510,6 @@ pub const PresentPipeline = struct {
         rd.computeListDispatch(cl, gx, gy, 1);
         rd.computeListEnd();
 
-        self.retire.retain(release);
         // Last access to pipeline state: this emits a synchronous signal.
         self.getTexture().setTextureRdRid(slot.rgba_rid);
         return .presented;
@@ -603,19 +605,17 @@ pub const PresentPipeline = struct {
     }
 
     fn retireResourceGeneration(self: *PresentPipeline) bool {
+        self.advanceRenderEpoch();
         const rd = self.rd orelse return false;
-        // A generation retired but not yet attached to a presented frame is
-        // chained onto this one rather than dropped: the retire ring only
-        // holds one closure per slot, so parking it separately would silently
-        // overwrite a live entry. On the catch path below, `prior` stays where
-        // it is — owned by exactly one holder at all times.
-        const release = si.boxClosure(self.allocator, ResourceGeneration{
+        // Generations are independent epoch-batched payloads. They retire
+        // even if the replacement build/import fails or playback stays paused;
+        // no later successful frame is needed to carry their release hook.
+        self.retire.retain(self.allocator, ResourceGeneration{
             .rd = rd,
             .shader = self.shader,
             .pipeline = self.pipeline,
             .sampler = self.sampler,
             .ring = self.ring,
-            .prior = self.pending_generation_release,
         }, resourceGenerationTeardown) catch {
             log.err("could not retain the current GPU resource generation for a safe rebuild.", .{});
             return false;
@@ -630,16 +630,16 @@ pub const PresentPipeline = struct {
         self.height = 0;
         self.state = .unbuilt;
         self.built_output_mode = null;
-        self.pending_generation_release = release;
         return true;
     }
 
     /// Tear down all RD resources and drain the retire-ring.
     pub fn shutdown(self: *PresentPipeline) void {
-        // Release any surfaces still parked before tearing down RD resources.
+        // Preserve the existing immediate teardown contract. RD defers its
+        // own RID destruction, but drain is NOT a GPU fence for foreign native
+        // allocations (notably D3D12's borrowed resources). That inherited
+        // shutdown limitation needs a separate deferred-destruction design.
         self.retire.drain();
-        self.pending_generation_release.call();
-        self.pending_generation_release = .{};
         self.freeResources();
         if (self.importer) |*imp| {
             imp.deinit();

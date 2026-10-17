@@ -5,6 +5,7 @@ const std = @import("std");
 const gst = @import("gst");
 const core = @import("core");
 const Backend = core.backend.Backend;
+const fixture_pts = @import("linux_fixture_pts.zig");
 
 fn require(ok: bool, reason: []const u8) !void {
     if (!ok) {
@@ -13,13 +14,13 @@ fn require(ok: bool, reason: []const u8) !void {
     }
 }
 
-fn drainVideo(backend: Backend, ten_bit: bool, expected: usize, duration: f64) !void {
+fn drainVideo(backend: Backend, ten_bit: bool, expected: usize) !void {
     var count: usize = 0;
     var previous: f64 = -1;
     while (backend.nextVideoFrame()) |frame| {
         defer frame.release();
         try require(std.math.isFinite(frame.pts_seconds), "nonfinite video PTS");
-        try require(frame.pts_seconds + 0.0001 >= previous, "video PTS regressed within one generation");
+        try require(fixture_pts.matches(count, frame.pts_seconds), "video PTS differs from indexed fixture frame (missing/duplicate/reordered frame)");
         try require(frame.width == 320 and frame.height == 240, "unexpected decoded frame dimensions");
         try require(frame.native_handle != null, "video frame has no retained payload");
         try require(frame.pixel_format == @as(core.backend.PixelFormat, if (ten_bit) .x420 else .nv12), "wrong decoded pixel format/precision");
@@ -28,14 +29,12 @@ fn drainVideo(backend: Backend, ten_bit: bool, expected: usize, duration: f64) !
         }
         if (count == 0) {
             std.debug.print("LINUX_DECODE_FIRST pts={d:.6}\n", .{frame.pts_seconds});
-            try require(frame.pts_seconds >= -0.001 and frame.pts_seconds <= 0.04, "seek(0) lost first video frame");
         }
         previous = frame.pts_seconds;
         count += 1;
         try require(count <= expected, "duplicate/extra decoded video frames");
     }
     try require(count == expected, "video EOS arrived before expected frame count");
-    try require(@abs(previous - (duration - 1.0 / 30.0)) <= 0.04, "video tail PTS missing at EOS");
     try require(backend.nextVideoFrame() == null, "video EOS was not stable");
     std.debug.print("LINUX_DECODE_VIDEO frames={d} last_pts={d:.6} format={s}\n", .{ count, previous, if (ten_bit) "p010" else "nv12" });
 }
@@ -176,7 +175,7 @@ fn multiTrack(backend: Backend, path: []const u8) !void {
     // but inventing track zero as default contradicts this container.
     try require(!low.is_default, "first track was fabricated as container default");
     if (!high.is_default) std.debug.print("LINUX_DECODE_NOTE container default unknown\n", .{});
-    try drainVideo(backend, false, 90, 3);
+    try drainVideo(backend, false, 90);
     try require(backend.reselectAudioTrack(0, 0), "first-track reselect failed");
     try trackTone(backend, 440);
     try require(backend.nextVideoFrame() == null, "audio reselect disturbed video EOS");
@@ -184,7 +183,7 @@ fn multiTrack(backend: Backend, path: []const u8) !void {
     try trackTone(backend, 880);
     try require(backend.nextVideoFrame() == null, "second-track reselect rewound video");
     try require(backend.seek(0), "seek with second track selected failed");
-    try drainVideo(backend, false, 90, 3);
+    try drainVideo(backend, false, 90);
     try trackTone(backend, 880);
     try require(backend.reselectAudioTrack(0, 72151.0 / 48000.0), "nonzero first-track reselect failed");
     try checkAudioPosition(backend, 72151, 440);
@@ -192,10 +191,15 @@ fn multiTrack(backend: Backend, path: []const u8) !void {
     try checkAudioPosition(backend, 24353, 880);
     try require(backend.seek(72151.0 / 48000.0), "nonzero shared seek failed");
     try checkAudioPosition(backend, 72151, 880);
+    // Packet-boundary and adjacent-sample seeks also clamp decoder preroll at zero.
+    for ([_]usize{ 1024, 1025 }) |target_frame| {
+        try require(backend.reselectAudioTrack(0, @as(f64, @floatFromInt(target_frame)) / 48000.0), "packet-boundary first-track reselect failed");
+        try checkAudioPosition(backend, target_frame, 440);
+    }
     backend.selectAudioTrack(0);
     try require(backend.seek(0), "select-first-track plus seek failed");
     try trackTone(backend, 440);
-    try drainVideo(backend, false, 90, 3);
+    try drainVideo(backend, false, 90);
     try closeBounded(backend);
 }
 
@@ -265,14 +269,14 @@ pub fn main(init: std.process.Init) !void {
     }
     // This order intentionally catches a bounded paired-appsink demux deadlock.
     try require(backend.seek(0), "initial seek failed");
-    try drainVideo(backend, ten_bit, expected, duration);
+    try drainVideo(backend, ten_bit, expected);
     try drainAudio(backend, with_audio);
     // Seek after both EOS latches, drain in the opposite order, then replay.
     try require(backend.seek(0), "seek after EOS failed");
     try drainAudio(backend, with_audio);
-    try drainVideo(backend, ten_bit, expected, duration);
+    try drainVideo(backend, ten_bit, expected);
     try require(backend.seek(0), "second replay seek failed");
-    try drainVideo(backend, ten_bit, expected, duration);
+    try drainVideo(backend, ten_bit, expected);
     try drainAudio(backend, with_audio);
     try closeBounded(backend);
     // Close an active reader too, not only an already-drained pipeline.
