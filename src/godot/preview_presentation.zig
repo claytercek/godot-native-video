@@ -5,6 +5,17 @@ const std = @import("std");
 pub const Result = enum { pending, presented, failed };
 pub const timeout_ms: f64 = 5000;
 
+/// Classify a surface import's non-success tag without depending on Godot's
+/// plane/RID types. Recoverable device pressure follows the same bounded
+/// wall-time retry policy as a delayed importer, never drops the sole preview.
+pub fn importFailure(tag: anytype) Result {
+    return switch (tag) {
+        .not_ready, .transient_failure => .pending,
+        .bad_frame, .capability_unavailable => .failed,
+        else => unreachable, // success carries planes, not a failure policy
+    };
+}
+
 /// The presenter consumes Attempt.frame only on .presented. On .pending or
 /// .failed it borrows the frame; finish() either retains it or releases it.
 /// Taking the attempt out of this state before presenting makes cancellation
@@ -192,4 +203,54 @@ test "persistent not_ready has a wall-time deadline not a retry count" {
     try std.testing.expect(pending.expired(100 + timeout_ms));
     pending.cancel();
     try std.testing.expectEqual(@as(usize, 1), releases);
+}
+
+const FakeImportTag = enum { success, not_ready, transient_failure, bad_frame, capability_unavailable };
+
+test "transient import failures retain the sole preview until success" {
+    var releases: usize = 0;
+    var pending: Pending(FakeFrame) = .{};
+    pending.begin(7, 100);
+    pending.setFrame(.{ .releases = &releases });
+    for ([_]FakeImportTag{ .transient_failure, .not_ready, .transient_failure }) |tag| {
+        pending.finish(pending.take().?, importFailure(tag));
+        try std.testing.expect(pending.frame != null);
+        try std.testing.expectEqual(@as(u64, 7), pending.token);
+        try std.testing.expectEqual(@as(f64, 100), pending.started_ms);
+        try std.testing.expectEqual(@as(usize, 0), releases);
+    }
+    const success = pending.take().?;
+    pending.finish(success, .presented);
+    pending.cancel(); // preview->resume; GPU alone owns the consumed source
+    try std.testing.expectEqual(@as(usize, 0), releases);
+    success.frame.release();
+    try std.testing.expectEqual(@as(usize, 1), releases);
+}
+
+test "persistent transient failure expires without resetting the deadline" {
+    var releases: usize = 0;
+    var pending: Pending(FakeFrame) = .{};
+    pending.begin(7, 100);
+    pending.setFrame(.{ .releases = &releases });
+    for (0..100) |_| pending.finish(pending.take().?, importFailure(FakeImportTag.transient_failure));
+    try std.testing.expect(!pending.expired(100 + timeout_ms - 1));
+    try std.testing.expect(pending.expired(100 + timeout_ms));
+    pending.cancel();
+    pending.cancel();
+    try std.testing.expectEqual(@as(usize, 1), releases);
+}
+
+test "permanent import failure after transient retries cancels once" {
+    for ([_]FakeImportTag{ .bad_frame, .capability_unavailable }) |terminal| {
+        var releases: usize = 0;
+        var pending: Pending(FakeFrame) = .{};
+        pending.begin(7, 100);
+        pending.setFrame(.{ .releases = &releases });
+        pending.finish(pending.take().?, importFailure(FakeImportTag.transient_failure));
+        pending.finish(pending.take().?, importFailure(terminal));
+        try std.testing.expectEqual(@as(u64, 0), pending.token);
+        try std.testing.expect(pending.take() == null);
+        pending.cancel();
+        try std.testing.expectEqual(@as(usize, 1), releases);
+    }
 }

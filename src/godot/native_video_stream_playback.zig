@@ -75,7 +75,7 @@ pub fn register(r: *Registry) void {
     const class = r.createClass(NativeVideoStreamPlayback, r.allocator, .auto);
     class.addMethod("get_color_info", .auto);
     class.addMethod("get_cpu_copy_count", .auto);
-    class.addMethod("process_paused_preview", .auto);
+    class.addMethod("process_presentation", .auto);
     // output_mode (SDR,HDR) enum property, backed by set/get methods.
     class.addProperty("output_mode", .{
         .hint = .property_hint_enum,
@@ -92,10 +92,10 @@ base: *VideoStreamPlayback,
 controller: PlaybackController,
 present: PresentPipeline,
 // A weak SceneTree ObjectID, never a raw callback pointer or owning reference.
-// Connected only until the latest paused seek/settle has been presented.
-preview_tree_id: ?object_id.ObjectId = null,
+// Pumps paused previews AND GPU retirement; stays connected until both drain.
+presentation_tree_id: ?object_id.ObjectId = null,
 preview: preview_policy.Pending(backend_mod.VideoFrame) = .{},
-preview_processing: bool = false,
+presentation_processing: bool = false,
 
 // GodotMixSink scratch buffer, resized as needed, never per-tick — the seam
 // costs nothing beyond the copy from the controller's plain-float scratch into
@@ -117,6 +117,7 @@ pub fn create(allocator: *Allocator) !*NativeVideoStreamPlayback {
 
 pub fn destroy(self: *NativeVideoStreamPlayback, allocator: *Allocator) void {
     self.cancelPreviewWork();
+    self.disconnectPresentationPump();
     // Unregister from the shared pool first: this blocks until any in-flight
     // decode slice for our stream completes and releases every buffered
     // surface, so no worker can touch our Backend after this returns.
@@ -305,25 +306,27 @@ pub fn _seek(self: *NativeVideoStreamPlayback, time: f64) void {
     self.flushWarnings();
     if (self.controller.needsPausedPreview()) {
         self.preview.begin(self.present.nextSubmission(), nowMs().ms);
-        self.connectPausedPreview();
+        self.connectPresentationPump();
     }
 }
 
-/// VideoStreamPlayer stops _update while paused. Drive only outstanding seek
-/// previews from the SceneTree's normal main-thread frame signal instead.
-/// This callback carries no old target/frame; the controller owns the latest
-/// request and the scheduler serializes seek/flush against in-flight decode.
-pub fn processPausedPreview(self: *NativeVideoStreamPlayback) void {
+/// One main-thread presentation pump. VideoStreamPlayer stops _update while
+/// paused, so SceneTree.process_frame drives outstanding seeks AND retirement
+/// after pause/stop/resume. It carries no old target/frame; the controller owns
+/// the latest request, and Engine.getFramesDrawn is the sole lifetime clock.
+pub fn processPresentation(self: *NativeVideoStreamPlayback) void {
     // An ObjectID-bound callable is weak. Texture2DRD.changed is synchronous:
     // its handlers may replace the stream/free the player during present().
     // This owned Variant uses gdzig's RefCounted ownership adapter; its final
     // deinit MUST happen after every other defer and every access to self.
     var keep_alive = Variant.init(*VideoStreamPlayback, self.base);
     defer keep_alive.deinit();
-    if (self.preview_processing) return;
-    self.preview_processing = true;
-    defer self.preview_processing = false;
+    if (self.presentation_processing) return;
+    self.presentation_processing = true;
+    defer self.finishPresentation();
 
+    self.present.advanceRenderEpoch();
+    if (self.preview.token == 0) return;
     const now = nowMs();
     if (self.preview.expired(now.ms)) {
         self.controller.cancelPausedPreview();
@@ -354,38 +357,49 @@ pub fn processPausedPreview(self: *NativeVideoStreamPlayback) void {
 
 fn cancelPreviewWork(self: *NativeVideoStreamPlayback) void {
     self.preview.cancel();
-    self.disconnectPausedPreview();
+    self.disconnectIdlePresentationPump();
 }
 
-fn connectPausedPreview(self: *NativeVideoStreamPlayback) void {
-    if (self.preview_tree_id != null) return;
+fn finishPresentation(self: *NativeVideoStreamPlayback) void {
+    self.presentation_processing = false;
+    self.disconnectIdlePresentationPump();
+}
+
+fn disconnectIdlePresentationPump(self: *NativeVideoStreamPlayback) void {
+    // Cancellation from a synchronous changed handler may happen before the
+    // dispatch payload is retained. Reconcile only once the whole call exits.
+    if (!self.presentation_processing and self.preview.token == 0 and !self.present.hasRetirements()) self.disconnectPresentationPump();
+}
+
+fn connectPresentationPump(self: *NativeVideoStreamPlayback) void {
+    if (self.presentation_tree_id != null) return;
     const main_loop = Engine.getMainLoop() orelse return;
     const tree = SceneTree.downcast(main_loop) orelse return;
-    var callback = self.pausedPreviewCallback();
+    var callback = self.presentationCallback();
     defer callback.deinit();
     tree.connect(SceneTree.ProcessFrame, callback) catch {
-        log.err("Could not schedule paused seek preview.", .{});
+        log.err("Could not schedule presentation pump.", .{});
         return;
     };
-    self.preview_tree_id = object_id.fromRaw(tree.getInstanceId());
+    self.presentation_tree_id = object_id.fromRaw(tree.getInstanceId());
 }
 
-fn disconnectPausedPreview(self: *NativeVideoStreamPlayback) void {
-    const id = self.preview_tree_id orelse return;
-    self.preview_tree_id = null;
+fn disconnectPresentationPump(self: *NativeVideoStreamPlayback) void {
+    const id = self.presentation_tree_id orelse return;
+    self.presentation_tree_id = null;
     const object = godot.general.instanceFromId(object_id.toEngineInt(id)) orelse return;
     const tree = SceneTree.downcast(object) orelse return;
-    var callback = self.pausedPreviewCallback();
+    var callback = self.presentationCallback();
     defer callback.deinit();
     tree.disconnect(SceneTree.ProcessFrame, callback);
 }
 
-fn pausedPreviewCallback(self: *NativeVideoStreamPlayback) Callable {
+fn presentationCallback(self: *NativeVideoStreamPlayback) Callable {
     // Do not use gdzig's fromClosure here: it destructs a cached static
     // StringName. This name is borrowed and stays alive for the process.
     return Callable.initObjectMethod(
         godot.class.Object.upcast(self.base),
-        .fromComptimeLatin1("process_paused_preview"),
+        .fromComptimeLatin1("process_presentation"),
     );
 }
 
@@ -411,13 +425,24 @@ pub fn _update(self: *NativeVideoStreamPlayback, delta: f64) void {
     // Also use the retained/token-checked path if an engine/client explicitly
     // updates paused playback; never lose a delayed preview to normal present.
     if (self.controller.paused) {
-        self.processPausedPreview();
+        self.processPresentation();
         return;
     }
+    // Normal publication has the same reentrancy/lifetime contract as the
+    // SceneTree callback, including preparation-time texture.changed signals.
+    var keep_alive = Variant.init(*VideoStreamPlayback, self.base);
+    defer keep_alive.deinit();
+    if (self.presentation_processing) return;
+    self.presentation_processing = true;
+    defer self.finishPresentation();
+    self.present.advanceRenderEpoch();
     const sink = self.mixSinkAdapter();
     const frame = self.controller.tick(delta, nowMs(), sink);
     self.flushWarnings();
     if (frame) |f| {
+        // Connect BEFORE publication: a synchronous changed handler can stop,
+        // resume, or replace the stream. Retirement must outlive that preview.
+        self.connectPresentationPump();
         _ = self.present.present(f);
     }
 }

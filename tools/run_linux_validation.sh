@@ -161,6 +161,8 @@ if (( rendered )); then
   }
   # Existing synthetic-specific luminance/variance assertions remain authoritative.
   run_godot synthetic-smoke 'SMOKE: PASS' -- --smoke
+  run_godot presentation-epoch PRESENTATION_EPOCH_PASS --script res://presentation_epoch_test.gd -- --file="$fixtures/h264-silent.mp4"
+  run_godot transport-oracles LINUX_TRANSPORT_ORACLES_PASS --script res://linux_transport_oracles_test.gd
   run_godot transport-av LINUX_TRANSPORT_PASS --script res://linux_transport_test.gd -- --file="$fixtures/h264-aac.mp4" --expect-audio=1
   run_godot transport-silent LINUX_TRANSPORT_PASS --script res://linux_transport_test.gd -- --file="$fixtures/h264-silent.mp4" --expect-audio=0
   if (( hevc )); then

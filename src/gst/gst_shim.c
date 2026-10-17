@@ -10,6 +10,10 @@
 #include <sys/stat.h>
 
 #define DEADLINE (10 * GST_SECOND)
+/* AAC seeks can produce damaged initial PCM even with an accurate demux seek.
+ * Decode a bounded lead-in, then discard it at the original requested time.
+ * This covers the observed AAC history loss, not every codec's preroll needs. */
+#define AUDIO_SEEK_PREROLL (100 * GST_MSECOND)
 const size_t *nv_gst_abi_layout(void) {
 #define OFF(T, F) offsetof(T, F)
     static const size_t layout[] = {
@@ -38,6 +42,7 @@ struct nv_gst_reader {
     GstVideoFrame video;
     GstMapInfo audio;
     GstBuffer *audio_buffer;
+    GstClockTime audio_target;
     gboolean video_mapped, audio_mapped, terminal, ready, video_only;
 };
 static void set_error(gchar **dest, const char *message) {
@@ -143,6 +148,13 @@ static gboolean probe_raw_format(nv_gst_asset *a) {
     gst_object_unref(pipeline);
     return ok;
 }
+static gint compare_audio_streams(gconstpointer left, gconstpointer right) {
+    const gchar *left_id = gst_discoverer_stream_info_get_stream_id(GST_DISCOVERER_STREAM_INFO(left));
+    const gchar *right_id = gst_discoverer_stream_info_get_stream_id(GST_DISCOVERER_STREAM_INFO(right));
+    if (!left_id) return right_id ? 1 : 0;
+    if (!right_id) return -1;
+    return strcmp(left_id, right_id);
+}
 nv_gst_asset *nv_gst_discover(const char *path) {
     nv_gst_asset *a = g_try_new0(nv_gst_asset, 1);
     if (!a) return NULL;
@@ -179,6 +191,9 @@ nv_gst_asset *nv_gst_discover(const char *path) {
         ? (double)gst_discoverer_info_get_duration(a->info) / GST_SECOND : 0;
     a->public_info.color = (nv_gst_color){1,1,1,1,8};
     a->audio = gst_discoverer_info_get_audio_streams(a->info);
+    /* Discoverer's traversal order can differ from playbin's audio indices.
+     * Match decodebin's stream-ID ordering before indexing metadata/defaults. */
+    a->audio = g_list_sort(a->audio, compare_audio_streams);
     a->public_info.audio_count = g_list_length(a->audio);
     a->defaults = g_new0(gboolean, a->public_info.audio_count);
     GList *videos = gst_discoverer_info_get_video_streams(a->info);
@@ -332,16 +347,22 @@ int nv_gst_reader_video_info(nv_gst_reader *r, nv_gst_info *out) {
     return 1;
 }
 int nv_gst_reader_seek(nv_gst_reader *r, double seconds) {
-    if (!r || !r->pipeline || !isfinite(seconds) || seconds < 0 || seconds > (double)G_MAXINT64 / GST_SECOND) return 0;
+    if (!r || !r->pipeline || !isfinite(seconds) || seconds < 0) return 0;
+    double nanoseconds = seconds * GST_SECOND;
+    /* G_MAXINT64 rounds up to 2^63 as a double; reject that value before casting. */
+    if (nanoseconds >= (double)G_MAXINT64) return 0;
+    gint64 target = (gint64)nanoseconds;
+    gint64 position = r->video_only ? target : MAX(target - (gint64)AUDIO_SEEK_PREROLL, 0);
     nv_gst_reader_unmap(r);
     if (gst_element_set_state(r->pipeline, GST_STATE_PAUSED) == GST_STATE_CHANGE_FAILURE || !wait_ready(r)) return 0;
     r->terminal = FALSE;
     g_clear_pointer(&r->error, g_free);
     if (!gst_element_seek_simple(r->pipeline, GST_FORMAT_TIME,
         GST_SEEK_FLAG_FLUSH | (r->video_only ? (GST_SEEK_FLAG_KEY_UNIT | GST_SEEK_FLAG_SNAP_BEFORE) : GST_SEEK_FLAG_ACCURATE),
-        (gint64)(seconds * GST_SECOND))) {
+        position)) {
         set_error(&r->error, "keyframe seek rejected"); r->terminal = TRUE; return 0;
     }
+    r->audio_target = target;
     return wait_ready(r);
 }
 void nv_gst_reader_unmap(nv_gst_reader *r) {
@@ -353,13 +374,13 @@ void nv_gst_reader_unmap(nv_gst_reader *r) {
     if (r->sample) gst_sample_unref(r->sample);
     r->sample = NULL;
 }
-static int pull(nv_gst_reader *r) {
+static int pull(nv_gst_reader *r, GstClockTime timeout) {
     nv_gst_reader_unmap(r);
     if (r->terminal) return r->error ? -1 : 0;
     if (gst_element_set_state(r->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         set_error(&r->error, "unable to start reader"); r->terminal = TRUE; return -1;
     }
-    r->sample = gst_app_sink_try_pull_sample(r->sink, DEADLINE);
+    r->sample = gst_app_sink_try_pull_sample(r->sink, timeout);
     if (r->sample) return 1;
     if (bus_error(r)) return -1;
     r->terminal = TRUE;
@@ -378,7 +399,7 @@ static double buffer_pts(GstSample *sample, GstBuffer *buffer) {
     return GST_CLOCK_TIME_IS_VALID(pts) ? (double)pts / GST_SECOND : -1;
 }
 int nv_gst_reader_video(nv_gst_reader *r, nv_gst_video *out) {
-    int result = pull(r);
+    int result = pull(r, DEADLINE);
     if (result != 1) return result;
     GstVideoInfo info;
     if (!gst_video_info_from_caps(&info, gst_sample_get_caps(r->sample)) ||
@@ -403,26 +424,65 @@ int nv_gst_reader_video(nv_gst_reader *r, nv_gst_video *out) {
 fail:
     set_error(&r->error, "invalid/unmappable video sample or missing PTS"); r->terminal = TRUE; return -1;
 }
+static gboolean audio_clip_frames(GstClockTime pts, GstClockTime start, GstClockTime stop,
+        guint rate, gsize frames, gsize *offset, gsize *count) {
+    /* Keep sample instants in [start, stop), rounding up to whole PCM frames.
+     * Rounded packet timestamps can put the first sample one frame after the
+     * target; its PTS must follow the actual PCM, not be relabelled as start. */
+    guint64 first = start > pts ? gst_util_uint64_scale_ceil(start - pts, rate, GST_SECOND) : 0;
+    guint64 end = frames;
+    if (GST_CLOCK_TIME_IS_VALID(stop))
+        end = stop > pts ? MIN(end, gst_util_uint64_scale_ceil(stop - pts, rate, GST_SECOND)) : 0;
+    if (first >= end) return FALSE;
+    *offset = first;
+    *count = end - first;
+    return TRUE;
+}
 int nv_gst_reader_audio(nv_gst_reader *r, nv_gst_audio *out) {
-    int result = pull(r);
-    if (result != 1) return result;
-    GstAudioInfo info;
-    if (!gst_audio_info_from_caps(&info, gst_sample_get_caps(r->sample)) ||
-        GST_AUDIO_INFO_FORMAT(&info) != GST_AUDIO_FORMAT_F32LE ||
-        GST_AUDIO_INFO_LAYOUT(&info) != GST_AUDIO_LAYOUT_INTERLEAVED) goto fail;
-    /* Accurate seeks can yield a PCM buffer straddling the segment start.
-     * Clip its memory AND timestamp at the sample boundary, rather than
-     * labelling old samples with the requested new position. */
-    r->audio_buffer = gst_audio_buffer_clip(gst_buffer_ref(gst_sample_get_buffer(r->sample)),
-        gst_sample_get_segment(r->sample), GST_AUDIO_INFO_RATE(&info), GST_AUDIO_INFO_BPF(&info));
-    if (!r->audio_buffer || !gst_buffer_map(r->audio_buffer, &r->audio, GST_MAP_READ)) goto fail;
-    r->audio_mapped = TRUE;
-    out->samples = (const float *)r->audio.data;
-    out->count = r->audio.size / sizeof(float);
-    out->channels = GST_AUDIO_INFO_CHANNELS(&info); out->rate = GST_AUDIO_INFO_RATE(&info);
-    out->pts = buffer_pts(r->sample, r->audio_buffer);
-    if (out->pts >= 0 && out->channels > 0 && out->rate > 0 &&
-        r->audio.size % (sizeof(float) * out->channels) == 0) return 1;
+    gint64 started = g_get_monotonic_time();
+    for (;;) {
+        gint64 elapsed = g_get_monotonic_time() - started;
+        if (elapsed >= (gint64)(DEADLINE / GST_USECOND)) {
+            set_error(&r->error, "audio preroll exceeded deadline"); r->terminal = TRUE; return -1;
+        }
+        int result = pull(r, DEADLINE - (GstClockTime)elapsed * GST_USECOND);
+        if (result != 1) return result;
+        GstAudioInfo info;
+        if (!gst_audio_info_from_caps(&info, gst_sample_get_caps(r->sample)) ||
+            GST_AUDIO_INFO_FORMAT(&info) != GST_AUDIO_FORMAT_F32LE ||
+            GST_AUDIO_INFO_LAYOUT(&info) != GST_AUDIO_LAYOUT_INTERLEAVED) goto fail;
+        int rate = GST_AUDIO_INFO_RATE(&info), channels = GST_AUDIO_INFO_CHANNELS(&info);
+        int bpf = GST_AUDIO_INFO_BPF(&info);
+        const GstSegment *segment = gst_sample_get_segment(r->sample);
+        GstBuffer *buffer = gst_sample_get_buffer(r->sample);
+        GstClockTime pts = GST_BUFFER_PTS(buffer), target;
+        if (rate <= 0 || channels <= 0 || bpf <= 0 || (gsize)bpf != sizeof(float) * (gsize)channels ||
+            !GST_CLOCK_TIME_IS_VALID(pts) || !segment || segment->format != GST_FORMAT_TIME ||
+            !GST_CLOCK_TIME_IS_VALID(segment->start) || !isfinite(segment->rate) || segment->rate <= 0 ||
+            !isfinite(segment->applied_rate) || segment->applied_rate <= 0) goto fail;
+        /* The target is media stream time, not raw container PTS. A negative
+         * translated position is valid: the segment simply starts after it. */
+        int sign = gst_segment_position_from_stream_time_full(segment, GST_FORMAT_TIME, r->audio_target, &target);
+        if (!sign || !GST_CLOCK_TIME_IS_VALID(target)) goto fail;
+        GstClockTime start = sign > 0 ? MAX(segment->start, target) : segment->start;
+        r->audio_buffer = gst_buffer_ref(buffer);
+        if (!gst_buffer_map(r->audio_buffer, &r->audio, GST_MAP_READ)) goto fail;
+        r->audio_mapped = TRUE;
+        if (r->audio.size % bpf != 0) goto fail;
+        gsize offset, count;
+        if (!audio_clip_frames(pts, start, segment->stop, rate, r->audio.size / bpf, &offset, &count)) continue;
+        GstClockTime advance = gst_util_uint64_scale_round(offset, GST_SECOND, rate), stream_time;
+        if (advance >= GST_CLOCK_TIME_NONE - pts) goto fail;
+        /* Keep the original segment mapping and the timestamp of the actual
+         * first retained sample; only the PCM view is sliced, never relabelled. */
+        if (gst_segment_to_stream_time_full(segment, GST_FORMAT_TIME, pts + advance, &stream_time) != 1 ||
+            !GST_CLOCK_TIME_IS_VALID(stream_time)) goto fail;
+        out->samples = (const float *)r->audio.data + offset * (gsize)channels;
+        out->count = count * (gsize)channels;
+        out->channels = channels; out->rate = rate;
+        out->pts = (double)stream_time / GST_SECOND;
+        return 1;
+    }
 fail:
     set_error(&r->error, "invalid/unmappable float32 PCM sample or missing PTS"); r->terminal = TRUE; return -1;
 }
