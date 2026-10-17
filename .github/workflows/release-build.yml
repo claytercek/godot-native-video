@@ -42,7 +42,7 @@ jobs:
       - name: Setup Godot
         uses: chickensoft-games/setup-godot@v2
         with:
-          version: "4.7.1"
+          version: "4.7.2"
           use-dotnet: false
 
       - name: Stage output dir
@@ -109,7 +109,7 @@ jobs:
       - name: Setup Godot
         uses: chickensoft-games/setup-godot@v2
         with:
-          version: "4.7.1"
+          version: "4.7.2"
           use-dotnet: false
 
       - name: Stage output dir
@@ -155,9 +155,61 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build-linux:
+    name: Build Linux x86_64
+    # Build natively against this glibc/GStreamer baseline. Do not cross-link
+    # host GStreamer libraries into ARM binaries or advertise unbuilt outputs.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.2"
+          use-dotnet: false
+
+      - name: Install GStreamer development/runtime packages
+        run: |
+          sudo apt-get update
+          # Ubuntu runner's LLVM unwinder conflicts with GStreamer's libunwind-dev.
+          sudo apt-get remove -y libunwind-14-dev
+          sudo apt-get install -y pkg-config libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav
+
+      - name: Build Linux debug and release libraries
+        run: |
+          mkdir -p staging
+          for mode in debug release; do
+            optimize=safe
+            if [ "$mode" = release ]; then optimize=fast; fi
+            zig build -Doptimize="$optimize" -Dcpu=baseline --summary all
+            ldd -r project/lib/libnative_video.so 2>&1 | tee /tmp/native-video-ldd.log
+            if grep -E 'undefined symbol|not found' /tmp/native-video-ldd.log; then exit 1; fi
+            cp project/lib/libnative_video.so "staging/libnative_video.linux.$mode.x86_64.so"
+          done
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-video-linux
+          path: staging/*.so
+          if-no-files-found: error
+          retention-days: 1
+
   package:
     name: Package & Publish
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-windows, build-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -182,31 +234,113 @@ jobs:
           name: native-video-windows
           path: staging
 
-      - name: Validate binaries
-        run: |
-          test -s staging/libnative_video.macos.debug.dylib
-          test -s staging/libnative_video.macos.release.dylib
-          test -s staging/native_video.windows.debug.x86_64.dll
-          test -s staging/native_video.windows.release.x86_64.dll
-          test -s staging/native_video.windows.debug.x86_32.dll
-          test -s staging/native_video.windows.release.x86_32.dll
-          test -s staging/native_video.windows.debug.arm64.dll
-          test -s staging/native_video.windows.release.arm64.dll
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: native-video-linux
+          path: staging
 
       - name: Assemble addon
         run: |
           mkdir -p addon-out/addons/native_video
-          cp staging/libnative_video.macos.debug.dylib addon-out/addons/native_video/
-          cp staging/libnative_video.macos.release.dylib addon-out/addons/native_video/
-          cp staging/native_video.windows.debug.x86_64.dll addon-out/addons/native_video/
-          cp staging/native_video.windows.release.x86_64.dll addon-out/addons/native_video/
-          cp staging/native_video.windows.debug.x86_32.dll addon-out/addons/native_video/
-          cp staging/native_video.windows.release.x86_32.dll addon-out/addons/native_video/
-          cp staging/native_video.windows.debug.arm64.dll addon-out/addons/native_video/
-          cp staging/native_video.windows.release.arm64.dll addon-out/addons/native_video/
-          cp addon/native_video.gdextension addon-out/addons/native_video/
-          cp LICENSE addon-out/addons/native_video/
-          cp README.md addon-out/addons/native_video/
+          cp staging/* addon-out/addons/native_video/
+          cp addon/native_video.gdextension LICENSE README.md addon-out/addons/native_video/
+          python3 -m unittest discover -s tools -p 'test_check_packaged_addon.py'
+          python3 tools/check_packaged_addon.py addon-out/addons/native_video
+
+      # An editor always has the debug feature; custom feature tags cannot
+      # remove it. Use the real release template to test release selection.
+      # Run beside loose project files, without --path/--script (official
+      # 4.7 templates disable those overrides). No export/PCK addon rewrite.
+      - name: Setup Godot runtime validation binaries
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.2"
+          use-dotnet: false
+          include-templates: true
+
+      - name: Validate assembled addon with runtime-only Ubuntu packages
+        timeout-minutes: 10
+        run: |
+          mkdir -p runtime-check
+          install -m755 "$(readlink -f "$(command -v godot)")" runtime-check/godot-debug
+          template_dir="$HOME/.local/share/godot/export_templates/$(godot --version | cut -d. -f1-4)"
+          install -m755 "$template_dir/linux_release.x86_64" runtime-check/godot-release
+          docker run --rm -i \
+            -v "$PWD:/checkout:ro" -v "$PWD/runtime-check:/runtime" \
+            ubuntu:22.04 bash -euo pipefail -s <<'RUNTIME'
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            libfontconfig1 libx11-6 libxcursor1 libxinerama1 libxi6 \
+            libxrandr2 libgl1 libasound2 libpulse0 libudev1 libstdc++6 \
+            libvulkan1 mesa-vulkan-drivers xvfb xauth python3
+          dpkg-query -W -f='${binary:Package}\n' > /runtime/packages.log
+          if grep -E -- '-dev(:|$)' /runtime/packages.log; then
+            echo 'Runtime validation unexpectedly installed development packages' >&2
+            exit 1
+          fi
+          for compiler in cc gcc g++ clang zig; do
+            if command -v "$compiler"; then
+              echo 'Runtime validation unexpectedly has a compiler' >&2
+              exit 1
+            fi
+          done
+          gst-inspect-1.0 appsink > /runtime/appsink.log
+          gst-inspect-1.0 avdec_h264 > /runtime/h264.log
+          gst-inspect-1.0 avdec_h265 > /runtime/hevc.log
+          gst-inspect-1.0 avdec_aac > /runtime/aac.log
+          mkdir -p /tmp/project/.godot /tmp/runtime
+          cp /checkout/project/{main.gd,main.tscn,synthetic.mp4} /tmp/project/
+          cp -a /checkout/addon-out/addons /tmp/project/
+          cp /runtime/godot-{debug,release} /tmp/project/
+          cp /checkout/tools/check_packaged_addon.gd /tmp/project/package_selection.gd
+          sed 's|run/main_scene=.*|run/main_scene="res://package_selection.tscn"|' \
+            /checkout/project/project.godot > /tmp/project/project.godot
+          printf '%s\n' '[gd_scene load_steps=2 format=3]' \
+            '[ext_resource type="Script" path="res://package_selection.gd" id="1"]' \
+            '[node name="PackageSelection" type="Node"]' 'script = ExtResource("1")' \
+            > /tmp/project/package_selection.tscn
+          printf 'res://addons/native_video/native_video.gdextension\n' > /tmp/project/.godot/extension_list.cfg
+          chmod 700 /tmp/runtime
+          export XDG_RUNTIME_DIR=/tmp/runtime
+          export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          export LIBGL_ALWAYS_SOFTWARE=1
+          for library in /tmp/project/addons/native_video/*.so; do
+            log="/runtime/ldd-$(basename "$library").log"
+            ldd -r "$library" > "$log" 2>&1
+            if grep -E 'undefined symbol|not found' "$log"; then exit 1; fi
+          done
+          cd /tmp/project
+          for mode in debug release; do
+            export NATIVE_VIDEO_PACKAGE_MODE="$mode"
+            timeout --kill-after=5 30 "./godot-$mode" --headless \
+              > "/runtime/selection-$mode.log" 2>&1
+            python3 /checkout/tools/check_linux_validation_log.py \
+              "/runtime/selection-$mode.log" --marker "PACKAGE_SELECTION_PASS $mode"
+            timeout --kill-after=5 60 xvfb-run -a -s '-screen 0 640x480x24' \
+              "./godot-$mode" --display-driver x11 \
+              --rendering-method forward_plus --rendering-driver vulkan \
+              --audio-driver Dummy -- --smoke > "/runtime/smoke-$mode.log" 2>&1
+            python3 /checkout/tools/check_linux_validation_log.py \
+              "/runtime/smoke-$mode.log" --marker 'SMOKE: PASS'
+          done
+          # Validation must neither patch the manifest nor swap/rename libraries.
+          diff -r /checkout/addon-out/addons /tmp/project/addons
+          RUNTIME
+
+      - name: Upload Linux runtime validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-video-linux-runtime-logs
+          path: runtime-check/*.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Zip addon
         run: |

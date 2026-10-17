@@ -233,7 +233,7 @@ track with a differing rate is refused.
 
 1. Install Zig 0.17.0, then make a Godot executable resolvable via
    `GODOT_PATH`, `-Dgodot-path=`, or `PATH`.
-   For example, with gdvm: `export GODOT_PATH="$(gdvm show 4.7.1)"`.
+   For example, with gdvm: `export GODOT_PATH="$(gdvm show 4.7.2)"`.
    Or use the path to your installed Godot executable. Every `zig build`
    invocation needs Godot, including `zig build test`. Resolution order is
    `-Dgodot-path`, then `GODOT_PATH`, then `godot` on `PATH`; bindings come
@@ -314,13 +314,38 @@ track with a differing rate is refused.
    Xvfb. Both steps launch the Godot resolved from `-Dgodot-path`,
    `GODOT_PATH`, or `PATH`, in that order.
 
-   Linux CI targets stock Godot 4.6.3 and 4.7.2.
-   `tools/gen_linux_validation_media.sh` and `tools/run_linux_validation.sh`
-   cover decode, audio-track selection, seeking, looping, and paused-preview
-   lifecycle regressions. Physical
-   AMD RX Vega validation also covered transport and reentrant preview
-   teardown. These checks don't certify hardware decoding or HDR display
-   output.
+### CI and local validation
+
+Required checks in `.github/workflows/test.yml` cover macOS, Linux, and
+Windows with stock Godot 4.7.2 (primary) and 4.6.3 (supported floor). All
+six combinations build the extension and run a short rendered playback
+smoke using the checked-in `project/synthetic.mp4`. Unit/native-backend
+tests and standalone decode smoke run only on the primary version.
+Windows also generates the fixtures its native tests require.
+
+Deeper Linux codec, multitrack, seek, lifecycle, input-rejection, and
+rendered transport regressions remain local opt-in checks, not CI jobs.
+With the build dependencies above plus FFmpeg and Python 3 installed:
+
+```bash
+bash tools/gen_linux_validation_media.sh /tmp/native-video-fixtures
+bash tools/run_linux_validation.sh --fixtures /tmp/native-video-fixtures \
+  --results /tmp/native-video-backend-results --backend-only
+```
+
+For rendered checks with software Vulkan and Xvfb (Ubuntu example):
+
+```bash
+GNV_LVP_ICD=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+  bash tools/run_linux_validation.sh --fixtures /tmp/native-video-fixtures \
+  --results /tmp/native-video-rendered-results --rendered-only --renderer software-xvfb
+```
+
+Install Xvfb and Mesa Vulkan drivers for that command, and adjust the ICD
+path for your system. Logs go to the chosen results directory. Software
+rendering doesn't certify hardware decoding or HDR display output.
+Physical AMD RX Vega validation also covered transport and reentrant preview
+teardown.
 
 ## Project layout
 
