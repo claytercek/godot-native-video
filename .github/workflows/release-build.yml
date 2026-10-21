@@ -8,7 +8,7 @@ on:
         type: string
         required: false
         default: ""
-  # Called by release-please.yml when a release is created. The tag input
+  # Called by release.yml when a release is created. The tag input
   # makes this job attach the packaged zip to that GitHub Release. Called
   # (workflow_call) instead of triggered by `on: release`, because releases
   # made by the default GITHUB_TOKEN don't fire release events.
@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release-tag || github.sha }}
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -94,6 +96,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release-tag || github.sha }}
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -163,6 +167,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release-tag || github.sha }}
           persist-credentials: false
 
       - name: Download macOS binaries

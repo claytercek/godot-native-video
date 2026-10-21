@@ -276,6 +276,11 @@ track with a differing rate is refused.
 For the historical record of how this implementation was chosen —
 benchmarks and rationale — see [EVALUATION.md](EVALUATION.md).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for release-note and release-workflow
+instructions.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

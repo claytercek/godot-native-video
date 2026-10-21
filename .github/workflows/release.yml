@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      created: ${{ steps.release.outputs.created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Changie
+        uses: miniscruff/changie-action@v3
+        with:
+          version: v1.26.0
+
+      - name: Publish prepared release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="$(changie latest)"
+          # v0.3.1 contains imported history, not a new release.
+          if [[ "$tag" == v0.3.1 ]] || git show-ref --verify --quiet "refs/tags/$tag"; then
+            exit 0
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" \
+            --title "$tag" --notes-file ".changes/$tag.md"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+
+  # PR refresh must not block the binary build after publication succeeds.
+  release-pr:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Changie
+        uses: miniscruff/changie-action@v3
+        with:
+          version: v1.26.0
+
+      - name: Prepare release notes
+        id: notes
+        shell: bash
+        run: |
+          if compgen -G '.changes/unreleased/*.yaml' > /dev/null; then
+            changie batch auto --allow-no-changes=false
+          fi
+          changie merge
+          echo "version=$(changie latest)" >> "$GITHUB_OUTPUT"
+
+      # A fixed branch maintains one rolling PR, including when its proposed
+      # version changes. With no diff this also closes an obsolete release PR.
+      - name: Update release PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          base: main
+          branch: release/changie
+          delete-branch: true
+          title: Release ${{ steps.notes.outputs.version }}
+          commit-message: Release ${{ steps.notes.outputs.version }}
+          body-path: .changes/${{ steps.notes.outputs.version }}.md
+          add-paths: |
+            .changes/
+            CHANGELOG.md
+
+  # GITHUB_TOKEN-created releases do not trigger another release workflow.
+  # Call the existing binary build directly, using the exact version tag.
+  build:
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    uses: ./.github/workflows/release-build.yml
+    with:
+      release-tag: ${{ needs.release.outputs.tag_name }}
+    secrets: inherit
+    permissions:
+      contents: write
