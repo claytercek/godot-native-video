@@ -1,0 +1,3 @@
+kind: fixed
+body: Fix intermittent crashes and video-open failures caused by heap corruption in gdzig’s allocator. (#26)
+time: 2026-10-21T11:47:17.55374822-04:00

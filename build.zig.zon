@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .gdzig = .{
-            .url = "git+https://github.com/gdzig/gdzig#7e50fe4eeed6b6d6437e61706f25906f8a68eac7",
-            .hash = "godot-0.0.0-dev-q0GYjuSbwQBuWCSxjO_V1pYSWC7OEVw8d-bdpK1IFfea",
+            .url = "git+https://github.com/gdzig/gdzig#c05f4910e2bf72cb947423acee6554dd0d29b041",
+            .hash = "godot-0.0.0-dev-q0GYjjVDxQBIclm8yGfVodpqKfN9aCYkM3ITWK2xBarO",
         },
     },
     .paths = .{
