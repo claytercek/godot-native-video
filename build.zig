@@ -298,7 +298,8 @@ pub fn build(b: *Build) !void {
         .linux => "vulkan",
         else => "default",
     }, "--log" });
-    smoke.addArg(b.getInstallPath(.prefix, "smoke.log"));
+    // Pass the output path without tracking the not-yet-created log as an input.
+    smoke.addDirectoryArg2(b.graph.path(.install_prefix, "smoke.log"), .{});
     smoke.addArg("--");
     smoke.addPassthruArgs();
     smoke.step.dependOn(&install.step);
