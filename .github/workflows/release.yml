@@ -4,9 +4,24 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      package-only:
+        description: "Only build/package; skip release creation and release PR refresh"
+        type: boolean
+        required: false
+        default: false
+      release-tag:
+        description: "Existing release tag (package-only only; empty uploads a workflow artifact)"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 concurrency:
   group: release
@@ -14,7 +29,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && !inputs.package-only
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -50,7 +65,7 @@ jobs:
 
   # PR refresh must not block the binary build after publication succeeds.
   release-pr:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && !inputs.package-only
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -93,13 +108,75 @@ jobs:
             CHANGELOG.md
 
   # GITHUB_TOKEN-created releases do not trigger another release workflow.
-  # Call the existing binary build directly, using the exact version tag.
+  # Build the published tag, or explicitly package a manual tag/SHA without
+  # creating a release. Ignore release-tag outside package-only mode.
   build:
     needs: release
-    if: needs.release.outputs.created == 'true'
-    uses: ./.github/workflows/release-build.yml
+    if: always() && !cancelled() && (needs.release.outputs.created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.package-only))
+    uses: ./.github/workflows/build.yml
     with:
-      release-tag: ${{ needs.release.outputs.tag_name }}
-    secrets: inherit
+      ref: ${{ inputs.package-only && (inputs.release-tag || github.sha) || needs.release.outputs.tag_name }}
+    permissions:
+      contents: read
+
+  package:
+    name: Package & Publish
+    needs: [release, build]
+    if: always() && !cancelled() && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.package-only && inputs.release-tag || needs.release.outputs.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.package-only && (inputs.release-tag || github.sha) || needs.release.outputs.tag_name }}
+          persist-credentials: false
+
+      - name: Download macOS binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: native-video-macos
+          path: staging
+
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: native-video-windows
+          path: staging
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: native-video-linux
+          path: staging
+
+      - name: Assemble addon
+        run: |
+          mkdir -p addon-out/addons/native_video
+          cp staging/* addon-out/addons/native_video/
+          cp addon/native_video.gdextension LICENSE README.md addon-out/addons/native_video/
+          python3 -m unittest discover -s tools -p 'test_check_packaged_addon.py'
+          python3 tools/check_packaged_addon.py addon-out/addons/native_video
+
+      - name: Zip addon
+        run: |
+          zip_name="native_video-${RELEASE_TAG:-${GITHUB_SHA}}.zip"
+          echo "ZIP_NAME=${zip_name}" >> "$GITHUB_ENV"
+          (cd addon-out && zip -r "../${zip_name}" addons)
+
+      - name: Attach zip to GitHub Release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" "$ZIP_NAME" --clobber
+
+      - name: Upload workflow artifact (manual runs)
+        if: env.RELEASE_TAG == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: native_video
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error

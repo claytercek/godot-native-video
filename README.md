@@ -74,8 +74,7 @@ Highlights:
   configuring the build and fails without it, even for steps that never
   launch Godot.
 
-For Linux runtime use on Ubuntu/Debian, install the GStreamer packages
-used by the release workflow's runtime-only container:
+For Linux runtime use on Ubuntu/Debian, install these GStreamer packages:
 
 ```bash
 sudo apt-get update
@@ -317,10 +316,14 @@ track with a differing rate is refused.
 ### CI and local validation
 
 Required checks in `.github/workflows/test.yml` cover macOS, Linux, and
-Windows with stock Godot 4.7.2 (primary) and 4.6.3 (supported floor). All
-six combinations build the extension and run a short rendered playback
-smoke using the checked-in `project/synthetic.mp4`. Unit/native-backend
-tests and standalone decode smoke run only on the primary version.
+Windows with stock Godot 4.7.2 (primary) and 4.6.3 (supported floor). The
+shared `.github/workflows/build.yml`, also called by
+`.github/workflows/release.yml`, builds every shipped platform/architecture
+in safe/debug and fast/release modes once per run. All six runtime
+combinations consume its fast/release artifacts and run a short rendered
+playback smoke using the checked-in `project/synthetic.mp4`.
+Unit/native-backend tests and standalone decode smoke still build their
+own harnesses and run only on the primary version.
 Windows also generates the fixtures its native tests require.
 
 Deeper Linux codec, multitrack, seek, lifecycle, input-rejection, and

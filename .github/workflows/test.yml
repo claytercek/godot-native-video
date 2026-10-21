@@ -16,9 +16,17 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
   test:
+    # Keep the existing check name for branch-protection rules.
     name: Build & Smoke (${{ matrix.os }}, Godot ${{ matrix.godot }})
+    needs: build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     defaults:
@@ -79,8 +87,23 @@ jobs:
           gst-inspect-1.0 avdec_h264 > ci-logs/h264-decoder.log
           gst-inspect-1.0 avdec_aac > ci-logs/aac-decoder.log
 
-      - name: Build extension
-        run: zig build --summary all 2>&1 | tee ci-logs/build.log
+      - name: Download platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: native-video-${{ runner.os == 'macOS' && 'macos' || runner.os == 'Windows' && 'windows' || 'linux' }}
+          path: staging
+
+      # Runtime coverage remains fast/release only. Native tests and decode
+      # smoke build their own harnesses without installing the extension.
+      - name: Install release extension
+        run: |
+          mkdir -p project/lib
+          case "$RUNNER_OS" in
+            macOS) cp staging/libnative_video.macos.release.dylib project/lib/libnative_video.dylib ;;
+            Windows) cp staging/native_video.windows.release.x86_64.dll project/lib/native_video.dll ;;
+            Linux) cp staging/libnative_video.linux.release.x86_64.so project/lib/libnative_video.so ;;
+            *) echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
+          esac
 
       - name: Reject unresolved Linux symbols
         if: runner.os == 'Linux'

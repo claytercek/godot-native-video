@@ -41,9 +41,9 @@ changie merge --dry-run | diff -u CHANGELOG.md -
 Every push to `main` updates a single `release/changie` PR with the batched
 notes and generated `CHANGELOG.md`. Review and merge that PR when ready to
 release; GitHub's rebase-and-merge is supported. The Release workflow creates
-the `vX.Y.Z` tag and GitHub release, then calls the existing binary build to
-attach the addon ZIP. With no pending fragments, no release PR is needed.
-The history through `v0.3.1` is preserved in `.changes/v0.3.1.md`; subsequent
+the `vX.Y.Z` tag and GitHub release, then builds, validates, and attaches
+the addon ZIP. With no pending fragments, no release PR is needed. The
+history through `v0.3.1` is preserved in `.changes/v0.3.1.md`; subsequent
 releases each have their own `.changes/v*.md` file.
 
 Edit fragments in the originating PR rather than editing generated release-PR
@@ -56,12 +56,18 @@ default `GITHUB_TOKEN`; no extra secret is needed. Workflows triggered by the
 bot-created PR may require approval before running. No changelog or fragment
 check is required.
 
-To refresh the release PR, manually run **Release** on `main`. Publication and
-PR refresh run independently, so a failed PR update won't block a release's
-binary build. New tags point to the commit checked out by the Release run.
-The imported `v0.3.1` baseline and existing tags are skipped.
+To refresh the release PR, manually run **Release** on `main` with the default
+inputs. Publication and PR refresh run independently, so a failed PR update
+won't block a release's binary build. New tags point to the commit checked
+out by the Release run. The imported `v0.3.1` baseline and existing tags are
+skipped.
 
-For a failed build, rerun the failed jobs or manually run **Build & Release**
-with that release tag. Every build and packaging checkout uses the tag, not
-the current `main`. If a tag exists without a GitHub release, create the release
-for that tag using its `.changes/vX.Y.Z.md` notes before running the build.
+For a failed build, rerun the failed jobs or manually run **Release** with
+`package-only` enabled and `release-tag` set to that existing release tag.
+Every build and packaging checkout uses the tag, not the current `main`.
+This mode skips release creation and PR refresh. Leave `release-tag` empty
+to build the selected ref's SHA and upload the ZIP as a workflow artifact
+without attaching it to a release. The tag input is ignored unless
+`package-only` is enabled. If a tag exists without a GitHub release, create
+the release for that tag using its `.changes/vX.Y.Z.md` notes before
+running the build.

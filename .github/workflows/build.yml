@@ -1,0 +1,177 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Source ref to build (defaults to the caller's SHA)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-linux-windows:
+    name: Build Linux & Windows
+    # Build Linux natively against this glibc/GStreamer baseline. Do not
+    # cross-link host GStreamer libraries into ARM binaries.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      # Never run here -- only present to satisfy gdzig's configure-time
+      # lookup, which panics when no Godot executable can be resolved.
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.2"
+          use-dotnet: false
+
+      - name: Install GStreamer development/runtime packages
+        run: |
+          sudo apt-get update
+          # Ubuntu runner's LLVM unwinder conflicts with GStreamer's libunwind-dev.
+          sudo apt-get remove -y libunwind-14-dev
+          sudo apt-get install -y pkg-config libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav
+
+      - name: Build Linux debug and release libraries
+        run: |
+          mkdir -p staging
+          for mode in debug release; do
+            optimize=safe
+            if [ "$mode" = release ]; then optimize=fast; fi
+            zig build -Doptimize="$optimize" -Dcpu=baseline --summary all
+            ldd -r project/lib/libnative_video.so 2>&1 | tee /tmp/native-video-ldd.log
+            if grep -E 'undefined symbol|not found' /tmp/native-video-ldd.log; then exit 1; fi
+            cp project/lib/libnative_video.so "staging/libnative_video.linux.$mode.x86_64.so"
+          done
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-video-linux
+          path: staging/*.so
+          if-no-files-found: error
+          retention-days: 1
+
+      # Zig's bundled MinGW toolchain can cross-compile every Windows target
+      # from the same Linux host, without another tooling setup.
+      - name: Build Windows x86_64 (debug)
+        run: |
+          zig build -Dtarget=x86_64-windows-gnu -Doptimize=safe --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.debug.x86_64.dll
+
+      - name: Build Windows x86_64 (release)
+        run: |
+          zig build -Dtarget=x86_64-windows-gnu -Doptimize=fast --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.release.x86_64.dll
+
+      - name: Build Windows x86_32 (debug)
+        run: |
+          zig build -Dtarget=x86-windows-gnu -Doptimize=safe --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.debug.x86_32.dll
+
+      - name: Build Windows x86_32 (release)
+        run: |
+          zig build -Dtarget=x86-windows-gnu -Doptimize=fast --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.release.x86_32.dll
+
+      - name: Build Windows arm64 (debug)
+        run: |
+          zig build -Dtarget=aarch64-windows-gnu -Doptimize=safe --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.debug.arm64.dll
+
+      - name: Build Windows arm64 (release)
+        run: |
+          zig build -Dtarget=aarch64-windows-gnu -Doptimize=fast --summary all
+          cp project/lib/native_video.dll staging/native_video.windows.release.arm64.dll
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-video-windows
+          path: staging/*.dll
+          if-no-files-found: error
+          retention-days: 1
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      # Never run here -- only present to satisfy gdzig's configure-time
+      # lookup, which panics when no Godot executable can be resolved.
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.2"
+          use-dotnet: false
+
+      - name: Stage output dir
+        run: mkdir -p staging
+
+      - name: Build macOS arm64 (debug)
+        run: |
+          zig build -Dtarget=aarch64-macos -Doptimize=safe --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-arm64.debug.dylib
+
+      - name: Build macOS arm64 (release)
+        run: |
+          zig build -Dtarget=aarch64-macos -Doptimize=fast --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-arm64.release.dylib
+
+      - name: Build macOS x86_64 (debug)
+        run: |
+          zig build -Dtarget=x86_64-macos -Doptimize=safe --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-x86_64.debug.dylib
+
+      - name: Build macOS x86_64 (release)
+        run: |
+          zig build -Dtarget=x86_64-macos -Doptimize=fast --summary all
+          cp project/lib/libnative_video.dylib staging/libnative_video.macos-x86_64.release.dylib
+
+      - name: Lipo universal macOS binaries
+        run: |
+          lipo -create staging/libnative_video.macos-arm64.debug.dylib staging/libnative_video.macos-x86_64.debug.dylib -output staging/libnative_video.macos.debug.dylib
+          lipo -create staging/libnative_video.macos-arm64.release.dylib staging/libnative_video.macos-x86_64.release.dylib -output staging/libnative_video.macos.release.dylib
+
+      # iOS is deliberately not built here: it produces a plain .dylib, but
+      # Godot's iOS export conventionally needs a static library /
+      # .xcframework, and only link-time (not on-device runtime) has been
+      # verified. See README for the follow-up.
+
+      - name: Upload macOS binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-video-macos
+          path: |
+            staging/libnative_video.macos.debug.dylib
+            staging/libnative_video.macos.release.dylib
+          if-no-files-found: error
+          retention-days: 1
