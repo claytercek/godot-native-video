@@ -1,0 +1,3 @@
+kind: fixed
+body: Fix looping and replay after scrubbing so videos restart from the beginning instead of the last seek position.
+time: 2026-10-21T11:54:41-04:00
