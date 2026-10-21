@@ -17,8 +17,8 @@ defaults:
     shell: bash
 
 jobs:
-  build-linux-windows:
-    name: Build Linux & Windows
+  build-linux:
+    name: Build Linux
     # Build Linux natively against this glibc/GStreamer baseline. Do not
     # cross-link host GStreamer libraries into ARM binaries.
     runs-on: ubuntu-22.04
@@ -46,10 +46,10 @@ jobs:
           sudo apt-get update
           # Ubuntu runner's LLVM unwinder conflicts with GStreamer's libunwind-dev.
           sudo apt-get remove -y libunwind-14-dev
-          sudo apt-get install -y pkg-config libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-            gstreamer1.0-plugins-ugly gstreamer1.0-libav
+          # Link libraries are dependencies of the dev packages. Codec plugins
+          # are only needed by the test jobs, not compilation or ldd validation.
+          sudo apt-get install -y --no-install-recommends pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - name: Build Linux debug and release libraries
         run: |
@@ -71,8 +71,32 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # Zig's bundled MinGW toolchain can cross-compile every Windows target
-      # from the same Linux host, without another tooling setup.
+  build-windows:
+    name: Build Windows
+    # Zig's bundled MinGW toolchain cross-compiles all Windows targets. This
+    # independent Linux host needs no GStreamer development/runtime packages.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      # gdzig resolves Godot at configure time; it is not executed here.
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: "4.7.2"
+          use-dotnet: false
+
+      - name: Stage output dir
+        run: mkdir -p staging
+
       - name: Build Windows x86_64 (debug)
         run: |
           zig build -Dtarget=x86_64-windows-gnu -Doptimize=safe --summary all

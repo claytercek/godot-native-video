@@ -327,7 +327,8 @@ fn linkMfLibs(mod: *Build.Module) void {
         "mfplat", "mfreadwrite", "mf",    "d3d11",
         "dxgi",   "d3d12",       "ole32", "d3dcompiler_47",
     }) |lib| {
-        mod.linkSystemLibrary(lib, .{});
+        // Windows import libraries need no pkg-config; avoid broken host wrappers.
+        mod.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
     }
 }
 
