@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0](https://github.com/claytercek/godot-native-video/compare/v0.3.1...v0.4.0) (2026-10-21)
+
+### Added
+* Add Linux video playback through GStreamer, with x86_64 debug and release binaries for stock Godot 4.6+ using the Forward+ Vulkan renderer. Supports H.264/HEVC video, NV12/P010 frame uploads, audio track selection, and seeking. Linux requires system GStreamer libraries and codec plugins; these are not bundled with the addon. Hardware decoding is optional, and presentation uses CPU uploads rather than zero-copy. See the README for runtime package installation.
+
+### Fixed
+* Fix intermittent crashes and video-open failures caused by heap corruption in gdzig’s allocator. (#26)
+* Fix looping and replay after scrubbing so videos restart from the beginning instead of the last seek position.
+
 ## [0.3.1](https://github.com/claytercek/godot-native-video/compare/v0.3.0...v0.3.1) (2026-09-16)
 
 

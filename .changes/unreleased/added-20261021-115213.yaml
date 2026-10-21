@@ -1,3 +1,0 @@
-kind: added
-body: Add Linux video playback through GStreamer, with x86_64 debug and release binaries for stock Godot 4.6+ using the Forward+ Vulkan renderer. Supports H.264/HEVC video, NV12/P010 frame uploads, audio track selection, and seeking. Linux requires system GStreamer libraries and codec plugins; these are not bundled with the addon. Hardware decoding is optional, and presentation uses CPU uploads rather than zero-copy. See the README for runtime package installation.
-time: 2026-10-21T11:52:13.532598577-04:00
