@@ -499,12 +499,14 @@ pub const PlaybackController = struct {
     // End-of-playback: video EOS (atEnd() is worker-reported) and audio drained.
     fn checkEndOfPlayback(self: *PlaybackController, sched: *DecodeScheduler, now: WallClockMs, media_now: f64) void {
         if (sched.atEnd(self.stream.?) and self.audioExhausted()) {
-            // This branch runs exactly once per load() on the tick that observes
-            // both conditions true (tick() no-ops on every subsequent call once
-            // self.playing is false), so reportFinal's own idempotency guard is
-            // a belt-and-suspenders, not load-bearing here.
+            // This branch runs once per completed playback on the tick that
+            // observes both conditions true (tick() no-ops until play()).
             self.audio_telemetry.reportFinal(now, media_now);
             self.playing = false;
+            // Godot loops by calling play() alone. The completed run's scrub
+            // target must not become its loop start; a new seek after EOS can
+            // still establish an intentional target before the next play().
+            self.scrubber = Scrubber.init(self.scrubber.config);
         }
     }
 

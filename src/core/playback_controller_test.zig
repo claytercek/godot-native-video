@@ -413,6 +413,100 @@ test "stop() resets transport state and tick() is a no-op before load()" {
     controller.shutdown();
 }
 
+// Drive the public tick() seam until the real scheduler reports drained EOS.
+// ReleaseFast uses a worker, so allow it to fill between ticks as well.
+fn finishPlayback(controller: *PlaybackController, sink: MixSink, start_ms: f64) !f64 {
+    for (0..2000) |i| {
+        const now_ms = start_ms + @as(f64, @floatFromInt(i)) * (1000.0 / 30.0);
+        if (controller.tick(1.0 / 30.0, WallClockMs.init(now_ms), sink)) |frame| frame.release();
+        if (!controller.playing) return now_ms;
+        if (!controller.sched.isSynchronous()) @import("sys_clock.zig").sleep(100 * std.time.ns_per_us);
+    }
+    return error.PlaybackDidNotFinish;
+}
+
+fn expectPlaybackStartsAt(controller: *PlaybackController, sink: MixSink, target: f64, now_ms: f64) !void {
+    controller.play(WallClockMs.init(now_ms));
+    try std.testing.expect(controller.playing);
+    try std.testing.expectApproxEqAbs(target, controller.position, 1e-9);
+    try std.testing.expectApproxEqAbs(target, controller.mediaTime(), 1e-9);
+    const frame = controller.tick(0.0, WallClockMs.init(now_ms), sink) orelse return error.MissingRestartFrame;
+    defer frame.release();
+    try std.testing.expectApproxEqAbs(target, frame.pts_seconds, 1e-9);
+}
+
+test "play after sought playback reaches EOS restarts at zero on every loop" {
+    const sched = makeSched();
+    defer sched.deinit();
+    var controller = PlaybackController.init();
+    defer controller.deinit();
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
+    var sink: AcceptAllMixSink = .{};
+    try expectPlaybackStartsAt(&controller, sink.sink(), 0.0, 0.0);
+
+    var now_ms: f64 = 1000.0;
+    for (0..3) |_| {
+        controller.seek(1.0, WallClockMs.init(now_ms));
+        now_ms = try finishPlayback(&controller, sink.sink(), now_ms + 1000.0);
+        // EOS holds the last presented image; only play() rewinds delivery.
+        try std.testing.expect(controller.position > 9.0);
+        now_ms += 1000.0;
+        try expectPlaybackStartsAt(&controller, sink.sink(), 0.0, now_ms);
+        now_ms += 1000.0;
+    }
+    // A subsequent loop without another seek also starts at zero.
+    now_ms = try finishPlayback(&controller, sink.sink(), now_ms);
+    try expectPlaybackStartsAt(&controller, sink.sink(), 0.0, now_ms + 1000.0);
+}
+
+test "an explicit seek after EOS remains the next play target" {
+    const sched = makeSched();
+    defer sched.deinit();
+    var controller = PlaybackController.init();
+    defer controller.deinit();
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
+    var sink: AcceptAllMixSink = .{};
+    controller.play(WallClockMs.init(0.0));
+    controller.seek(1.0, WallClockMs.init(1000.0));
+    const end_ms = try finishPlayback(&controller, sink.sink(), 2000.0);
+
+    controller.seek(2.0, WallClockMs.init(end_ms + 1000.0));
+    try expectPlaybackStartsAt(&controller, sink.sink(), 2.0, end_ms + 2000.0);
+    const next_end_ms = try finishPlayback(&controller, sink.sink(), end_ms + 3000.0);
+    try expectPlaybackStartsAt(&controller, sink.sink(), 0.0, next_end_ms + 1000.0);
+}
+
+test "pause resume and stopped seeks retain their transport targets" {
+    const sched = makeSched();
+    defer sched.deinit();
+    var controller = PlaybackController.init();
+    defer controller.deinit();
+    try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
+    var sink: AcceptAllMixSink = .{};
+
+    // A seek between load() and the first play() is intentional, not a replay.
+    controller.seek(1.0, WallClockMs.init(0.0));
+    try expectPlaybackStartsAt(&controller, sink.sink(), 1.0, 1000.0);
+    if (controller.tick(1.0, WallClockMs.init(2000.0), sink.sink())) |frame| frame.release();
+    const paused_time = controller.mediaTime();
+    try std.testing.expectApproxEqAbs(2.0, paused_time, 1e-9);
+    controller.setPaused(true);
+    try std.testing.expect(controller.tick(1.0, WallClockMs.init(3000.0), sink.sink()) == null);
+    controller.play(WallClockMs.init(4000.0));
+    try std.testing.expectApproxEqAbs(paused_time, controller.mediaTime(), 1e-9);
+
+    controller.setPaused(true);
+    controller.seek(3.0, WallClockMs.init(5000.0));
+    controller.setPaused(false);
+    try std.testing.expectApproxEqAbs(3.0, controller.mediaTime(), 1e-9);
+
+    controller.stop();
+    try expectPlaybackStartsAt(&controller, sink.sink(), 0.0, 6000.0);
+    controller.stop();
+    controller.seek(4.0, WallClockMs.init(7000.0));
+    try expectPlaybackStartsAt(&controller, sink.sink(), 4.0, 8000.0);
+}
+
 test "6-channel back-pressure never races the source reader ahead (bounded backlog)" {
     // Regression for the cross-platform "audio too fast + choppy" bug on
     // multi-channel clips. A back-pressured sink accepts far fewer frames than
