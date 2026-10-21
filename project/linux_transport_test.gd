@@ -118,6 +118,44 @@ func _check_audio_phase(expect_audio: bool, phase: String) -> bool:
 		"fresh audio window failed or capture deadline expired after " + phase)
 
 
+# Detect the backward transition independently of its destination: requiring
+# position < 35% here would hide the regression that restarts at the old scrub
+# target (45%). Neither this helper nor the caller seeks/stops/reloads at EOS.
+func _check_loops(expect_audio: bool, phase: String) -> bool:
+	var length := player.get_stream_length()
+	var wraps := 0
+	var previous := player.stream_position
+	var deadline := Time.get_ticks_msec() + int((length * 4.0 + 4.0) * 1000.0)
+	while not failed and wraps < 3 and Time.get_ticks_msec() < deadline:
+		await process_frame
+		var position := player.stream_position
+		if previous > length * 0.65 and position < previous - length * 0.2:
+			wraps += 1
+			var iteration := "%s-%d" % [phase, wraps]
+			print("LINUX_TRANSPORT_LOOP phase=", iteration, " previous=", previous, " restart=", position)
+			if not _require(position >= 0.0 and position < 0.1, iteration + " did not restart at zero"):
+				return false
+			# Presentation can trail the reset clock by a rendered epoch. Require
+			# an actual early-frame marker before leaving the first 200ms, not
+			# just a reset clock over stale EOS/scrub pixels. Do not pause/seek
+			# to obtain the image: that would repair the behavior under test.
+			var marker := Oracle.marker_frame(_image())
+			var marker_deadline := Time.get_ticks_msec() + 1000
+			while (marker < 0 or marker > 6) and player.stream_position < 0.2 and Time.get_ticks_msec() < marker_deadline:
+				await process_frame
+				marker = Oracle.marker_frame(_image())
+			print("LINUX_TRANSPORT_MARKER phase=", iteration, " actual=", marker, " expected=0..6")
+			if not _require(marker >= 0 and marker <= 6, iteration + " did not render the beginning of the clip"):
+				return false
+			if not await _check_audio_phase(expect_audio, iteration):
+				return false
+		previous = player.stream_position
+	if not _require(wraps == 3 and player.is_playing(), phase + " did not complete three loop transitions"):
+		return false
+	print("LINUX_TRANSPORT_CHECK phase=", phase, " loops=", wraps, " (restart clock, frame markers, independent audio windows)")
+	return true
+
+
 func _require_seek_image(image: Image, target: float, phase: String) -> bool:
 	print("LINUX_TRANSPORT_MARKER phase=", phase, " actual=", Oracle.marker_frame(image),
 		" expected=", Oracle.expected_seek_frame(target), " target=", target)
@@ -455,24 +493,33 @@ func _run() -> void:
 	player.play()
 	if not await _check_audio_phase(expect_audio, "loop-start"):
 		return
-	var wraps := 0
-	var previous := player.stream_position
-	var loop_deadline := Time.get_ticks_msec() + int((length * 4.0 + 4.0) * 1000.0)
-	while wraps < 3 and Time.get_ticks_msec() < loop_deadline:
-		await process_frame
-		var position := player.stream_position
-		if previous > length * 0.65 and position < length * 0.35:
-			wraps += 1
-			if not await _check_audio_phase(expect_audio, "loop-%d" % wraps):
-				return
-		previous = player.stream_position
-	if not _require(wraps >= 3 and player.is_playing(), "three loop transitions did not complete"):
+	# Preserve the no-scrub control on the clean playback created above.
+	if not await _check_loops(expect_audio, "loop"):
+		return
+
+	# Keep the same playback and its nonzero scrub history through natural EOS.
+	# A stop, stream replacement or explicit seek(0) here masks stale resume
+	# targets when Godot implements looping by calling play() directly.
+	player.paused = true
+	if not await _drain_presentation("pause before loop scrub"):
+		return
+	target = length * 0.45
+	player.stream_position = target
+	if not await _drain_presentation("loop scrub completion", 120):
+		return
+	if not _require(player.paused and absf(player.stream_position - target) < 0.06, "loop scrub did not settle at nonzero target"):
+		return
+	if not _require_seek_image(_image(), target, "loop-paused-scrub"):
+		return
+	player.paused = false
+	if not _require(await _advance_from(target, 1.0 / Oracle.FRAME_RATE), "loop scrub resume did not advance"):
+		return
+	if not await _check_loops(expect_audio, "loop-after-scrub"):
 		return
 	if not _require(not pcm_nonfinite, "engine audio mix contained nonfinite PCM"):
 		return
 	if not expect_audio and not _require(not pcm_nonzero, "silent source produced nonzero audio outside its windows"):
 		return
-	print("LINUX_TRANSPORT_CHECK loops=", wraps, " (independent post-transition audio windows)")
 	# Exercise reentrant destruction while the preview is actively publishing,
 	# not only teardown before the callback starts. Keep the public texture ref
 	# alive in the helper; it does not own the playback or its present pipeline.
