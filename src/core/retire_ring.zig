@@ -75,7 +75,9 @@ pub fn RetireRing(comptime N: usize) type {
                 allocator: std.mem.Allocator,
                 value: @TypeOf(value),
                 fn release(node: *Node) void {
-                    const box: *@This() = @fieldParentPtr("node", node);
+                    // Nodes only come from allocator.create(Box), which
+                    // guarantees the parent's potentially stronger alignment.
+                    const box: *@This() = @alignCast(@fieldParentPtr("node", node));
                     teardown(&box.value);
                     box.allocator.destroy(box);
                 }
@@ -177,6 +179,39 @@ test "epoch retirement releases FIFO across frames and idle gaps" {
     try std.testing.expectEqual(@as(usize, 6), order.items.len);
     ring.advance(10003);
     try std.testing.expectEqual(@as(usize, 7), order.items.len);
+}
+
+test "epoch retirement releases over-aligned payloads on advance and drain" {
+    const Value = struct {
+        releases: *[3]usize,
+        id: usize align(64),
+
+        fn release(value: *@This()) void {
+            std.testing.expectEqual(@as(usize, 0), @intFromPtr(value) % @alignOf(@This())) catch unreachable;
+            value.releases[value.id] += 1;
+        }
+    };
+    // Force Box to require stronger alignment than its intrusive Node, even
+    // on targets where ordinary pointer-sized payloads don't expose the bug.
+    try std.testing.expect(@alignOf(Value) > @alignOf(RetireRing(2).Node));
+    var releases: [3]usize = @splat(0);
+    var ring: RetireRing(2) = .{};
+    defer ring.drain();
+    ring.advance(10);
+    for (0..2) |id| {
+        try ring.retain(std.testing.allocator, Value{ .releases = &releases, .id = id }, Value.release);
+    }
+    ring.advance(11);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0, 0 }, &releases);
+    ring.advance(12);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &releases);
+    try std.testing.expectEqual(@as(usize, 0), ring.liveCount());
+
+    try ring.retain(std.testing.allocator, Value{ .releases = &releases, .id = 2 }, Value.release);
+    ring.drain();
+    ring.drain();
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1 }, &releases);
+    try std.testing.expectEqual(@as(usize, 0), ring.liveCount());
 }
 
 test "epoch retention allocation failure leaves caller ownership intact" {
