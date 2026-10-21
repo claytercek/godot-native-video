@@ -158,8 +158,22 @@ jobs:
           mkdir -p addon-out/addons/native_video
           cp staging/* addon-out/addons/native_video/
           cp addon/native_video.gdextension LICENSE README.md addon-out/addons/native_video/
-          python3 -m unittest discover -s tools -p 'test_check_packaged_addon.py'
-          python3 tools/check_packaged_addon.py addon-out/addons/native_video
+          # Ensure the package contains every library referenced by its manifest.
+          python3 - <<'PY'
+          import configparser
+          import json
+          from pathlib import Path
+
+          directory = Path("addon-out/addons/native_video")
+          manifest = configparser.ConfigParser(interpolation=None)
+          manifest.optionxform = str
+          with (directory / "native_video.gdextension").open() as source:
+              manifest.read_file(source)
+          for filename in manifest["libraries"].values():
+              library = directory / json.loads(filename)
+              if not library.is_file():
+                  raise FileNotFoundError(f"Missing packaged library: {library}")
+          PY
 
       - name: Zip addon
         run: |

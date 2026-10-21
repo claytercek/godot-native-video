@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproducible integration fixtures; never writes media into the checkout.
+# Reproducible Linux integration fixtures; output must be outside the checkout.
 set -euo pipefail
 out=${1:-/tmp/godot-native-video-linux-fixtures}
 mkdir -p "$out"

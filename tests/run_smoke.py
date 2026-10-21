@@ -44,7 +44,7 @@ def run_smoke(godot, driver, log, timeout, display_args):
     text = log.read_text(encoding="utf-8", errors="replace")
     print(text, end="", flush=True)
     checked = subprocess.run([
-        sys.executable, str(REPO / "tools/check_linux_validation_log.py"),
+        sys.executable, str(REPO / "tests/check_validation_log.py"),
         str(log), "--marker", "SMOKE: PASS",
     ], check=False).returncode
     # Prove an actual RenderingDevice was selected, not just a successful exit.

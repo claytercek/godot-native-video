@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-CHECKER = pathlib.Path(__file__).with_name("check_linux_validation_log.py")
+CHECKER = pathlib.Path(__file__).with_name("check_validation_log.py")
 MARKER = "LINUX_TRANSPORT_PASS"
 PROBES = (
     "variant_get_type_by_name",

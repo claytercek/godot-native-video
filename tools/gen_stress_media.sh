@@ -4,9 +4,8 @@
 # Real-world-quirk stress-media generator — test tooling only; never a
 # runtime dep.
 #
-# Our synthetic marker clip (tools/gen_test_media.sh) and the clip matrix
-# (tools/gen_clip_matrix.sh) are all-intra or B-frame-free with mono/stereo
-# audio, so neither one exercises frame-reordering (B-frames) or multi-
+# The checked-in synthetic clip (project/synthetic.mp4) does not cover
+# every frame-reordering (B-frames) or multi-
 # channel audio decode paths. A real-world H.264/5.1/.mov file exposed bugs
 # in both that the synthetic corpus was blind to. This script produces small,
 # targeted clips that isolate each quirk so regressions get caught by
@@ -89,8 +88,7 @@ mkdir -p "${OUTPUT_DIR}"
 # drawtext font selection. On Windows, fontconfig-enabled ffmpeg builds crash
 # resolving a font *family* (no fontconfig config file ships with the binary),
 # so point freetype at a concrete font file instead. Elsewhere the family
-# lookup works and stays font-installation agnostic. (Same trick as
-# tools/gen_test_media.sh and tools/gen_clip_matrix.sh.)
+# lookup works and stays font-installation agnostic.
 if [[ "${OS:-}" == "Windows_NT" ]]; then
     DRAWTEXT_FONT="fontfile='C\\:/Windows/Fonts/consola.ttf'"
 else

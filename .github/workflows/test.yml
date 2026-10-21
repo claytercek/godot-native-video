@@ -66,10 +66,10 @@ jobs:
           mkdir -p ci-logs
           { zig version; godot --version; python --version; } 2>&1 | tee ci-logs/versions.log
 
-      - name: Test shared smoke runner
+      - name: Test Python validation harnesses
         if: runner.os == 'Linux' && matrix.godot == '4.7.2'
-        timeout-minutes: 1
-        run: python -m unittest discover -s tools -p test_run_smoke.py -v 2>&1 | tee ci-logs/smoke-runner-tests.log
+        timeout-minutes: 3
+        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p 'test_*.py' -v 2>&1 | tee ci-logs/smoke-runner-tests.log
 
       - name: Install Linux GStreamer and software Vulkan
         if: runner.os == 'Linux'
@@ -136,7 +136,7 @@ jobs:
               prefix=(); driver=d3d12; display=()
               ;;
           esac
-          "${prefix[@]}" python tools/run_smoke.py --driver "$driver" \
+          "${prefix[@]}" python tests/run_smoke.py --driver "$driver" \
             --log ci-logs/smoke.log -- "${display[@]}"
 
       - name: Setup Windows FFmpeg

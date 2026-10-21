@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Build = std.Build;
 const gdzig = @import("gdzig");
 
@@ -35,7 +36,7 @@ pub fn build(b: *Build) !void {
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
     const paused_preview_mod = b.createModule(.{
-        .root_source_file = b.path("tools/core_paused_preview_test.zig"),
+        .root_source_file = b.path("src/core/paused_preview_test.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "core", .module = core_mod }},
@@ -49,7 +50,7 @@ pub fn build(b: *Build) !void {
     test_step.dependOn(&paused_preview_run.step);
 
     const fixture_pts_mod = b.createModule(.{
-        .root_source_file = b.path("tools/linux_fixture_pts.zig"),
+        .root_source_file = b.path("src/gst/linux_fixture_pts.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -172,7 +173,7 @@ pub fn build(b: *Build) !void {
         b.step("decode-smoke", "Pump the GStreamer backend without Godot (pass a media path via -- <path>)").dependOn(&smoke_run.step);
 
         const regression_mod = b.createModule(.{
-            .root_source_file = b.path("tools/linux_decode_regression.zig"),
+            .root_source_file = b.path("src/gst/linux_decode_regression.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -288,15 +289,20 @@ pub fn build(b: *Build) !void {
     // driver: Godot's headless driver has no RenderingDevice and therefore
     // cannot exercise texture import or the conversion shader.
     const smoke = Build.Step.Run.create(b, "run godot demo smoke test");
+    smoke.addArg(if (builtin.os.tag == .windows) "python" else "python3");
+    smoke.addFileArg(b.path("tests/run_smoke.py"));
+    smoke.addArg("--godot");
     smoke.addFileArg(gdzig_dep.namedLazyPath("godot"));
-    smoke.addArg("--path");
-    smoke.addDirectoryArg(b.path("./project"));
-    // The Linux CI/render smoke checks textures and mixer progress, not an
-    // audio device. Avoid unrelated ALSA/PulseAudio failures on build hosts.
-    if (target.result.os.tag == .linux) smoke.addArgs(&.{ "--audio-driver", "Dummy" });
-    smoke.addArgs(&.{ "--", "--smoke" });
+    smoke.addArgs(&.{ "--driver", switch (target.result.os.tag) {
+        .windows => "d3d12",
+        .linux => "vulkan",
+        else => "default",
+    }, "--log" });
+    smoke.addArg(b.getInstallPath(.prefix, "smoke.log"));
+    smoke.addArg("--");
+    smoke.addPassthruArgs();
     smoke.step.dependOn(&install.step);
-    b.step("smoke", "Run the demo project's --smoke pass/fail check (requires display/GPU)").dependOn(&smoke.step);
+    b.step("smoke", "Run the strict rendered smoke with a deadline and log checks (requires Python 3 and display/GPU)").dependOn(&smoke.step);
 }
 
 /// Resolve both headers (including @cImport translation) and link flags from

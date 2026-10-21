@@ -180,7 +180,7 @@ if (( rendered )); then
       --audio-driver Dummy --max-fps 60 "$@" > "$results/$name.log" 2>&1; then
       tail -60 "$results/$name.log" >&2; return 1
     fi
-    if ! python3 tools/check_linux_validation_log.py "$results/$name.log" --marker "$marker" "${physical_args[@]}"; then
+    if ! python3 tests/check_validation_log.py "$results/$name.log" --marker "$marker" "${physical_args[@]}"; then
       tail -60 "$results/$name.log" >&2; return 1
     fi
   }

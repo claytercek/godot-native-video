@@ -9,9 +9,10 @@ import tempfile
 import time
 import unittest
 
-TOOLS = pathlib.Path(__file__).resolve().parent
+REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
+@unittest.skipUnless(shutil.which("timeout"), "Linux validation runner requires GNU timeout on PATH")
 class XvfbStartupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="gnv-xvfb-test-")
@@ -20,8 +21,10 @@ class XvfbStartupTests(unittest.TestCase):
         self.repo = self.root / "repo"
         tools = self.repo / "tools"
         tools.mkdir(parents=True)
-        for name in ("run_linux_validation.sh", "check_linux_validation_log.py"):
-            shutil.copyfile(TOOLS / name, tools / name)
+        shutil.copyfile(REPO / "tools/run_linux_validation.sh", tools / "run_linux_validation.sh")
+        tests = self.repo / "tests"
+        tests.mkdir()
+        shutil.copyfile(REPO / "tests/check_validation_log.py", tests / "check_validation_log.py")
         library = self.repo / "project/lib/libnative_video.so"
         library.parent.mkdir(parents=True)
         library.write_bytes(b"test library")
@@ -90,6 +93,7 @@ time.sleep(120)
         ], env=env, text=True, capture_output=True, timeout=40)
         elapsed = time.monotonic() - start
         # Both successful validation and startup failures must reap the server.
+        self.assertTrue(self.pid_file.exists(), result.stdout + result.stderr)
         pid = int(self.pid_file.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
