@@ -1,16 +1,9 @@
-//! pipeline.zig — the Media Foundation object graph owned by MfBackend.
+//! COM/D3D objects owned by MfBackend: D3D11 device/context, DXGI device
+//! manager, shared source reader, and optional dedicated audio reader.
+//! MfPipeline creates and configures objects; MfBackend owns playback policy.
 //!
-//! MfPipeline is the Windows analog of the AVFoundation shim: it owns the
-//! COM/D3D plumbing (the D3D11 device + context, the DXGI device manager, the
-//! shared source reader, and the optional dedicated audio-only reader) and the
-//! low-level operations that create and configure them. MfBackend composes one
-//! as a field and keeps all policy (track tables, selection state, colorimetry,
-//! EOS/error interpretation) to itself — the same policy/plumbing seam the AVF
-//! backend gets for free by having its object graph behind a C ABI.
-//!
-//! The COM/MF apartment lifecycle (CoInitializeEx/MFStartup) is NOT owned here:
-//! MfBackend runs it on its ComExecutor's MTA thread, which is also where these
-//! objects are created and torn down. This struct only owns COM *objects*.
+//! MfBackend controls COM/MF initialization and shutdown on its ComExecutor
+//! MTA thread, where these objects are also created and torn down.
 
 const std = @import("std");
 

@@ -1,83 +1,64 @@
-# Native Video for Godot
+# Native video for Godot
 
-MP4/MOV video playback (H.264/HEVC) for stock Godot 4.6+ on macOS,
-Windows, and Linux. Drop-in compatible with Godot's `VideoStreamPlayer`;
-no engine changes required. The extension owns playback timing and uses
-AVFoundation, Media Foundation, or GStreamer for decoding. macOS and
-Windows/D3D12 can present without CPU copies; Linux intentionally uploads
-CPU-readable NV12/P010 planes, with optional hardware decoding.
+MP4/MOV playback (H.264/HEVC) for stock Godot 4.6+ on macOS, Windows, and
+Linux. Works with `VideoStreamPlayer` without engine changes. The extension
+controls playback timing and decodes through AVFoundation, Media Foundation,
+or GStreamer. macOS and Windows/D3D12 support presentation without CPU
+copies; Linux uploads CPU-readable planes, with optional hardware decoding.
 
 ## Architecture
 
-The extension is built around a Godot-independent **core** that drives the
-media backend in Decoder mode: `AVAssetReader` on macOS, a synchronous
-`IMFSourceReader` on Windows, and independent video-only/audio-only
-GStreamer readers on Linux. The core schedules decode on a bounded shared
-worker pool; GStreamer also manages its own pipeline threads. On Windows,
-COM is confined to a single dedicated MTA (multi-threaded apartment)
-executor thread the backend owns for the life of the open media, since
-Godot's own main thread runs in an STA that Media Foundation object
-creation can't use directly.
-The core owns the master clock, the frame queue, sync, and decode-ahead, so
-nothing implicit in the OS framework owns timing.
+A Godot-independent core drives each backend in decoder mode:
+`AVAssetReader` on macOS, synchronous `IMFSourceReader` on Windows, and
+separate video/audio GStreamer readers on Linux. A bounded, shared worker
+pool schedules decode and preserves per-stream frame order. Media backends
+can also use their own threads.
 
-On macOS, frames reach the GPU with no CPU copy: the hardware-decoded NV12
-surface is imported via `RenderingDevice.texture_create_from_extension` as a
-`Texture2DRD` and converted NV12→RGB in a single Metal compute pass into an
-engine-owned texture returned from `VideoStreamPlayback._get_texture()`.
-Godot never samples the decoder surface directly. On Windows the same
-zero-copy shape is available when Godot runs its D3D12 rendering driver —
-see [Windows present path](#windows-present-path) below for the one case
-where it falls back to a CPU copy instead.
+The core owns the master clock, frame queue, synchronization, and
+decode-ahead. Audio drives the clock, with a monotonic fallback for silent
+clips. Presentation drops late frames and holds early ones to recover from
+decode delays without lasting drift. Scrubbing uses keyframes during fast
+drags and selects the exact frame when the drag settles.
+
+On Windows, the backend confines COM to a dedicated MTA (multi-threaded
+apartment) executor for the lifetime of the open media. Godot's main thread
+runs in an STA, which can't create the required Media Foundation objects.
+
+On macOS, `RenderingDevice.texture_create_from_extension` imports the
+hardware-decoded NV12 surface as a `Texture2DRD`. A Metal compute pass
+converts NV12 to RGB in an engine-owned texture returned by
+`VideoStreamPlayback._get_texture()`. Godot never samples the decoder
+surface directly. This path needs no CPU copy, BGRA-to-RGBA swizzle, or GPU
+round-trip. Windows/D3D12 uses a similar zero-copy path; see
+[Windows present path](#windows-present-path) for selection and fallback.
 
 On Linux, GStreamer supplies retained CPU-readable NV12 (8-bit) or P010
-(10-bit) frames. The extension uploads both planes into Godot-owned R/RG
-textures, then uses the shared color/HDR conversion shader. This is a CPU
-upload path, not zero-copy: optional hardware decoding may still require a
-readback before upload. The tradeoff is CPU memory bandwidth, especially
-with multiple high-resolution streams. No DMA-BUF or native Vulkan import
-is required, and GStreamer doesn't own the playback clock.
-
-Highlights:
-
-- **Decoder mode, engine-owned clock** — audio-master sync with a monotonic
-  fallback for silent clips; drop-late / hold-early present policy recovers
-  from decode hiccups without permanent drift.
-- **Zero-copy present pipeline** — no per-frame CPU copies, no BGRA→RGBA
-  swizzle, no GPU round-trip, on macOS always and on Windows when the D3D12
-  rendering driver is active.
-- **Native media backends:** AVFoundation on macOS, Media Foundation on
-  Windows, GStreamer on Linux. Linux hardware decoding depends on installed
-  plugins and drivers; software decoding is also supported.
-- **Adaptive scrubbing** — keyframe-only while dragging fast, exact frame on
-  settle.
-- **Shared decode-worker pool:** core decode jobs share workers, with
-  per-stream frame order preserved. Media frameworks may use their own threads.
+(10-bit) frames. The extension uploads their planes to Godot-owned R/RG
+textures and runs the shared color/HDR conversion shader. Hardware decoding
+may require a readback before upload. CPU memory bandwidth can limit
+multiple high-resolution streams, but this path needs no DMA-BUF or native
+Vulkan import. GStreamer doesn't control the playback clock.
 
 ## Requirements
 
-- **macOS** (Apple Silicon or Intel; the extension links AVFoundation,
-  CoreMedia, CoreVideo, and Metal directly) **or Windows** (the extension
-  links Media Foundation and D3D11/D3D12 directly), **or Linux** with system
-  GStreamer libraries and codec plugins (see below).
-- **Stock Godot 4.6+**, **Forward+ renderer** on Linux (Vulkan). macOS and
-  Windows also support Mobile. Compatibility/OpenGL isn't supported on any
-  platform. Linux CPU uploads still need a RenderingDevice and compute
-  shaders; they aren't a Compatibility renderer fallback.
-- **Zig 0.17.0** to build from source. Other Zig versions are not supported:
-  the extension is built against
-  [gdzig](https://github.com/gdzig/gdzig), a pre-1.0 binding generator
+- macOS (Apple Silicon or Intel), Windows, or Linux. The extension links
+  AVFoundation, CoreMedia, CoreVideo, and Metal on macOS; Media Foundation
+  and D3D11/D3D12 on Windows; system GStreamer libraries on Linux.
+- Stock Godot 4.6+ with Forward+ on Linux (Vulkan). macOS and Windows also
+  support Mobile. Compatibility/OpenGL is unsupported: even CPU uploads
+  require a RenderingDevice and compute shaders.
+- Zig 0.17.0 for source builds. Other versions are unsupported.
+  [gdzig](https://github.com/gdzig/gdzig), the pre-1.0 binding generator, is
   pinned to a specific commit and Zig version.
-- **A Godot executable resolvable at build time** (building from source
-  only; irrelevant if you use a released binary) — on `PATH`, or named by
-  `-Dgodot-path=/path/to/Godot` or `GODOT_PATH`. gdzig looks one up while
-  configuring the build and fails without it, even for steps that never
-  launch Godot.
-- **Python 3** on `PATH` (`python` on Windows, `python3` elsewhere) for
-  `zig build smoke` and the local
-  validation tools; not needed to use the released addon.
+- A Godot executable for every source-build step, including tests. Set
+  `-Dgodot-path=/path/to/Godot` or `GODOT_PATH`, or put `godot` on `PATH`.
+  gdzig resolves it during build configuration, even for steps that don't
+  launch Godot. Released binaries don't need this setup.
+- Python 3 on `PATH` (`python` on Windows, `python3` elsewhere) for
+  `zig build smoke` and local validation tools. The released addon doesn't
+  need Python.
 
-For Linux runtime use on Ubuntu/Debian, install these GStreamer packages:
+On Ubuntu/Debian, install the Linux runtime dependencies:
 
 ```bash
 sudo apt-get update
@@ -88,18 +69,17 @@ sudo apt-get install --no-install-recommends \
   gstreamer1.0-plugins-ugly gstreamer1.0-libav
 ```
 
-These libraries and plugins **aren't bundled** with the addon. They provide
-appsinks, MP4 demuxing, audio/video conversion, and H.264/HEVC/AAC software
-decoders. Hardware decoder plugins and drivers are optional and vary by
-system. Godot also needs its normal system libraries and a working Vulkan
-driver. None of these dependencies require a custom Godot build. Package
-names vary on other distributions.
+The addon doesn't bundle these libraries or plugins. They provide appsinks,
+MP4 demuxing, audio/video conversion, and H.264/HEVC/AAC software decoders.
+Hardware decoding depends on optional plugins and drivers. Godot also needs
+its usual system libraries and a working Vulkan driver. Package names vary
+by distribution; no custom Godot build is required.
 
 ## Releases
 
-Each GitHub Release attaches a `native_video-<tag>.zip` containing an
-`addons/native_video/` folder: drop it into a project's `addons/` directory
-and Godot picks up `native_video.gdextension` automatically. It bundles:
+Each GitHub Release includes `native_video-<tag>.zip`. Copy its
+`addons/native_video/` folder into your project's `addons/` directory.
+Godot loads `native_video.gdextension` automatically.
 
 | Platform | Arch | Files |
 | --- | --- | --- |
@@ -109,139 +89,109 @@ and Godot picks up `native_video.gdextension` automatically. It bundles:
 | Windows | arm64 | `native_video.windows.debug.arm64.dll`, `native_video.windows.release.arm64.dll` |
 | Linux | x86_64 | `libnative_video.linux.debug.x86_64.so`, `libnative_video.linux.release.x86_64.so` |
 
-Linux release binaries are built natively on Ubuntu 22.04 with a baseline
-x86_64 CPU target and link against system GStreamer. Install the runtime
-packages above before loading the addon. Linux ARM64 isn't shipped or
-tested; the demo manifest permits native ARM64 source builds, not an ARM
-release binary.
+Linux binaries are built natively on Ubuntu 22.04 for a baseline x86_64 CPU
+and link system GStreamer. Install the runtime packages above before loading
+the addon. Linux ARM64 isn't shipped or tested; the demo manifest allows
+native ARM64 source builds.
 
-Both a debug and a release binary ship for every listed platform/arch, matching
-Godot's `template_debug`/`template_release` export split — the `.gdextension`
-routes each automatically based on how the exported project was built.
-Debug binaries are built with `-Doptimize=safe` (safety checks kept
-in, unstripped); release binaries with `-Doptimize=fast` (stripped).
+Each platform/architecture includes debug and release binaries. The
+`.gdextension` selects one to match Godot's `template_debug` or
+`template_release` export. Debug binaries use `-Doptimize=safe` with safety
+checks enabled and stripping disabled; release binaries use stripped
+`-Doptimize=fast` builds.
 
-**iOS** builds and links (produces a valid iOS Mach-O `dylib`), but is not
-shipped in releases: Godot's iOS export conventionally expects a static
-library / `.xcframework` rather than a plain dylib, and only link-time (not
-on-device runtime) has been verified. Follow-up work; not currently
-tracked for a specific release.
+iOS builds produce a valid Mach-O `dylib` but aren't shipped. Godot's iOS
+export normally expects a static library or `.xcframework`. Only linking
+has been verified, not on-device playback; packaging work has no scheduled
+release.
 
 ## Windows present path
 
-Windows can run Godot's Vulkan or D3D12 `RenderingDevice` driver, and this
-build links two import paths that hand decoded frames to Godot. The choice
-is made once, automatically, at startup, from the active RD driver name and
-the running Godot version — never a build-time variant, never a
-try-and-fail probe:
+At startup, the extension selects an import path from the active
+`RenderingDevice` driver and Godot version. Both paths are built in;
+selection doesn't probe them by trial and error.
 
 | Renderer driver | Import path | Zero-copy | Notes |
 | --- | --- | --- | --- |
-| `d3d12` | D3D12 shared-handle import | Yes | Shared NT handles + a shared D3D11/D3D12 fence hand the decoder's D3D11 texture to Godot's D3D12 device; a plane-split compute pass splits NV12/P010 into luma/chroma views. The selection code requires Godot 4.5+ for this path (`texture_create_from_extension` isn't implemented for the D3D12 driver before that); this extension's Godot 4.6+ floor already clears that bar. |
-| `vulkan` (stock) or anything else | CPU-copy fallback | No | A zero-copy Vulkan path (DXGI shared handles into `VK_KHR_external_memory_win32`) is not built here — it was hard-disabled upstream even before this Zig port, because Godot's `texture_create_from_extension` mis-binds NV12 plane aspects on the Vulkan driver. Adds one GPU→CPU readback per frame before the texture reaches Godot. |
+| `d3d12` | D3D12 shared-handle import | Yes | Shared NT handles and a D3D11/D3D12 fence pass the decoder's D3D11 texture to Godot's D3D12 device. A compute pass splits NV12/P010 into luma/chroma views. Selection requires Godot 4.5+, when D3D12 gained `texture_create_from_extension`; the extension's 4.6+ minimum meets this requirement. |
+| `vulkan` (stock) or anything else | CPU-copy fallback | No | Adds a GPU-to-CPU readback per frame. The DXGI shared-handle path through `VK_KHR_external_memory_win32` was disabled upstream before this Zig port and isn't built here: Godot's Vulkan `texture_create_from_extension` mis-binds NV12 plane aspects. |
 
-If the D3D12 path is selected but fails to come up — no D3D12 device to
-bind, or the shared handles can't be opened across adapters — the extension
-degrades to the CPU-copy path automatically, once, and stays there for the
-rest of that playback session; it never retries the zero-copy path per
-frame. Call `get_cpu_copy_count()` on a playback instance to see how many
-frames took the CPU-copy path this session (always 0 on macOS, since Metal
-import is always zero-copy there).
+If D3D12 setup fails, for example because no device is available or shared
+handles can't be opened across adapters, playback falls back to CPU copies
+for the session. It doesn't retry zero-copy each frame.
 
-**Recommendation:** run Godot with the D3D12 rendering driver for zero-copy
-present. Stock Vulkan still gets full hardware decode, just with a per-frame
-GPU→CPU readback added before present.
+Use Godot's D3D12 driver for zero-copy presentation. Stock Vulkan supports
+hardware decoding but adds a readback before presentation. See
+[Diagnostics](#diagnostics) to check CPU-copy usage.
 
 ## Known limitations
 
-- **Headless mode (`--headless`)**: presentation is disabled because there
-  is no RenderingDevice. Decode, audio mixing, the master clock, and
-  playback state machines keep running normally, and end-of-stream is
-  reached. No texture output is available.
-- **Compatibility/OpenGL renderer**: not supported on any platform. CPU
-  upload paths still need RenderingDevice textures and compute shaders.
-- **Linux HEVC Main10/PQ/HLG**: supported when suitable GStreamer decoder
-  plugins are installed. P010 preserves 10-bit samples through upload and
-  color conversion, but this doesn't certify OS/compositor HDR signaling
-  or actual HDR display output.
-- **Vulkan zero-copy on Windows**: not available. A DXGI-shared-handle path
-  into Vulkan was hard-disabled upstream (a Godot `texture_create_from_extension`
-  bug mis-binds NV12 plane aspects on the Vulkan driver) and isn't built into
-  this extension, so Vulkan on Windows always takes the CPU-copy fallback
-  described above.
-- **HEVC on Windows** depends on a decoder MFT being registered on the
-  machine (typically the "HEVC Video Extensions" package) — not present on
-  every Windows installation.
-- **Three spurious errors on Godot 4.6**: gdzig generates its bindings from
-  Godot 4.7's API description, so at load it probes for three 4.7-only
-  interface functions (`variant_get_type_by_name`, `classdb_construct_object3`,
-  `classdb_register_extension_class6`). A 4.6 engine logs
-  `Attempt to get non-existent interface function` for each. gdzig never
-  calls them and falls back to the older entry points; playback is
-  unaffected. Nothing the extension binds changed hash between 4.6 and 4.7,
-  and CI runs the integration smoke against both.
-- **Single precision only (prebuilt binaries)**: the released libraries are
-  built for the standard single-precision Godot. They will not load into a
-  double-precision (`precision=double`) Godot build — the two disagree on the
-  in-memory layout of core types. Double-precision users build from source
-  with `-Dprecision=double` (see [Building from source](#building-from-source)).
+- Headless mode (`--headless`) disables presentation because there's no
+  RenderingDevice. Decode, audio mixing, the master clock, and playback
+  state machines still run to end-of-stream, but produce no texture.
+- Linux HEVC Main10/PQ/HLG needs suitable GStreamer decoder plugins. P010
+  preserves 10-bit samples through upload and color conversion; this doesn't
+  certify OS/compositor HDR signaling or HDR display output.
+- Windows HEVC needs a registered decoder MFT, typically the "HEVC Video
+  Extensions" package. Some Windows installations lack one.
+- Godot 4.6 logs `Attempt to get non-existent interface function` for
+  `variant_get_type_by_name`, `classdb_construct_object3`, and
+  `classdb_register_extension_class6`. gdzig's bindings use Godot 4.7's API
+  description and probe these 4.7-only functions at load. On 4.6, gdzig uses
+  older entry points without calling them; playback is unaffected. No API
+  hash used by the extension changed between 4.6 and 4.7, and CI tests both.
+- Prebuilt libraries require standard single-precision Godot. They won't
+  load into a double-precision (`precision=double`) build because core type
+  layouts differ. Build from source with `-Dprecision=double`; see
+  [Building from source](#building-from-source).
 
 ## Diagnostics
 
-Every log line the extension emits — from the main thread or a decode
-worker, on any backend — is mirrored to Godot's own reporting surface as
-well as stderr: errors and warnings show up in the editor's Output panel
-(`push_error` / `push_warning`), not just a console window, and info/debug
-lines print there too. A failed `load()` (bad path, backend open failure,
-unsupported content) is reported the same way, with the resolved OS path and
-the underlying error name, instead of failing silently.
+Logs from every backend and thread go to stderr and Godot's Output panel.
+Errors and warnings use `push_error` / `push_warning`; info/debug lines
+print there too. Failed `load()` calls report the resolved OS path and
+underlying error, including bad paths, backend failures, and unsupported
+content.
 
-`get_cpu_copy_count()` on a live `VideoStreamPlayback` reports how many
-frames in this session have gone through a CPU-copy path: the Windows
-fallback or Linux plane upload. It stays zero on macOS. On Linux this
-counts uploaded frames, not individual memory copies.
+Call `get_cpu_copy_count()` on a live `VideoStreamPlayback` to count frames
+that used Windows' CPU-copy fallback or Linux's plane upload this session.
+It stays zero on macOS. Linux counts uploaded frames, not individual memory
+copies.
 
 ## Scope
 
-- **Codecs:** H.264, HEVC (Main and Main10).
-- **Containers:** MP4, MOV — the loader registers `.mp4`, `.mov`, and
-  `.m4v`.
-- **Pixel formats:** NV12 (8-bit) and 10-bit biplanar: x420 on macOS,
-  P010 on Windows/Linux, negotiated to match the source's bit depth. The
-  conversion path normalises 10-bit payloads in 16-bit GPU words.
-- **Colorimetry:** BT.709, BT.601, and BT.2020 YCbCr matrices; BT.709 /
-  BT.601 / BT.2020 / DCI-P3 primaries; BT.709, PQ (ST 2084 / HDR10), and HLG
+- Codecs: H.264 and HEVC (Main and Main10).
+- Containers: MP4 and MOV; the loader registers `.mp4`, `.mov`, and `.m4v`.
+- Pixel formats: NV12 (8-bit) and 10-bit biplanar x420 (macOS) or P010
+  (Windows/Linux), negotiated to match source bit depth. Conversion
+  normalizes 10-bit payloads in 16-bit GPU words.
+- Colorimetry: BT.709, BT.601, and BT.2020 YCbCr matrices; BT.709, BT.601,
+  BT.2020, and DCI-P3 primaries; BT.709, PQ (ST 2084 / HDR10), and HLG
   transfer functions; video and full range. Unspecified fields default to
   BT.709, video range.
-- **HDR:** PQ/HLG clips tone-map to watchable SDR by default, or output
-  scene-linear HDR (RGBA16F, 1.0 = 203-nit Reference White per BT.2408) when
-  the stream's `output_mode` is set to HDR.
-- **Audio:** AAC, decoded to interleaved float32 PCM. Mono, stereo, and 5.1
-  sources are channel-mixed to the clip's canonical output format.
-- **Multi-track audio:** supported — enumerate tracks with
-  `NativeVideoStream.get_audio_tracks()` and select one via
-  `VideoStreamPlayer.audio_track`, either before `play()` or mid-playback.
+- HDR: PQ/HLG clips tone-map to SDR by default. Set the stream's
+  `output_mode` to HDR for scene-linear RGBA16F output, where 1.0 equals
+  203-nit Reference White per BT.2408.
+- Audio: AAC decoded to interleaved float32 PCM. Mono, stereo, and 5.1
+  sources are mixed to the clip's canonical output format.
+- Multi-track audio: enumerate with `NativeVideoStream.get_audio_tracks()`
+  and select with `VideoStreamPlayer.audio_track` before `play()` or during
+  playback.
 
-Beyond this scope, the extension will attempt to play anything the media
-backend can decode, as long as it arrives in one of the registered
-container extensions above. Such content may well work, but only the matrix
-above is tested and contractually supported.
-
-**Out of scope:** VP9/AV1. **Known limitation:** mixed-sample-rate clips —
-the first audio track's sample rate wins, and a mid-stream switch to a
-track with a differing rate is refused.
+Only this matrix is tested and supported. Other content may play if the
+backend can decode it and its container has a registered extension. VP9/AV1
+is out of scope. For mixed-sample-rate clips, the first audio track sets the
+sample rate; switching to a track with a different rate is refused.
 
 ## Building from source
 
-1. Install Zig 0.17.0, then make a Godot executable resolvable via
-   `GODOT_PATH`, `-Dgodot-path=`, or `PATH`.
-   For example, with gdvm: `export GODOT_PATH="$(gdvm show 4.7.2)"`.
-   Or use the path to your installed Godot executable. Every `zig build`
-   invocation needs Godot, including `zig build test`. Resolution order is
-   `-Dgodot-path`, then `GODOT_PATH`, then `godot` on `PATH`; bindings come
-   from gdzig's vendored API description, not the resolved executable.
+1. Install Zig 0.17.0 and make Godot available through `-Dgodot-path=`,
+   `GODOT_PATH`, or `PATH`, in that resolution order. For example, with gdvm:
+   `export GODOT_PATH="$(gdvm show 4.7.2)"`. You can also use your installed
+   Godot executable. Every `zig build` step needs it, including tests;
+   bindings come from gdzig's vendored API description, not this executable.
 
-   On Linux, install the runtime packages above plus the development
+   On Linux, install the runtime packages above and the development
    dependencies used by CI:
 
    ```bash
@@ -251,9 +201,8 @@ track with a differing rate is refused.
      gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-pbutils-1.0
    ```
 
-   The build requires pkg-config to resolve these headers and system
-   libraries, even for backend tests. Use native Linux builds against the
-   target system's GStreamer development packages.
+   Even backend tests need pkg-config to resolve headers and system
+   libraries. Build natively against the target system's GStreamer packages.
 
 2. Build the extension:
 
@@ -261,32 +210,28 @@ track with a differing rate is refused.
    zig build
    ```
 
-   This compiles `libnative_video.dylib` (macOS), `native_video.dll`
-   (Windows), or `libnative_video.so` (Linux) and installs it to
-   `project/lib/`, where `project/native_video.gdextension` expects it.
-   `build.zig` drives the build. Linux also needs the pkg-config/GStreamer
-   packages above; Windows links Media Foundation and D3D11/D3D12 as system
-   libraries.
+   `build.zig` compiles `libnative_video.dylib` (macOS), `native_video.dll`
+   (Windows), or `libnative_video.so` (Linux) into `project/lib/`, as expected
+   by `project/native_video.gdextension`. Windows links Media Foundation and
+   D3D11/D3D12 system libraries.
 
-   Builds default to a stripped `fast` binary (~380 KB on macOS
-   arm64; Windows binary size hasn't been separately measured). Pass
-   `-Doptimize=debug` for a debug build, or `-Doptimize=small` to
-   trade some speed for an even smaller library.
+   The default is a stripped `fast` binary (~380 KB on macOS arm64; Windows
+   size hasn't been measured separately). Use `-Doptimize=debug` for debug
+   builds or `-Doptimize=small` to trade speed for size.
 
-   To target a double-precision Godot build, add `-Dprecision=double`
-   (default is `float`). The precision must match the Godot the extension
-   loads into; a mismatch is a memory-layout error, not a graceful failure.
+   Precision defaults to `float`. Add `-Dprecision=double` for
+   double-precision Godot. A mismatch causes memory-layout errors, not a
+   graceful failure.
 
-3. Run the core, platform backend, and pure presentation-policy tests
-   (they exercise no Godot code, though the build still resolves a Godot
-   executable):
+3. Run core, platform-backend, and pure presentation-policy tests. They
+   don't exercise Godot code, though the build still resolves Godot:
 
    ```bash
    zig build test
    ```
 
-   On Linux, focused backend and plane-packing tests and a standalone decode
-   smoke are also available:
+   Linux also has focused backend and plane-packing tests and a standalone
+   decode smoke:
 
    ```bash
    zig build test-gst
@@ -294,53 +239,51 @@ track with a differing rate is refused.
    zig build decode-smoke -- project/synthetic.mp4
    ```
 
-4. Run the demo project (builds the extension, launches Godot, and opens
-   the interactive playback UI against `project/synthetic.mp4` or a clip
-   passed after `--`):
+4. Build and launch the interactive demo with `project/synthetic.mp4`, or
+   pass another clip after `--`:
 
    ```bash
    zig build run
    ```
 
-   For an unattended pass/fail check instead — loads a clip, plays it, polls
-   for a presented video texture, does a pixel-content sanity check, and
-   quits with exit 0 (PASS) / 1 (FAIL) — use the dedicated smoke step:
+   For unattended verification, run the smoke check. It loads and plays a
+   clip, waits for a video texture, checks pixel content, and exits with
+   0 (PASS) or 1 (FAIL):
 
    ```bash
    zig build smoke
    ```
 
    This builds and installs the extension, then runs `tests/run_smoke.py`
-   with the resolved Godot and writes `zig-out/smoke.log`. Unlike a bare
-   `zig build run -- --smoke`, it enforces a 75-second deadline, an exact
-   PASS line, a Forward+ device banner, and strict engine-error checks
-   (allowing only the three known Godot 4.6 probes). Dummy audio is selected
-   on every OS; rendering uses Vulkan on Linux, D3D12 on Windows, and the
-   default driver on macOS. Presentation needs a display and a working
-   RenderingDevice, not `--headless`; Linux CI uses software Vulkan under
-   Xvfb. Engine setup arguments pass through, for example
-   `zig build smoke -- --display-driver x11`. Both build steps use the Godot
-   resolved from `-Dgodot-path`, `GODOT_PATH`, or `PATH`, in that order.
+   with the resolved Godot and writes `zig-out/smoke.log`. Unlike
+   `zig build run -- --smoke`, it requires completion within 75 seconds, an
+   exact PASS line, a Forward+ device banner, and no engine errors except
+   the known Godot 4.6 probes.
+
+   Smoke uses dummy audio on every OS, Vulkan on Linux, D3D12 on Windows,
+   and the default rendering driver on macOS. It needs a display and a
+   working RenderingDevice; don't use `--headless`. Linux CI uses software
+   Vulkan under Xvfb. Pass engine setup flags after `--`, for example:
+   `zig build smoke -- --display-driver x11`.
 
 ### CI and local validation
 
-Required checks in `.github/workflows/test.yml` cover macOS, Linux, and
-Windows with stock Godot 4.7.2 (primary) and 4.6.3 (supported floor). The
-shared `.github/workflows/build.yml`, also called by
-`.github/workflows/release.yml`, builds every shipped platform/architecture
-in safe/debug and fast/release modes once per run. All six runtime
-combinations consume its fast/release artifacts and run a short rendered
-playback smoke using the checked-in `project/synthetic.mp4`.
-Unit/native-backend tests and standalone decode smoke still build their
-own harnesses and run only on the primary version.
-Windows also generates the fixtures its native tests require.
-CI invokes `tests/run_smoke.py` directly so it tests downloaded release
-artifacts rather than rebuilding them via `zig build smoke`.
+`.github/workflows/test.yml` requires checks on macOS, Linux, and Windows
+with stock Godot 4.7.2 (primary) and 4.6.3 (supported minimum). The shared
+`.github/workflows/build.yml`, also used by `.github/workflows/release.yml`,
+builds all shipped platforms/architectures in safe/debug and fast/release
+modes once per run.
+
+All OS/version combinations run rendered playback smoke with the
+fast/release artifacts and `project/synthetic.mp4`. CI calls
+`tests/run_smoke.py` directly to test downloaded artifacts without
+rebuilding. Unit/backend tests and standalone decode smoke build their own
+harnesses and run only on the primary version. Windows generates the
+fixtures its native tests need.
 
 ### Developer tools
 
-The supported commands in `tools/` generate optional fixtures or orchestrate
-local Linux validation:
+Generate optional fixtures or run local Linux validation with:
 
 ```bash
 bash tools/gen_stress_media.sh --output-dir tests/fixtures/stress --duration 6
@@ -349,26 +292,26 @@ bash tools/run_linux_validation.sh --help
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The generators require FFmpeg (with libx264); Linux fixture generation also
-uses FFprobe and Python 3. The Linux runner documents its backend/rendered
-modes in `--help` and requires GNU `timeout` on `PATH`. Python discovery
-skips the Xvfb startup suite when `timeout` is absent; on macOS, install
-Homebrew `coreutils` and include its commands on `PATH` to run that suite.
-To check an already-built extension without rebuilding:
+Generators need FFmpeg with libx264; Linux fixture generation also needs
+FFprobe and Python 3. The Linux runner's `--help` documents backend and
+rendered modes. It requires GNU `timeout` on `PATH`. Python discovery skips
+the Xvfb startup suite without `timeout`; on macOS, install Homebrew
+`coreutils` and add its commands to `PATH` to run it.
+
+To check an existing build without rebuilding:
 
 ```bash
 python3 tests/run_smoke.py --godot /path/to/godot --driver vulkan --log zig-out/smoke.log
 ```
 
-Choose `--driver d3d12` on Windows or `--driver default` on macOS. Display
-setup flags go after `--`; use `python` instead of `python3` on Windows.
-The shared checker is
-`tests/check_validation_log.py <log> --marker <success-marker>`; its legacy
-`LINUX_VALIDATION_LOG_*` output labels are retained for log consumers.
+Use `--driver d3d12` on Windows or `--driver default` on macOS. Put display
+setup flags after `--`; use `python` on Windows. The shared log checker is
+`tests/check_validation_log.py <log> --marker <success-marker>`. Its
+`LINUX_VALIDATION_LOG_*` labels remain for existing log consumers.
 
-Deeper Linux codec, multitrack, seek, lifecycle, input-rejection, and
-rendered transport regressions remain local opt-in checks, not CI jobs.
-With the build dependencies above plus FFmpeg and Python 3 installed:
+Linux codec, multitrack, seek, lifecycle, input-rejection, and rendered
+transport regressions are local opt-in checks, not CI jobs. Install the
+build dependencies above, FFmpeg, and Python 3, then run:
 
 ```bash
 bash tools/gen_linux_validation_media.sh /tmp/native-video-fixtures
@@ -376,7 +319,7 @@ bash tools/run_linux_validation.sh --fixtures /tmp/native-video-fixtures \
   --results /tmp/native-video-backend-results --backend-only
 ```
 
-For rendered checks with software Vulkan and Xvfb (Ubuntu example):
+For rendered checks with software Vulkan and Xvfb on Ubuntu:
 
 ```bash
 GNV_LVP_ICD=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
@@ -384,63 +327,50 @@ GNV_LVP_ICD=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
   --results /tmp/native-video-rendered-results --rendered-only --renderer software-xvfb
 ```
 
-Install Xvfb and Mesa Vulkan drivers for that command, and adjust the ICD
-path for your system. Logs go to the chosen results directory. Software
-rendering doesn't certify hardware decoding or HDR display output.
-Physical AMD RX Vega validation also covered transport and reentrant preview
-teardown.
+Install Xvfb and Mesa Vulkan drivers and adjust the ICD path for your
+system. Logs go to the chosen results directory. Software rendering doesn't
+certify hardware decoding or HDR display output. Physical AMD RX Vega tests
+also covered transport and reentrant preview teardown.
 
 ## Project layout
 
-- `src/core/` — engine-independent core (clock, frame queue, scrubber,
-  present selector, decode scheduler, backend interface, color math). Pure
-  Zig, no Godot, AVFoundation, Media Foundation, or GStreamer imports;
-  its tests are part of `zig build test`.
-- `src/avf/` — the AVFoundation backend (macOS): `avf_shim.m`/`avf_shim.h`
-  (a C-ABI Objective-C shim) plus the Zig glue that drives it through the
-  core `Backend` interface. `decode_smoke.zig` is a standalone CLI harness
-  that pumps the backend without Godot, for isolating decode-side bugs.
-- `src/mf/` — the Media Foundation backend (Windows): a synchronous
-  `IMFSourceReader` driven through the core `Backend` interface, the
-  dedicated MTA `ComExecutor` thread, and the hand-written D3D11/D3D12/DXGI
-  bindings under `src/mf/win/`. `decode_smoke.zig` mirrors the AVFoundation
-  harness for isolating decode-side bugs without Godot.
-- `src/gst/`: the Linux GStreamer backend, with a C shim for discovery and
-   independent video/audio readers, retained frame payloads, backend tests,
-   a standalone `decode_smoke.zig` harness, and the adjacent
-   `linux_decode_regression.zig` / `linux_fixture_pts.zig` acceptance harness
-   and fixture PTS oracle.
-- `src/godot/` — [gdzig](https://github.com/gdzig/gdzig) glue:
-  `NativeVideoStream` / `NativeVideoStreamPlayback` registration, the
-  present pipeline that runs the NV12→RGB compute pass, and the surface
-  importers it selects between — Metal on macOS; on Windows, the pure
-  `importer_selector` function plus the D3D12 zero-copy and CPU-copy
-  importers it chooses between; Linux uses the CPU-upload importer and pure
-  NV12/P010 plane-packing helpers.
-- `project/` — the example/verification Godot project and dev harness.
-  `main.gd`/`main.tscn` are a single entry point with two modes selected by
-  CLI flag: interactive playback UI (`zig build run`, the default) or
-  unattended pass/fail verification (`zig build smoke`, `--smoke`).
-- `addon/` — the shipped `.gdextension` template packaged into release
-  zips (see [Releases](#releases) above). Not used by `zig build`; the dev
-  harness in `project/` has its own `native_video.gdextension` pointing at
-   local build output.
-- `tests/` — cross-platform smoke/log validation runners and Python CLI
-  regression tests; generated stress media lives under `tests/fixtures/`.
-- `tools/` — supported developer entry points only: the two media generators
-  and `run_linux_validation.sh`. Keep backend-specific Zig harnesses and
-  tests beside their owning module in `src/`; keep shared validation and
-  its tests in `tests/`, not `tools/`. One-off release packaging checks
-  belong in their workflow rather than becoming permanent developer tools.
+- `src/core/`: engine-independent clock, frame queue, scrubber, presentation
+  selector, decode scheduler, backend interface, and color math. Pure Zig
+  with no Godot or media-framework imports; tested by `zig build test`.
+- `src/avf/`: macOS AVFoundation backend. `avf_shim.m`/`avf_shim.h` expose a
+  C ABI to Zig through the core `Backend` interface. `decode_smoke.zig`
+  isolates decode bugs without Godot.
+- `src/mf/`: Windows Media Foundation backend. Synchronous `IMFSourceReader`,
+  the MTA `ComExecutor`, hand-written D3D11/D3D12/DXGI bindings in
+  `src/mf/win/`, and a standalone `decode_smoke.zig` harness.
+- `src/gst/`: Linux GStreamer backend. A C shim handles discovery and
+  independent video/audio readers. Includes retained frame payloads,
+  backend tests, `decode_smoke.zig`, the `linux_decode_regression.zig`
+  acceptance harness, and the `linux_fixture_pts.zig` fixture PTS oracle.
+- `src/godot/`: [gdzig](https://github.com/gdzig/gdzig) class registration
+  (`NativeVideoStream` / `NativeVideoStreamPlayback`), NV12-to-RGB
+  presentation, and platform importers. macOS uses Metal; Windows uses
+  `importer_selector` to choose D3D12 or CPU copies; Linux uses CPU upload
+  and pure NV12/P010 plane-packing helpers.
+- `project/`: demo and verification harness. `main.gd`/`main.tscn` provide
+  the default interactive UI (`zig build run`) and unattended verification
+  (`zig build smoke`, `--smoke`).
+- `addon/`: release `.gdextension` template; see [Releases](#releases).
+  `zig build` uses the separate `project/native_video.gdextension`, which
+  points to local output.
+- `tests/`: shared smoke/log runners and Python CLI regression tests.
+  Generated stress media lives in `tests/fixtures/`.
+- `tools/`: media generators and `run_linux_validation.sh`. Keep
+  backend-specific Zig tests and harnesses beside their module in `src/`,
+  shared validation and tests in `tests/`, and one-off packaging checks in
+  release workflows.
 
-For the historical record of how this implementation was chosen —
-benchmarks and rationale — see [EVALUATION.md](EVALUATION.md).
+See [EVALUATION.md](EVALUATION.md) for implementation benchmarks and rationale.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for release-note and release-workflow
-instructions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for release notes and workflow instructions.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).

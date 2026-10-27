@@ -1,14 +1,8 @@
 // -----------------------------------------------------------------------
-// avf_shim.m — AVFoundation decode object graph behind a pure C ABI.
-//
-// Compiled with -fobjc-arc. ARC manages the Objective-C object graph
-// (AVURLAsset, AVAssetReader, track outputs); the Core Video / Core Media
-// CFTypeRefs that cross the C boundary (CVPixelBufferRef, CMSampleBufferRef,
-// CMBlockBufferRef) are NOT ARC-managed and are retained/released explicitly.
-//
-// This file is pure mechanism: it drives the AVFoundation object graph
-// behind a C ABI and makes no policy decisions. All policy (track
-// selection/clamping, EOS/error interpretation) lives in avf_backend.zig.
+// AVFoundation decoding behind a C ABI. Compiled with -fobjc-arc: ARC owns
+// AVURLAsset, AVAssetReader, and track outputs. CFTypeRefs crossing the boundary
+// (CVPixelBufferRef, CMSampleBufferRef, CMBlockBufferRef) require explicit
+// retain/release. avf_backend.zig owns track policy and EOS/error interpretation.
 // -----------------------------------------------------------------------
 #import "avf_shim.h"
 

@@ -1,20 +1,11 @@
-//! metal_surface_importer.zig — macOS CVPixelBuffer -> Metal -> RD importer.
+//! Zero-copy CVPixelBuffer -> Metal -> RenderingDevice import for AVF's
+//! biplanar NV12 (8-bit) and x420 (10-bit) surfaces. CVMetalTextureCache uses
+//! Godot's MTLDevice to wrap IOSurface planes as MTLTextures, then imports them
+//! through textureCreateFromExtension as R8/R16 luma and RG8/RG16 chroma.
 //!
-//! Takes a hardware-decoded biplanar Y'CbCr CVPixelBuffer (NV12 8-bit or
-//! x420/P010 10-bit, from the AVF backend) and produces two Godot
-//! RenderingDevice plane texture RIDs — luma (R8/R16) and chroma (RG8/RG16)
-//! — WITHOUT any CPU copy. It reuses Godot's *own* MTLDevice
-//! (RenderingDevice.getDriverResource) so a CVMetalTextureCache wraps each
-//! IOSurface-backed plane as an MTLTexture usable inside Godot's RD command
-//! stream, then hands that MTLTexture handle to textureCreateFromExtension
-//! — still no copy.
-//!
-//! CoreVideo/CoreFoundation are plain C, declared extern by hand (mirrors how
-//! avf_backend.zig declares its shim ABI; gdzig projects avoid @cImport). The
-//! one place that needs real ObjC messaging — creating the ownership-probe
-//! MTLTexture at initialize() — goes through the libobjc runtime (objc_msgSend),
-//! which is already linked via the Metal/Foundation frameworks, so no ObjC shim
-//! file and no build.zig change are required.
+//! CoreVideo/CoreFoundation use handwritten C externs, without @cImport.
+//! The ownership-probe texture uses objc_msgSend through libobjc, already
+//! linked by Metal/Foundation; no Objective-C shim is needed.
 
 const std = @import("std");
 
@@ -29,12 +20,8 @@ const PlaneTextures = si.PlaneTextures;
 
 const log = std.log.scoped(.native_video_metal_import);
 
-// -----------------------------------------------------------------------
-// CoreVideo / CoreFoundation C ABI — declared by hand (no @cImport).
-// Opaque CoreFoundation/CoreVideo handles cross as ?*anyopaque:
-//   ?*anyopaque == CVMetalTextureCacheRef / CVMetalTextureRef /
-//   CVPixelBufferRef / CFTypeRef / id<MTLDevice> / id<MTLTexture>.
-// -----------------------------------------------------------------------
+// CoreVideo/CoreFoundation C ABI. ?*anyopaque carries CVMetalTextureCacheRef,
+// CVMetalTextureRef, CVPixelBufferRef, CFTypeRef, id<MTLDevice>, or id<MTLTexture>.
 
 // CFAllocatorRef defaults: the public APIs accept NULL for kCFAllocatorDefault,
 // so we pass null and avoid importing the extern constant symbol.
@@ -70,12 +57,9 @@ extern fn CVMetalTextureCacheCreateTextureFromImage(
 extern fn CVMetalTextureCacheFlush(texture_cache: ?*anyopaque, options: u64) void;
 extern fn CVMetalTextureGetTexture(image: ?*anyopaque) ?*anyopaque; // id<MTLTexture>
 
-// -----------------------------------------------------------------------
-// Objective-C runtime — used solely to build the ownership-probe MTLTexture.
-// objc_msgSend is declared arg-less then @ptrCast to an exact prototype at each
-// call site (the standard Zig idiom; on arm64 the integer/pointer arg ABI is
-// identical to a normal C call for these non-struct-returning selectors).
-// -----------------------------------------------------------------------
+// Objective-C runtime for the ownership-probe MTLTexture. Cast the argumentless
+// objc_msgSend declaration to each selector's exact prototype. On arm64 these
+// integer/pointer calls, with no struct returns, use the normal C ABI.
 extern fn objc_getClass(name: [*:0]const u8) ?*anyopaque;
 extern fn sel_registerName(name: [*:0]const u8) ?*anyopaque;
 extern fn objc_msgSend() void;
@@ -105,24 +89,16 @@ const pf_420f = fourcc("420f"); // 420YpCbCr8BiPlanarFullRange
 const pf_x420 = fourcc("x420"); // 420YpCbCr10BiPlanarVideoRange
 const pf_xf20 = fourcc("xf20"); // 420YpCbCr10BiPlanarFullRange
 
-// -----------------------------------------------------------------------
-// Ownership probe.
+// Probe import ownership on the live driver. Godot 4.7's metal-cpp rewrite
+// stopped retaining format-matched MTLTextures in textureCreateFromExtension,
+// though texture_free still releases them. Godot <= 4.6 retained via
+// __bridge_retained. Affected drivers need a donated reference per import.
 //
-// Godot 4.7 rewrote the Metal RD driver onto metal-cpp and lost refcount
-// balance for imported textures: textureCreateFromExtension no longer retains
-// the MTLTexture when the format already matches (it did in <= 4.6 via rid's
-// __bridge_retained), but texture_free still releases it unconditionally,
-// deallocating the texture out from under its real owner.
-//
-// Rather than gate on version numbers — which can't tell a fixed 4.7.x from a
-// broken one — probe the live driver: hand it a throwaway texture and watch the
-// refcount across textureCreateFromExtension. A balanced driver retains on
-// import; the broken one leaves the count untouched. Returns true when the
-// driver will consume a reference it never took, i.e. every import must donate
-// one. CFGetRetainCount is unreliable for managing one's own references, but
-// measuring whether a foreign call took ownership is the one job it does
-// deterministically: nothing else can touch this texture between the two reads.
-// -----------------------------------------------------------------------
+// Compare a throwaway texture's refcount across import instead of checking
+// versions, which cannot distinguish fixed 4.7.x builds. A balanced driver
+// retains; an affected driver leaves the count unchanged. Nothing else can
+// access the probe between these CFGetRetainCount reads; this measurement
+// does not replace explicit ownership accounting for shared textures.
 
 /// Build a 1x1 R8Unorm ShaderRead probe MTLTexture on `device`. Returns a +1
 /// retained id<MTLTexture> the caller must release, or null.
@@ -181,13 +157,9 @@ fn driverStealsImportReference(rd: *RenderingDevice, device: ?*anyopaque) bool {
     return steals;
 }
 
-// -----------------------------------------------------------------------
-// Per-frame release payload: the two RD RIDs plus the two CVMetalTexture
-// wrappers, heap-boxed by si.boxClosure() on import. Order matters in the
-// teardown below: RD must be done with the MTLTexture (free_rid) before the
-// CVMetalTexture that owns it is released. The retire-ring only runs this
-// after N rendered frames, so the GPU is finished sampling.
-// -----------------------------------------------------------------------
+// Heap-boxed per-frame teardown. After N rendered frames, the retire ring
+// frees RD RIDs before releasing the CVMetalTexture wrappers that own their
+// MTLTextures. This keeps wrappers alive until GPU sampling is finished.
 const ReleaseValue = struct {
     rd: *RenderingDevice,
     luma: Rid,
@@ -202,10 +174,7 @@ fn releaseTeardown(v: *ReleaseValue) void {
     if (v.cv_chroma) |t| CFRelease(t);
 }
 
-// -----------------------------------------------------------------------
-// The concrete Metal importer. Owns the CVMetalTextureCache bound to Godot's
-// MTLDevice; constructed once per present pipeline and reused across frames.
-// -----------------------------------------------------------------------
+// Owns a CVMetalTextureCache on Godot's MTLDevice, reused across frames.
 pub const MetalSurfaceImporter = struct {
     allocator: std.mem.Allocator,
     rd: ?*RenderingDevice = null,
@@ -216,10 +185,8 @@ pub const MetalSurfaceImporter = struct {
     // reference. Detected at initialize() by probing the live driver.
     donate_reference_to_godot: bool = false,
 
-    /// Construct the importer. Held by value in the present pipeline and reused
-    /// across frames; initialize() binds it to RD and deinit() releases its
-    /// CVMetalTextureCache. Never fails — the fallible work happens in
-    /// initialize().
+    /// Construct by value without allocating. initialize() binds RD and creates
+    /// the cache; deinit() releases it.
     pub fn init(allocator: std.mem.Allocator) MetalSurfaceImporter {
         return .{ .allocator = allocator };
     }
@@ -232,10 +199,8 @@ pub const MetalSurfaceImporter = struct {
         // *failed* attempt left texture_cache null, so it retries fully.
         if (self.texture_cache != null) return true;
 
-        // DRIVER_RESOURCE_LOGICAL_DEVICE returns the id<MTLDevice> as an int on
-        // the Metal RD backend. On a non-Metal backend this is not a valid
-        // MTLDevice and CVMetalTextureCacheCreate will fail, reported as "not
-        // initialised".
+        // The Metal backend returns id<MTLDevice> as an integer. A non-Metal
+        // handle is invalid here and cannot initialize CVMetalTextureCache.
         const device_handle = rd.getDriverResource(.driver_resource_logical_device, si.rid_invalid, 0);
         if (device_handle == 0) return false;
         const device: ?*anyopaque = @ptrFromInt(device_handle);
@@ -300,9 +265,7 @@ pub const MetalSurfaceImporter = struct {
             return si.rid_invalid;
         }
 
-        // Import the MTLTexture into Godot RD. The `image` argument is the
-        // native texture handle: the id<MTLTexture> pointer as an int. SAMPLING
-        // usage is all we need — the compute pass samples these planes.
+        // Pass id<MTLTexture> as an integer handle. Only SAMPLING is needed.
         const rid = rd.textureCreateFromExtension(
             .texture_type_2d,
             fmt,
@@ -320,11 +283,9 @@ pub const MetalSurfaceImporter = struct {
             return si.rid_invalid;
         }
 
-        // An unbalanced driver (see driverStealsImportReference) releases this
-        // MTLTexture in texture_free without ever retaining it. Without the
-        // donated reference, free_rid over-releases the texture out from under
-        // the CVMetalTextureCache and the next import crashes on the recycled
-        // object (Metal abort or SIGSEGV).
+        // Donate the reference consumed by an unbalanced driver's texture_free.
+        // Without it, free_rid over-releases the cache's MTLTexture and the next
+        // import can crash on the recycled object.
         if (donate) {
             _ = CFRetain(mtl_tex);
         }
@@ -333,14 +294,10 @@ pub const MetalSurfaceImporter = struct {
         return rid;
     }
 
-    /// Import a decoder surface (CVPixelBufferRef) into two RD plane textures,
-    /// zero-copy. Does NOT take ownership of the decoder surface. AVF's
-    /// CVPixelBuffers already come back sized to the display/clean aperture
-    /// (VideoToolbox crops internally -- see avf_shim.m's
-    /// CVPixelBufferGetWidth/Height and this importer's
-    /// CVPixelBufferGetWidthOfPlane/HeightOfPlane calls below, both of which
-    /// already read the cropped size), so there is no decoder padding here to
-    /// crop away.
+    /// Borrow a CVPixelBufferRef and import two RD planes without copying.
+    /// VideoToolbox already crops AVF buffers to the display/clean aperture:
+    /// avf_shim.m's CVPixelBufferGetWidth/Height and this importer's per-plane
+    /// size queries read cropped dimensions, so no padding crop is needed.
     pub fn import(self: *MetalSurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) si.ImportResult {
         var out: PlaneTextures = .{};
         if (self.texture_cache == null) return .transient_failure;
@@ -414,17 +371,13 @@ pub const MetalSurfaceImporter = struct {
         return .{ .success = out };
     }
 
-    /// Metal is always zero-copy: nothing here ever violates the contract, so
-    /// the count is always zero. Present purely so PresentPipeline can query
-    /// cpuCopyCount() through the same call shape on every platform.
+    /// Always zero; keeps PresentPipeline's importer interface platform-neutral.
     pub fn cpuCopyCount(self: *const MetalSurfaceImporter) u64 {
         _ = self;
         return 0;
     }
 
-    /// Release importer state (the owned CVMetalTextureCache). The importer
-    /// itself is held by value in the present pipeline, so there is nothing to
-    /// free here.
+    /// Release the owned CVMetalTextureCache; the importer itself is a value.
     pub fn deinit(self: *MetalSurfaceImporter) void {
         if (self.texture_cache) |cache| {
             CVMetalTextureCacheFlush(cache, 0);

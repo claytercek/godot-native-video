@@ -1,10 +1,6 @@
-//! windows_import_common.zig — scaffolding shared by the two Windows
-//! surface importers (cpu_copy_surface_importer.zig and
-//! d3d12_surface_importer.zig): binding to the decoder's own D3D11 device,
-//! the "cached texture, recreate on size/format change" pattern, and NV12/
-//! P010 format detection. Pure D3D11/DXGI plumbing — no RenderingDevice, no
-//! Godot types — so it stays a plain sibling of surface_importer.zig rather
-//! than depending on it.
+//! Shared D3D11/DXGI helpers for the Windows CPU-copy and D3D12 importers:
+//! decoder-device binding, cached textures, NV12/P010 detection, and crop
+//! resolution. No RenderingDevice or Godot types.
 
 const std = @import("std");
 
@@ -15,19 +11,16 @@ const d3d11 = win.d3d11;
 
 const core = @import("core");
 
-/// The decoder texture's own device + immediate context, both AddRef'd by
-/// the GetDevice/GetImmediateContext calls below. The caller releases both
-/// (com.release) in its own teardown.
+/// Decoder device and immediate context, AddRef'd by GetDevice and
+/// GetImmediateContext. The caller must com.release both.
 pub const DecoderDevice = struct {
     device: *d3d11.ID3D11Device,
     context: *d3d11.ID3D11DeviceContext,
 };
 
-/// Bind to the SAME device the decoder texture lives on: D3D11 resources are
-/// per-device, so every op that touches `decoded` (CopySubresourceRegion,
-/// view creation, ...) must run on this device, never a separately created
-/// one. Returns null if GetDevice fails (a torn-down or foreign texture) —
-/// the caller logs with its own module-scoped message.
+/// Bind to decoded's device. D3D11 resources are per-device: copies, views,
+/// and all other operations on decoded must use this device, never a separate
+/// one. Returns null if device/context lookup fails; the caller logs.
 pub fn bindDecoderDevice(decoded: *d3d11.ID3D11Texture2D) ?DecoderDevice {
     var dev: ?*d3d11.ID3D11Device = null;
     decoded.GetDevice(&dev);
@@ -38,9 +31,7 @@ pub fn bindDecoderDevice(decoded: *d3d11.ID3D11Texture2D) ?DecoderDevice {
     return .{ .device = device, .context = context };
 }
 
-/// NV12 (8-bit) or P010 (10-bit) — the only two decoder surface formats the
-/// Windows importers accept. Returns null for anything else; the caller logs
-/// and bails.
+/// True for P010 (10-bit), false for NV12 (8-bit), null for unsupported formats.
 pub fn detectBitDepth(format: dxgi.DXGI_FORMAT) ?bool {
     return switch (format) {
         dxgi.DXGI_FORMAT_P010 => true,
@@ -49,21 +40,18 @@ pub fn detectBitDepth(format: dxgi.DXGI_FORMAT) ?bool {
     };
 }
 
-/// A D3D11Texture2D recreated only when its size or format changes —
-/// the "cached staging/intermediate texture" pattern both Windows importers
-/// use (cpu_copy's per-slot readback staging texture, d3d12's blit
-/// intermediate). Owns the texture; release() (or a fresh ensure() call)
-/// frees the previous one before replacing it.
+/// Owned D3D11Texture2D, reused until size or format changes. Used for CPU
+/// readback slots and the D3D12 blit intermediate. release() or a mismatched
+/// ensure() frees the previous texture.
 pub const CachedTex2D = struct {
     texture: ?*d3d11.ID3D11Texture2D = null,
     width: com.UINT = 0,
     height: com.UINT = 0,
     format: dxgi.DXGI_FORMAT = dxgi.DXGI_FORMAT_UNKNOWN,
 
-    /// Reuse `texture` if it already matches width/height/format; otherwise
-    /// release it and create a fresh one with the given usage/bind/CPU-access
-    /// flags. Returns true once `texture` is ready to use; false (texture
-    /// left null) if CreateTexture2D failed — the caller logs.
+    /// Reuse a matching width/height/format; otherwise release and recreate
+    /// with the supplied usage/bind/CPU-access flags. Returns false with a null
+    /// texture if CreateTexture2D fails; the caller logs.
     pub fn ensure(
         self: *CachedTex2D,
         device: *d3d11.ID3D11Device,
@@ -110,11 +98,9 @@ pub const CachedTex2D = struct {
     }
 };
 
-/// A VideoFrame.crop rect resolved against the decoder's actual (possibly
-/// macroblock-aligned) luma texture dimensions, plus its derived chroma crop.
-/// Both Windows importers copy/sample only this rect out of the decoder
-/// texture, so decoder padding never reaches the plane textures the present
-/// shader samples.
+/// VideoFrame.crop resolved against the decoder's macroblock-aligned luma
+/// dimensions, with a derived chroma crop. Both Windows importers use these
+/// bounds to exclude padding from the planes sampled by the present shader.
 pub const ResolvedCrop = struct {
     luma_x: com.UINT,
     luma_y: com.UINT,
@@ -126,14 +112,11 @@ pub const ResolvedCrop = struct {
     chroma_height: com.UINT,
 };
 
-/// Resolve `crop` (a VideoFrame's display-aperture rect) against the
-/// decoder's actual luma texture size. `crop.width == 0` -- the
-/// core.backend.CropRect "no crop metadata" sentinel -- and any
-/// out-of-bounds rect both fall back to the full aligned texture (the exact
-/// pre-crop-support behavior); a valid rect is clamped so it never reads past
-/// the texture edge. The chroma crop halves every field with a floor
-/// division, per CropRect's doc-commented half-pixel policy for 4:2:0
-/// subsampling.
+/// Resolve the display aperture against the decoder's actual luma size.
+/// Zero or oversized extents fall back to the corresponding aligned dimension;
+/// offsets are clamped to keep the crop inside the texture. Zero width is
+/// core.backend.CropRect's no-metadata sentinel. Chroma fields use floor
+/// division by 2, following CropRect's half-pixel policy for 4:2:0.
 pub fn resolveCrop(crop: core.backend.CropRect, aligned_width: com.UINT, aligned_height: com.UINT) ResolvedCrop {
     const luma_width = if (crop.width > 0 and crop.width <= aligned_width) crop.width else aligned_width;
     const luma_height = if (crop.height > 0 and crop.height <= aligned_height) crop.height else aligned_height;

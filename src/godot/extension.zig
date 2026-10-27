@@ -1,27 +1,15 @@
-//! extension.zig — GDExtension entry point for the native video module.
+//! GDExtension entry point. Registers the playback, stream, and loader classes,
+//! then manages the ResourceFormatLoader singleton at the SCENE level.
 //!
-//! Registers the three Binding classes and, at the SCENE initialization
-//! level, adds a NativeVideoResourceFormatLoader singleton to the
-//! ResourceLoader (removed at teardown) so a stock VideoStreamPlayer can
-//! load + play a native clip.
+//! gdzig calls register() at load, registry.enter/exit per initialization level,
+//! and unregister() at teardown. `.auto` classes commit at SCENE. Registry's
+//! addCallbacks enter hook runs after those commits, so the loader class exists
+//! before its singleton is created; the exit hook removes it.
 //!
-//! Init-level handling: gdzig's entrypoint calls register() once at load, then
-//! registry.enter(level)/exit(level) per initialization level, and
-//! unregister() at final teardown. Classes registered with `.auto` commit at
-//! the SCENE level by default. The loader singleton has no class seam of its
-//! own for per-level setup, so we hook the SCENE enter/exit via the
-//! Registry's addCallbacks mechanism — the enter callback runs AFTER all
-//! classes for that level have committed (see Registry.enter), so the loader
-//! class is already registered and instantiable when we create the singleton.
-//!
-//! `std_options` here is the whole extension binary's actual log config:
-//! gdzig's generated entrypoint root re-exports it verbatim (`pub const
-//! std_options = if (@hasDecl(extension, "std_options")) extension.std_options
-//! else .{}`), so declaring it in this module is enough to install
-//! godot_log.logFn process-wide. register()/unregister() bracket the window
-//! where gdzig's interface (and so Godot's push_error/print) is actually
-//! live; godot_log falls back to stderr-only outside it and in standalone
-//! binaries that never call register() at all.
+//! gdzig's generated root re-exports std_options, installing godot_log.logFn for
+//! the extension binary. register()/unregister() enable Godot logging only while
+//! gdzig's interface is live. Outside that window, including standalone binaries
+//! that never register, logging uses stderr alone.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -39,23 +27,14 @@ const NativeVideoStreamPlayback = @import("native_video_stream_playback.zig");
 const NativeVideoResourceFormatLoader = @import("native_video_resource_format_loader.zig");
 const godot_log = @import("godot_log.zig");
 
-// Pinned explicitly rather than left at Zig's build-mode default: ReleaseFast
-// already defaults to .info (only .debug is compiled out), but pinning it
-// here makes that an explicit contract instead of an accident of std.log's
-// per-mode default -- one that would silently reopen this exact bug if
-// std.log's default for ReleaseFast ever changes upstream.
+// Keep .info logs in every build mode, independent of std.log's defaults.
 pub const std_options: std.Options = .{
     .logFn = godot_log.logFn,
     .log_level = .info,
 };
 
-// -----------------------------------------------------------------------
-// Process-wide decode pool. Every playback instance registers with this one
-// scheduler so N VideoStreamPlayers share a single bounded set of worker
-// threads. Lazily created under a mutex on first use; intentionally never
-// torn down — its worker threads live for the process lifetime and the OS
-// reclaims them at exit.
-// -----------------------------------------------------------------------
+// All playbacks share a bounded process-wide decode pool, created under a
+// mutex on first use. It is never torn down; workers live until process exit.
 var g_scheduler: ?*DecodeScheduler = null;
 var g_scheduler_mu: core.sys_clock.Mutex = .{};
 
@@ -73,10 +52,8 @@ pub fn sharedScheduler() *DecodeScheduler {
 }
 
 pub fn register(r: *Registry) void {
-    // gdzig's raw interface is already live by the time the generated
-    // entrypoint calls register() (see entrypoint.zig), so push_error/print
-    // are safe to call from here on -- flip the gate before anything below
-    // has a chance to log.
+    // gdzig's interface is live at register() (entrypoint.zig). Enable Godot
+    // logging before any registration work can log.
     godot_log.setAvailable(true);
 
     // Playback must be registered before the stream so the stream's
@@ -94,19 +71,13 @@ pub fn unregister(r: *Registry) void {
     r.removeModule(NativeVideoStream);
     r.removeModule(NativeVideoStreamPlayback);
 
-    // Last thing before the generated entrypoint tears down gdzig's
-    // interface (see entrypoint.zig's exit()) -- nothing after this point
-    // may reach for Godot's utility functions.
+    // Disable Godot logging before entrypoint.zig tears down the interface.
     godot_log.setAvailable(false);
 }
 
-// -----------------------------------------------------------------------
-// LoaderLifecycle — the ResourceFormatLoader singleton's per-level hook.
-//
-// enter/exit fire for every initialization level; we act only at SCENE.
-// Stored by value in the Registry arena; the enter/exit callbacks receive
-// a stable pointer to that copy.
-// -----------------------------------------------------------------------
+// Loader singleton lifecycle. enter/exit act only at SCENE, though called at
+// every level. Registry stores this value in its arena and passes callbacks a
+// stable pointer to that copy.
 const LoaderLifecycle = struct {
     allocator: Allocator,
     loader: ?*NativeVideoResourceFormatLoader = null,

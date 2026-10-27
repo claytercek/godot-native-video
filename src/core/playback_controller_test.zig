@@ -1,9 +1,6 @@
-//! PlaybackController tests. No Godot, no GPU. Each case constructs its own
-//! DecodeScheduler and injects it at load(), requesting force-synchronous
-//! mode so decode runs inline on the test thread where the build supports it
-//! (release builds fall back to a single async worker; the cases hold in
-//! both modes). The scrub-resolve cases that drive seek()/tick() against the
-//! real scheduler live in scrubber_integration_test.zig.
+//! Godot/GPU-free PlaybackController tests. Each case injects its own scheduler:
+//! synchronous decode in debug, one async worker in release. Scrub seek()/tick()
+//! integration cases live in scrubber_integration_test.zig.
 
 const std = @import("std");
 
@@ -508,14 +505,10 @@ test "pause resume and stopped seeks retain their transport targets" {
 }
 
 test "6-channel back-pressure never races the source reader ahead (bounded backlog)" {
-    // Regression for the cross-platform "audio too fast + choppy" bug on
-    // multi-channel clips. A back-pressured sink accepts far fewer frames than
-    // driveAudio() offers (Godot's downstream buffer holds ~1/channels as many
-    // frames as we push). The old code drained the whole offered block from the
-    // ring but advanced only by `accepted`, discarding the surplus; fillAudio()
-    // then refilled the over-drained ring, pulling the reader ~channels× real
-    // time. The fix consumes only the accepted frames, so the reader is pulled
-    // at playback rate and the decoded-vs-served backlog stays within one ring.
+    // Regress multi-channel back-pressure: the sink accepts only part of each
+    // offer. Consuming more than accepted would discard PCM and over-drain the
+    // ring, making fillAudio() decode faster than playback. The decoded/served
+    // backlog must stay within one ring.
     const sched = makeSched();
     defer sched.deinit();
     var controller = PlaybackController.init();
@@ -536,10 +529,7 @@ test "6-channel back-pressure never races the source reader ahead (bounded backl
         _ = controller.tick(1.0 / 60.0, WallClockMs.init(t), sink.sink());
     }
 
-    // Every decoded frame is either served to the sink or still buffered in the
-    // ring, so the backlog can never exceed one ring's worth. Under the old
-    // drop-the-surplus code this gap grew without bound (the reader raced ~6×
-    // ahead), reaching hundreds of thousands of frames over 300 ticks.
+    // Every decoded frame is served or buffered; backlog cannot exceed the ring.
     const decoded = controller.audio_telemetry.decoded_frames_in;
     const served = controller.audio_telemetry.frames_served;
     const ring_capacity: u64 = 48000 / 2;

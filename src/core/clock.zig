@@ -1,13 +1,8 @@
-//! Media-time clocks.
+//! Playback clocks in f64 seconds, retaining PTS precision over hours of media.
 //!
-//! The Engine Core owns the master playback clock. Two concrete clocks and
-//! a bridge live here: AudioMasterClock derives time from audio sample
-//! consumption, MonotonicClock accumulates frame deltas for silent
-//! playback, and ClockBridge wraps both and switches mastership at runtime
-//! (audio-to-monotonic handoff across silent gaps, and re-anchor back).
-//!
-//! All times are in seconds using f64 to represent PTS values accurately
-//! for media up to several hours long.
+//! AudioMasterClock tracks consumed PCM; MonotonicClock accumulates frame
+//! deltas. ClockBridge switches between them across silent gaps and re-anchors
+//! audio when it resumes.
 
 const std = @import("std");
 
@@ -88,19 +83,9 @@ pub const AudioMasterClock = struct {
     }
 };
 
-/// ClockBridge — runtime-switchable master clock.
-///
-/// Wraps both an AudioMasterClock and a MonotonicClock, delegating to
-/// whichever is currently the active master. Supports audio-to-monotonic
-/// handoff and monotonic-to-audio re-anchor, both seeded from the current
-/// position so the reported mediaTime() remains continuous across the
-/// switch.
-///
-/// The audio side is optional: `audio` may be null for clips with no audio
-/// track. A null audio clock means the bridge is permanently
-/// monotonic-master (silent clips) — every audio-facing method becomes a
-/// safe no-op instead of requiring callers to construct a dummy
-/// AudioMasterClock.
+/// Switch between audio and monotonic clocks, seeding each handoff from the
+/// current position to keep mediaTime() continuous. With `audio == null`,
+/// remain monotonic-master and treat audio-facing methods as no-ops.
 pub const ClockBridge = struct {
     audio: ?AudioMasterClock,
     mono: MonotonicClock,
@@ -181,12 +166,8 @@ pub const ClockBridge = struct {
         return self.audio_master;
     }
 
-    /// Report audio sample consumption. Delegates to AudioMasterClock when
-    /// audio-master; no-op in monotonic mode (audio samples are not
-    /// consumed during a gap, so the clock stays honest for re-anchor).
-    /// Also a no-op when there is no audio clock — audio_master can never
-    /// be true in that case, but the explicit guard keeps this method safe
-    /// on its own terms.
+    /// Report sample consumption to AudioMasterClock only while audio-master.
+    /// No-op during a monotonic gap or when no audio clock exists.
     pub fn onAudioMixed(self: *ClockBridge, frame_count: i32) void {
         if (self.audio_master) {
             if (self.audio) |*a| {

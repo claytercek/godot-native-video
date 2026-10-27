@@ -1,24 +1,15 @@
-//! native_video_stream_playback.zig — the Binding's VideoStreamPlayback.
+//! Adapt core.PlaybackController to Godot's VideoStreamPlayback through type
+//! conversion, mixAudio(), and PresentPipeline. Playback state machines remain
+//! in the Godot-independent controller.
 //!
-//! Adapts the Godot-independent Engine Core (core.PlaybackController) to
-//! Godot's VideoStreamPlayback so a stock VideoStreamPlayer can play a
-//! native clip.
-//! Holds no playback logic of its own — every state machine lives in the
-//! Godot-free PlaybackController. This class is exactly the translation layer:
-//! Godot type conversion, a MixSink implementation wrapping mixAudio(), and
-//! present-pipeline plumbing (the zero-copy GPU present + _getTexture()).
+//! _update() takes controller.tick()'s frame by value and passes it to
+//! PresentPipeline, which releases it on failure or through the GPU retire ring.
 //!
-//! _update() calls controller.tick(), which returns the frame to present (if
-//! any) BY VALUE; this class performs the GPU present via PresentPipeline and
-//! owns the frame's release() from there via the retire ring.
-//!
-//! Virtual method int params/returns use their natural width (i32 for
-//! index/channels/mix-rate): gdzig's vtable ptrcall marshalling reads/writes
-//! the full 8-byte engine slot regardless of the declared Zig width. Floats
-//! stay f64 — that IS the natural Godot width. The output_mode property
-//! accessors below are NOT virtuals — they're addProperty-registered methods
-//! dispatched through Variant, which only supports i64 for integers — so
-//! they stay i64.
+//! Virtual integer parameters/returns use natural widths (i32 for indices,
+//! channels, and mix rate): gdzig's vtable ptrcall marshals full 8-byte engine
+//! slots regardless of Zig width. Floats use Godot's f64 width. output_mode
+//! accessors are addProperty methods dispatched through Variant, whose integers
+//! require i64.
 
 const NativeVideoStreamPlayback = @This();
 
@@ -49,9 +40,8 @@ const platform_backend = switch (builtin.os.tag) {
     else => @compileError("Native Video supports macOS, iOS, Windows, and Linux only"),
 };
 
-// Core types come through the "core" named module (build.zig-wired) so they
-// match the PlaybackController's module instance. A module's root restricts
-// @import, so path imports into ../core are not an option.
+// Use build.zig's named module to share PlaybackController's type identity;
+// Zig's module-root boundary prevents path imports into ../core.
 const core = @import("core");
 const backend_mod = core.backend;
 const Backend = backend_mod.Backend;
@@ -91,15 +81,14 @@ allocator: Allocator,
 base: *VideoStreamPlayback,
 controller: PlaybackController,
 present: PresentPipeline,
-// A weak SceneTree ObjectID, never a raw callback pointer or owning reference.
-// Pumps paused previews AND GPU retirement; stays connected until both drain.
+// Weak SceneTree ObjectID. The pump stays connected until paused previews
+// and GPU retirements both drain.
 presentation_tree_id: ?object_id.ObjectId = null,
 preview: preview_policy.Pending(backend_mod.VideoFrame) = .{},
 presentation_processing: bool = false,
 
-// GodotMixSink scratch buffer, resized as needed, never per-tick — the seam
-// costs nothing beyond the copy from the controller's plain-float scratch into
-// Godot's array type. Owned here so the MixSink adapter can reach it.
+// Owned MixSink scratch array, grown as needed and reused across ticks.
+// The adapter copies the controller's plain floats into it for Godot.
 mix_buffer: PackedFloat32Array,
 
 pub fn create(allocator: *Allocator) !*NativeVideoStreamPlayback {
@@ -118,9 +107,8 @@ pub fn create(allocator: *Allocator) !*NativeVideoStreamPlayback {
 pub fn destroy(self: *NativeVideoStreamPlayback, allocator: *Allocator) void {
     self.cancelPreviewWork();
     self.disconnectPresentationPump();
-    // Unregister from the shared pool first: this blocks until any in-flight
-    // decode slice for our stream completes and releases every buffered
-    // surface, so no worker can touch our Backend after this returns.
+    // Unregister before freeing backend state. shutdown() waits for in-flight
+    // decode work and releases buffered surfaces; no worker can use it after.
     self.controller.shutdown();
     self.present.shutdown();
     self.controller.deinit();
@@ -129,13 +117,8 @@ pub fn destroy(self: *NativeVideoStreamPlayback, allocator: *Allocator) void {
     allocator.destroy(self);
 }
 
-// -----------------------------------------------------------------------
-// GodotMixSink — the Binding's MixSink implementation.
-//
-// The one Godot API call the Engine Core's audio drive reaches through: wraps
-// VideoStreamPlayback.mixAudio(). Copies the controller's plain-float scratch
-// into the owned PackedFloat32Array (resized as needed) and pushes it.
-// -----------------------------------------------------------------------
+// MixSink adapter: copy the controller's floats into the reusable
+// PackedFloat32Array and submit them through VideoStreamPlayback.mixAudio().
 fn mixSinkAdapter(self: *NativeVideoStreamPlayback) MixSink {
     return .{ .ptr = self, .vtable = &mix_sink_vtable };
 }
@@ -159,17 +142,14 @@ fn mixSinkMix(ptr: *anyopaque, interleaved: []const f32, channel_count: i32) i32
     return self.base.mixAudio(frame_count, .{ .buffer = self.mix_buffer, .offset = 0 });
 }
 
-/// Monotonic wall clock for the Scrubber's velocity/debounce timing
-/// (independent of media time, which jumps around during a scrub). Never jumps.
+/// Monotonic wall clock for scrub velocity/debounce, independent of media time.
 fn nowMs() WallClockMs {
     const ns: i128 = core.sys_clock.nanoTimestamp();
     const ms: f64 = @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
     return WallClockMs.init(ms);
 }
 
-/// Drains warnings the controller queued since the last call and logs them.
-/// The controller has no logging dependency of its own; this is the Godot-side
-/// half of that seam.
+/// Drain and log queued warnings; the controller has no logging dependency.
 fn flushWarnings(self: *NativeVideoStreamPlayback) void {
     var warnings = self.controller.takeWarnings();
     defer {
@@ -181,10 +161,9 @@ fn flushWarnings(self: *NativeVideoStreamPlayback) void {
     }
 }
 
-/// Resolve a Godot res:// / user:// path to an absolute OS path and open it
-/// on a fresh backend. globalizePath leaves absolute OS paths untouched.
-/// Returns an error if the backend can't be constructed or open() fails; on
-/// success the caller owns the (already open) backend and must deinit() it.
+/// Open a fresh backend for a res://, user://, or absolute OS path.
+/// globalizePath leaves absolute paths unchanged. On success, the caller owns
+/// the open backend and must deinit() it; construction/open failures return errors.
 pub fn openBackendForPath(allocator: Allocator, path: String) !Backend {
     var backend = try platform_backend.create(allocator);
 
@@ -200,10 +179,8 @@ pub fn openBackendForPath(allocator: Allocator, path: String) !Backend {
     return backend;
 }
 
-/// Reports a load() failure to Godot's own error reporting (push_error —
-/// visible in the editor's Output/errors panel, not just stderr), with the
-/// resolved OS path and the Zig error name. Open/load failures used to be
-/// swallowed silently, which made real bugs invisible.
+/// Report load failure through push_error with the resolved OS path and Zig
+/// error name, making it visible in the editor's Output/errors panel.
 fn reportLoadFailure(path: String, err: anyerror) void {
     var os_path = ProjectSettings.globalizePath(path);
     defer os_path.deinit();
@@ -229,9 +206,8 @@ pub fn load(self: *NativeVideoStreamPlayback, path: String) bool {
         return false;
     };
 
-    // Audio-master latency compensation shifts reported media time back so it
-    // reflects what the speaker is emitting now, not what was just pushed into
-    // the audio buffer. Resolved once here and handed to the controller.
+    // Sample output latency once. The controller subtracts it from media time
+    // to track audio reaching the speaker rather than audio entering the buffer.
     const latency: f64 = AudioServer.getOutputLatency();
 
     self.controller.load(self.allocator, extension.sharedScheduler(), backend, latency) catch |e| {
@@ -251,16 +227,13 @@ pub fn setOutputMode(self: *NativeVideoStreamPlayback, mode: i64) void {
     self.applyOutputMode(om);
 }
 
-/// The REQUESTED output mode — the pipeline never rewrites it, so the
-/// inspector round-trips what was set even if that mode failed to build. What
-/// is actually built is reported by get_color_info()'s "output_mode" key.
+/// Requested mode, preserved even if its build fails. get_color_info()'s
+/// output_mode key reports the built mode when resources exist.
 pub fn getOutputMode(self: *NativeVideoStreamPlayback) i64 {
     return @backingInt(self.present.outputMode());
 }
 
-/// Applies an already-resolved OutputMode, bypassing the Variant boundary
-/// conversion above. Used when the owning NativeVideoStream forwards its own
-/// (already-converted) output mode to a live playback.
+/// Apply a typed mode forwarded by NativeVideoStream, bypassing Variant conversion.
 pub fn applyOutputMode(self: *NativeVideoStreamPlayback, mode: OutputMode) void {
     self.present.setOutputMode(mode);
 }
@@ -310,15 +283,15 @@ pub fn _seek(self: *NativeVideoStreamPlayback, time: f64) void {
     }
 }
 
-/// One main-thread presentation pump. VideoStreamPlayer stops _update while
-/// paused, so SceneTree.process_frame drives outstanding seeks AND retirement
-/// after pause/stop/resume. It carries no old target/frame; the controller owns
-/// the latest request, and Engine.getFramesDrawn is the sole lifetime clock.
+/// Main-thread presentation pump. While VideoStreamPlayer pauses _update,
+/// SceneTree.process_frame drives seeks and retirement across pause/stop/resume.
+/// The controller owns the latest request; Engine.getFramesDrawn alone ages GPU
+/// resources.
 pub fn processPresentation(self: *NativeVideoStreamPlayback) void {
-    // An ObjectID-bound callable is weak. Texture2DRD.changed is synchronous:
-    // its handlers may replace the stream/free the player during present().
-    // This owned Variant uses gdzig's RefCounted ownership adapter; its final
-    // deinit MUST happen after every other defer and every access to self.
+    // ObjectID callables are weak; synchronous Texture2DRD.changed handlers
+    // may replace the stream or free the player during present(). Retain self
+    // through gdzig's RefCounted Variant adapter, and deinit it after all other
+    // defers and accesses to self.
     var keep_alive = Variant.init(*VideoStreamPlayback, self.base);
     defer keep_alive.deinit();
     if (self.presentation_processing) return;
@@ -409,13 +382,11 @@ pub fn _setAudioTrack(self: *NativeVideoStreamPlayback, idx: i32) void {
 }
 
 pub fn _getTexture(self: *NativeVideoStreamPlayback) ?*Texture2d {
-    // The engine-owned RGBA Texture2DRD. Godot samples ONLY this — never the
-    // decoder surface. The present pipeline (current_texture) holds its own
-    // owning reference for the pipeline's lifetime; this virtual return needs
-    // a SEPARATE +1 for the engine to adopt — confirmed empirically, since
-    // omitting it leaves the displayed texture readable via get_video_texture()
-    // but breaks RenderingServer's CPU image readback (Image.get_image()
-    // returns null) partway through playback.
+    // Godot samples this RGBA Texture2DRD, never the decoder surface. The
+    // pipeline owns current_texture; this virtual return needs a separate +1
+    // for the engine to adopt. Without it, get_video_texture() remains readable
+    // but RenderingServer CPU readback (Image.get_image()) returns null
+    // partway through playback.
     const tex = self.present.getTexture();
     _ = tex.reference();
     return .upcast(tex);
@@ -455,20 +426,17 @@ pub fn _getChannels(self: *NativeVideoStreamPlayback) i32 {
 }
 
 pub fn _getMixRate(self: *NativeVideoStreamPlayback) i32 {
-    // Canonical Mix Format sample rate: the FIRST audio-bearing track's rate.
+    // Canonical mix sample rate: the first audio-bearing track's rate.
     return self.controller.canonical_sample_rate;
 }
 
 // --- Colorimetry ---
 
-/// Returns a Dictionary with the parsed/negotiated colorimetry. Callable after
-/// load() succeeds. Untagged clips return BT.709 video-range defaults. Always
-/// includes an "output_mode" key (0 or 1) reporting the mode the present
-/// pipeline actually built. Once something is built it lags the `output_mode`
-/// property until the next present(), and stays behind it until the request
-/// changes again if the requested mode failed to build and fell back to SDR.
-/// While nothing is built at all — before the first present(), in headless
-/// mode, or after a failed build — it reports the request instead.
+/// Return parsed/negotiated colorimetry after successful load(); untagged clips
+/// use BT.709 video-range defaults. output_mode (0 or 1) reports the built mode,
+/// which can lag the property until present() or remain SDR after an HDR build
+/// failure until the request changes. With no resources built (before present,
+/// headless, or after build failure), it reports the requested mode.
 pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     const color: Colorimetry = self.controller.color;
     var info = Dictionary.init();
@@ -477,21 +445,15 @@ pub fn getColorInfo(self: *NativeVideoStreamPlayback) Dictionary {
     setDict(&info, "transfer", @backingInt(color.transfer));
     setDict(&info, "range", @backingInt(color.range));
     setDict(&info, "bit_depth", color.bit_depth);
-    // Report the mode actually built, not the requested one, so callers can
-    // distinguish an SDR clip in an HDR viewport vs a native HDR clip — and
-    // see when an HDR request fell back to SDR. With nothing built there is no
-    // built mode to report, so fall back to the request rather than inventing
-    // an SDR default — that default was the regression this key had.
+    // Expose the built mode, including SDR fallback. Before any build, use the
+    // request rather than an arbitrary SDR default.
     const built = self.present.builtOutputMode() orelse self.present.outputMode();
     setDict(&info, "output_mode", @backingInt(built));
     return info;
 }
 
-/// Frames imported through the Windows CPU-copy path so far this playback
-/// session — the one sanctioned exception to the zero-copy contract, counted
-/// honestly whether this session ran CPU-copy from the start or degraded
-/// into it mid-flight from a failed D3D12 zero-copy attempt. Always 0 on
-/// macOS (Metal is always zero-copy).
+/// Successful CPU-copy imports this playback session, including Windows
+/// sessions that fall back from D3D12. Always zero on Metal.
 pub fn getCpuCopyCount(self: *NativeVideoStreamPlayback) i64 {
     return @intCast(self.present.cpuCopyCount());
 }

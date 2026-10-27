@@ -1,24 +1,8 @@
-//! Audio-EOS wall-clock fallback — no Godot, no GPU.
+//! Godot-free tests for clock fallback when audio ends before video.
 //!
-//! A clip's audio track can legitimately end before its video track. The
-//! audio-master clock only advances from real samples consumed (onAudioMixed());
-//! once the backend stops producing real audio frames for good, nothing will
-//! ever call onAudioMixed() again, so the clock would freeze permanently unless
-//! something else advances it.
-//!
-//! This models the controller's unified clock rule:
-//!
-//!   var advanced_from_audio = false;
-//!   if (has_audio) { fill_audio(); advanced_from_audio = drive_audio(); }
-//!   if (!advanced_from_audio and audio_exhausted()) {
-//!       clock.setTime(clock.mediaTime() + delta);
-//!   }
-//!
-//! where audio_exhausted() == !has_audio or (audio_eos and ring empty): the
-//! clock advances from real samples whenever any exist; only once no more can
-//! ever come does the render delta take over. The !advanced_from_audio gate
-//! keeps the tick that drains the last partial block from double-advancing
-//! (real leftover + delta).
+//! Model the controller's rule: consumed PCM advances the clock; render delta
+//! takes over only when audio is absent or EOS has drained the ring. A tick
+//! that consumes the final partial block must not also add render delta.
 
 const std = @import("std");
 

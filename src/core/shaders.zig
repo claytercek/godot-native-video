@@ -1,19 +1,9 @@
-//! shaders.zig — the embedded GLSL present-pipeline shaders.
+//! Embedded SDR and HDR_OUTPUT=1 variants of shaders/nv12_to_rgb.glsl.
+//! Inline hdr_color_math.glsl and strip Godot's #[compute] marker because
+//! RenderingDevice.shaderCompileSpirvFromSource does not resolve #includes.
 //!
-//! Embeds shaders/nv12_to_rgb.glsl twice (SDR + HDR_OUTPUT=1), inlining the
-//! `#include "hdr_color_math.glsl"` directive and stripping the Godot-specific
-//! `#[compute]` marker line, because Godot's runtime GLSL compiler
-//! (RenderingDevice.shaderCompileSpirvFromSource) does not resolve #includes.
-//!
-//! Core owns these constants so the pure Zig color-matrix test
-//! (color_matrix_test.zig) can validate the shader source text headlessly, and
-//! the Godot present pipeline imports the two preprocessed variants for
-//! compilation.
-//!
-//! NOTE: this file IS wired into core.zig (`pub const shaders = @import(...)`),
-//! reached directly by @import from color_matrix_test.zig (sibling), and
-//! reached by the Godot present pipeline through the "core" module (see
-//! src/godot/present_pipeline.zig).
+//! Core tests parse these sources without Godot; the present pipeline imports
+//! the preprocessed variants through the core module for runtime compilation.
 
 const std = @import("std");
 

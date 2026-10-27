@@ -1,33 +1,17 @@
-//! com_executor.zig — a dedicated COM-apartment thread the MF backend owns.
+//! Dedicated COM multi-threaded apartment (MTA) for the MF backend.
 //!
-//! WHY THIS EXISTS: Media Foundation wants its objects created and torn down in
-//! a Multi-Threaded Apartment (MTA). Godot's D3D12 renderer, however, puts the
-//! engine main thread — the thread that calls our load()/open() — into a
-//! Single-Threaded Apartment (STA). On that thread CoInitializeEx(MTA) fails
-//! with RPC_E_CHANGED_MODE, and MFCreateSourceReaderFromURL then fails
-//! intermittently. We cannot dictate the main thread's apartment; the engine
-//! owns it. So the backend owns a thread whose apartment WE control.
+//! Godot's D3D12 main thread is an STA: CoInitializeEx(MTA) fails there with
+//! RPC_E_CHANGED_MODE, and source-reader creation fails intermittently. This
+//! executor creates its own thread, pairing CoInitializeEx(COINIT_MULTITHREADED)
+//! and CoUninitialize on that thread. run() dispatches a job and blocks for it.
 //!
-//! ComExecutor spawns exactly one such thread. It calls
-//! CoInitializeEx(COINIT_MULTITHREADED) once when it starts and the paired
-//! CoUninitialize once when it stops — the two apartment calls that MUST run on
-//! the same thread stay on the same thread. In between, run() marshals a
-//! closure onto that thread and blocks until it returns, so the backend can
-//! create/tear down its source reader in a controlled MTA while still returning
-//! success/failure to its caller synchronously.
+//! The thread lives from open() to close(), anchoring the process MTA while
+//! scheduler workers call ReadSample. A synchronous MF source reader created
+//! in that MTA has no single-thread affinity.
 //!
-//! The thread also lives from open() to close(), so while it is up the process
-//! MTA it anchors is guaranteed to exist. That is what lets the decode-scheduler
-//! workers pump ReadSample on the reader off-thread: an MF source reader in sync
-//! mode has no single-thread affinity, and the anchoring MTA keeps the reader a
-//! true free-threaded MTA object rather than one bound to an STA.
-//!
-//! CONCURRENCY CONTRACT: start()/run()/stop() are NOT safe to call concurrently
-//! with each other for one ComExecutor. The MF backend serialises them — open
-//! and close for a given backend never overlap (open completes before the
-//! stream is registered with the scheduler; close runs only after the scheduler
-//! has drained any in-flight decode slice). run() therefore handles a single
-//! in-flight job at a time, which is all the backend ever submits.
+//! Callers must serialize start()/run()/stop(); only one job may be in flight.
+//! MfBackend opens before scheduler registration and closes after all decode
+//! slices finish.
 
 const std = @import("std");
 
@@ -54,10 +38,8 @@ pub const ComExecutor = struct {
     ctx: *anyopaque = undefined,
     done: bool = false, // the consumed job has returned
 
-    /// Spawn the apartment thread and block until it has entered the MTA.
-    /// Returns error.ComInit if the thread could not join the MTA (should not
-    /// happen on a freshly spawned thread, which has no prior apartment).
-    /// Idempotent: a no-op when already running.
+    /// Spawn the thread and wait for MTA initialization. Return error.ComInit
+    /// on spawn or initialization failure. No-op if already running.
     pub fn start(self: *ComExecutor) error{ComInit}!void {
         if (self.thread != null) return;
         self.ready = false;

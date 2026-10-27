@@ -1,35 +1,19 @@
-//! win.zig — root of the hand-written Windows bindings for the Media Foundation
-//! decoder backend. This is the foundation the eventual `mf_backend.zig` and the
-//! D3D11/D3D12 surface importers build on; for now it is a pure bindings layer.
+//! Hand-written Windows bindings for MF decoding and D3D11/D3D12 import.
+//! Declarations follow Zig's bundled mingw-w64 headers without @cImport.
 //!
-//! Repo rule (hard): NO `@cImport` anywhere. Every OS type, GUID, function, and
-//! COM interface below is transcribed by hand from the mingw-w64 headers Zig
-//! bundles. The AVFoundation backend follows the same discipline on macOS
-//! (src/avf/avf_backend.zig); this mirrors it for Windows.
+//! Modules:
+//! - com.zig: IUnknown, ComPtr, HRESULT, PROPVARIANT, apartments, and Win32 helpers.
+//! - mf.zig: MF lifecycle, readers, media types, samples, buffers, and GUIDs.
+//! - dxgi.zig: resource interfaces and formats for shared handles.
+//! - d3d11.zig: devices, contexts, textures, fences, and descriptors.
+//! - d3d12.zig: interfaces for opening shared resources and waiting on fences.
+//! - d3dcompiler.zig: HLSL compilation for the plane-split compute shader.
 //!
-//! How the bindings are organised:
-//!  - com.zig         — IUnknown, ComPtr, HRESULT helpers, PROPVARIANT, COM
-//!                      apartment lifecycle, and the misc Win32 (handles,
-//!                      events, code-page/locale conversion) used by the port.
-//!  - mf.zig          — Media Foundation: MFStartup/Shutdown, the source
-//!                      reader/media-type/sample/buffer interfaces, the DXGI
-//!                      device manager, and every MF GUID constant.
-//!  - dxgi.zig        — the DXGI resource interface + DXGI_FORMAT subset, for
-//!                      shared-handle export.
-//!  - d3d11.zig       — the D3D11 device/context/texture/fence surface and the
-//!                      descriptor structs the interop + compute path fills.
-//!  - d3d12.zig       — the three D3D12 interfaces the zero-copy importer opens
-//!                      shared handles through.
-//!  - d3dcompiler.zig — runtime HLSL compile of the plane-split compute shader.
-//!
-//! Design conventions used throughout (see com.zig for the rationale):
-//!  - Interfaces are `extern struct { lpVtbl: *const Vtbl }`. Each Vtbl lists
-//!    EVERY slot in the exact C-header order (parent methods first); methods the
-//!    port never calls are opaque `*const anyopaque` placeholders so the typed
-//!    methods keep their real slot index. Deeper interfaces embed the shallower
-//!    vtable as their first field so the slot arithmetic can't drift.
-//!  - GUIDs are Zig consts with literal values — the mingw import libs omit many
-//!    of these symbols, so nothing links against them.
+//! Interfaces use `extern struct { lpVtbl: *const Vtbl }`. Preserve every slot
+//! in C-header order, with parent methods first and unused methods represented
+//! by *const anyopaque. Derived vtables embed the base as their first field.
+//! GUIDs use literal Zig constants because MinGW import libraries omit many
+//! GUID symbols.
 
 const std = @import("std");
 

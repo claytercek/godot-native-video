@@ -1,20 +1,11 @@
-//! present_pipeline.zig — the zero-copy NV12->RGB present pipeline.
+//! Y'CbCr-to-RGB presentation on Godot's RenderingDevice. Owns the compute
+//! shader, pipeline, and sampler, a platform surface importer, an RGBA output
+//! ring, and a retire ring for transient surfaces.
 //!
-//! Owns, on Godot's RenderingDevice:
-//!   - the NV12->RGB compute shader + pipeline + sampler,
-//!   - an N-buffered ring of engine-owned RGBA storage textures (rgba8 in SDR
-//!     mode, rgba16f in HDR mode), exposed through ONE stable Texture2DRD that
-//!     Godot samples (see getTexture()),
-//!   - a MetalSurfaceImporter that turns a decoder surface into two RD plane
-//!     textures — zero-copy,
-//!   - a RetireRing(N) that holds each frame's transient surfaces for N
-//!     rendered frames so the GPU never reads a freed surface.
-//!
-//! HDR output mode: the ring textures become RGBA16F and the compute shader
-//! emits scene-linear values scaled so 1.0 = 203-nit Reference White (BT.2408).
-//!
-//! present(frame) runs ONE compute dispatch (NV12->RGB) into the next ring slot
-//! and re-points the stable Texture2DRD at it.
+//! Each presentation dispatches one conversion pass into an output slot and
+//! points a stable Texture2DRD at it. SDR uses RGBA8; HDR uses scene-linear
+//! RGBA16F with 1.0 = 203-nit reference white (BT.2408). Transient surfaces stay
+//! alive for N rendered frames before retirement so GPU sampling finishes first.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,10 +28,8 @@ const PackedByteArray = godot.builtin.PackedByteArray;
 
 const log = std.log.scoped(.native_video_present);
 
-// Core types come through the "core" named module (build.zig-wired) so they
-// match the module instance the PlaybackController hands us. A module's root
-// restricts @import to its own subtree, so path imports into ../core are not
-// an option.
+// Use build.zig's named module to share PlaybackController's type identity;
+// Zig's module-root boundary prevents path imports into ../core.
 const core = @import("core");
 const backend = core.backend;
 const VideoFrame = backend.VideoFrame;
@@ -52,11 +41,9 @@ const si = @import("surface_importer.zig");
 const preview_policy = @import("preview_presentation.zig");
 const PlaneTextures = si.PlaneTextures;
 
-// The concrete surface importer is chosen at comptime per platform. On Windows
-// the WindowsSurfaceImporter itself picks between the D3D12 zero-copy and
-// CPU-copy paths at runtime; Linux uploads GStreamer's CPU-readable planes;
-// on macOS the Metal importer is the only path. All present the same
-// value-held interface, so the pipeline below stays platform-agnostic.
+// Select the platform importer at comptime. Windows chooses D3D12 or CPU-copy
+// at runtime; Linux uploads GStreamer CPU planes; Apple platforms use Metal.
+// All expose the same value-held interface.
 const SurfaceImporter = if (builtin.os.tag == .windows)
     @import("windows_surface_importer.zig").WindowsSurfaceImporter
 else if (builtin.os.tag == .linux)
@@ -69,10 +56,8 @@ pub const OutputMode = enum(u8) {
     sdr = 0, // RGBA8, non-linear (tone-mapped / clamped), Godot's standard 2D
     hdr = 1, // RGBA16F, scene-linear, 1.0 = 203-nit Reference White (BT.2408)
 
-    /// Converts a Variant-boundary i64 (as received from a Godot property
-    /// setter) into an OutputMode. Null for anything out of range, so the
-    /// caller can ignore the set — matches the property's enum hint, which
-    /// only ever offers 0 or 1.
+    /// Convert a Variant property integer to a mode. Return null for values
+    /// outside the property's enum hint (0 or 1), so callers can ignore them.
     pub fn fromInt(v: i64) ?OutputMode {
         return switch (v) {
             0 => .sdr,
@@ -82,9 +67,8 @@ pub const OutputMode = enum(u8) {
     }
 };
 
-/// Number of rendered frames a decoder surface is held before retirement, and
-/// the depth of the engine-owned RGBA output ring. Godot's render pipeline is
-/// at most a few frames deep; 3 is a safe, cheap bound.
+/// Decoder-surface retention and RGBA ring depth, measured in rendered frames.
+/// Three frames cover Godot's render-pipeline latency.
 pub const frame_latency: usize = 3;
 pub const ring_depth: usize = frame_latency;
 
@@ -117,12 +101,8 @@ const State = enum(u8) {
     disabled, // no RenderingServer/RenderingDevice — terminal, never leaves
 };
 
-// -----------------------------------------------------------------------
-// The retire-ring payload: freeing one presented frame's transient surfaces
-// (the uniform set RID, the imported plane textures, and the decoder frame
-// itself). Heap-boxed and run by the epoch retire ring once the
-// frame has survived its GPU latency window.
-// -----------------------------------------------------------------------
+// Heap-boxed retirement payload. After the GPU latency window, free the
+// uniform set, imported planes, and decoder frame in that order.
 const RetireValue = struct {
     rd: *RenderingDevice,
     uniform_set: Rid,
@@ -147,8 +127,7 @@ pub const PresentPipeline = struct {
     pipeline: Rid = si.rid_invalid,
     sampler: Rid = si.rid_invalid,
 
-    // Reusable push-constant staging buffer, resized once in buildResources and
-    // repacked in place every present() — avoids a per-frame heap alloc.
+    // Sized in buildResources and repacked in place, avoiding per-frame allocation.
     push_scratch: PackedByteArray,
 
     ring: [ring_depth]RingSlot = @splat(.{}),
@@ -163,15 +142,12 @@ pub const PresentPipeline = struct {
     width: i32 = 0,
     height: i32 = 0,
     state: State = .unbuilt,
-    // What script asked for. Written ONLY by setOutputMode(), so a build
-    // failure can never destroy the request and the property round-trips.
+    // Script request, changed only by setOutputMode(); build failure preserves it.
     requested_output_mode: OutputMode = .sdr,
-    // The mode buildResources() actually builds. Follows the request, except
-    // that the build-failure fallback in ensureReady() reverts it to .sdr.
+    // Build target: follows the request unless ensureReady() falls back to SDR.
     active_output_mode: OutputMode = .sdr,
-    // The mode of the resources currently live. Set only where state becomes
-    // .ready, cleared wherever those resources are released. Null means
-    // nothing is built (initial, headless, or after a failed build).
+    // Live resource mode, set on .ready and cleared on release. Null before
+    // build, in headless mode, or after build failure.
     built_output_mode: ?OutputMode = null,
 
     pub fn init(allocator: std.mem.Allocator) PresentPipeline {
@@ -186,39 +162,30 @@ pub const PresentPipeline = struct {
         return self.state == .ready;
     }
 
-    /// The REQUESTED output mode — exactly what was last passed to
-    /// setOutputMode(), never rewritten by the pipeline. May differ from what
-    /// is currently built: a request only takes effect at the next present(),
-    /// and a request that fails to build falls back to SDR.
+    /// Last requested mode, preserved across build failure. It may differ from
+    /// the built mode until the next present() or after SDR fallback.
     pub fn outputMode(self: *const PresentPipeline) OutputMode {
         return self.requested_output_mode;
     }
 
-    /// The mode of the resources actually in use — what the viewport is being
-    /// fed right now. Null when nothing is built: before the first present(),
-    /// in headless mode, and after a failed build. Differs from outputMode()
-    /// while a request is pending, or until the request changes again if the
-    /// requested mode failed to build and we fell back to SDR.
+    /// Live resource mode, or null before first present(), in headless mode,
+    /// or after build failure. May lag outputMode() while a request is pending;
+    /// SDR fallback persists until the request changes again.
     pub fn builtOutputMode(self: *const PresentPipeline) ?OutputMode {
         return self.built_output_mode;
     }
 
-    /// Frames imported through the CPU-copy path so far this session (always
-    /// 0 on macOS, and on Windows until/unless the importer is or degrades to
-    /// CPU-copy). See WindowsSurfaceImporter.cpuCopyCount / CpuCopySurfaceImporter.
+    /// Successful CPU-copy imports this session. Zero on Metal; Windows counts
+    /// initial CPU-copy selection and D3D12 fallback imports.
     pub fn cpuCopyCount(self: *const PresentPipeline) u64 {
         if (self.importer) |*importer| return importer.cpuCopyCount();
         return 0;
     }
 
-    /// Request an output mode (SDR or HDR). This is a REQUEST: it is applied
-    /// at the next ensureReady() (i.e. the next present()), which rebuilds
-    /// everything — the ring texture format changes (rgba8 vs rgba16f), so the
-    /// shader is recompiled too. If the requested mode fails to build, the
-    /// build falls back to SDR; the request itself is kept, and
-    /// builtOutputMode() reports what is actually in use. Repeating the
-    /// current request is a no-op, so a failed mode is not re-attempted every
-    /// time the property is written.
+    /// Request SDR or HDR for the next ensureReady()/present(). A mode change
+    /// rebuilds resources, including ring format and shader. Build failure
+    /// falls back to SDR without changing the request; builtOutputMode() reports
+    /// the result. Repeating the request is a no-op, including after failure.
     pub fn setOutputMode(self: *PresentPipeline, mode: OutputMode) void {
         if (mode != self.requested_output_mode) {
             self.requested_output_mode = mode;
@@ -229,9 +196,8 @@ pub const PresentPipeline = struct {
         }
     }
 
-    /// The engine-owned RGBA Texture2DRD holding the latest frame. Returned
-    /// from VideoStreamPlayback._getTexture(). Identity is stable: we hand out
-    /// one lazily-created Texture2DRD and re-point its RD RID each present.
+    /// Stable, lazily created RGBA Texture2DRD returned by _getTexture().
+    /// Each presentation updates its RD RID without replacing the object.
     pub fn getTexture(self: *PresentPipeline) *Texture2drd {
         if (self.current_texture == null) {
             const tex = Texture2drd.init();
@@ -245,7 +211,7 @@ pub const PresentPipeline = struct {
     /// Returns false if RD is unavailable or the importer fails.
     pub fn ensureReady(self: *PresentPipeline, width: i32, height: i32) bool {
         if (width <= 0 or height <= 0) return false;
-        // Disabled (e.g. headless) is terminal — don't retry build every frame.
+        // Disabled (e.g. headless) is terminal; do not retry each frame.
         if (self.state == .disabled) return false;
         if (!self.ensureImporter()) return false;
         if (self.state == .ready and width == self.width and height == self.height) {
@@ -258,13 +224,10 @@ pub const PresentPipeline = struct {
             if (!self.retireResourceGeneration()) return false;
         }
         if (self.buildResources(width, height)) return true;
-        // The active mode does not build on this device (shader, pipeline, or
-        // an unsupported ring texture format). Retry once against the SDR
-        // baseline — never against "whatever built last", which would escalate
-        // a failed SDR build back up to HDR. A failed HDR switch degrades to
-        // SDR instead of going black. buildResources() frees the partial build
-        // at entry. If SDR fails too, that is a real problem: give up here
-        // rather than looping. The user's request is left untouched.
+        // Retry a failed HDR shader/pipeline/texture build once as SDR, keeping
+        // the request intact. Always use SDR, not the previous mode, to avoid
+        // retrying a failed SDR build as HDR. buildResources() frees partial
+        // builds at entry; if SDR also fails, return without looping.
         if (self.active_output_mode != .sdr) {
             log.warn("{t} pipeline build failed — falling back to sdr output.", .{self.active_output_mode});
             self.active_output_mode = .sdr;
@@ -274,9 +237,8 @@ pub const PresentPipeline = struct {
     }
 
     fn buildResources(self: *PresentPipeline, width: i32, height: i32) bool {
-        // Reclaim any RIDs stranded by a previous failed build attempt before
-        // creating new ones. No-op on a clean first build or a normal rebuild
-        // (ensureReady already freed them) since every free is isValid()-guarded.
+        // Reclaim partial builds. Validity checks make this a no-op when
+        // ensureReady() already retired the previous generation.
         self.freeResources();
 
         const rd = self.rd.?;
@@ -329,9 +291,8 @@ pub const PresentPipeline = struct {
     fn ensureImporter(self: *PresentPipeline) bool {
         if (self.state == .disabled) return false;
         const rd = self.rd orelse RenderingServer.getRenderingDevice() orelse {
-            // No RenderingDevice (headless). Degrade gracefully: decode, audio,
-            // clock, and the playback state machine keep running; only texture
-            // output is disabled. Latch Disabled and print once.
+            // Headless: disable only texture output and log once. Decode,
+            // audio, the clock, and playback state continue.
             self.state = .disabled;
             log.info("No RenderingDevice — presentation disabled (headless mode). " ++
                 "Decode and audio continue normally.", .{});
@@ -420,11 +381,10 @@ pub const PresentPipeline = struct {
         return true;
     }
 
-    /// Engine.getFramesDrawn increments only when Godot draws, after the
-    /// SceneTree process phase (main/main.cpp). Thus process_frame previews,
-    /// reentrant resume, and VideoStreamPlayer._update share one epoch. Process
-    /// ticks while rendering is disabled do NOT age GPU resources. The binding
-    /// pumps this even after playback/preview stops until all batches retire.
+    /// Engine.getFramesDrawn advances after SceneTree processing when Godot
+    /// draws (main/main.cpp). Previews, reentrant resume, and _update share an
+    /// epoch; process ticks without rendering do not age GPU resources. The
+    /// binding pumps epochs after playback/preview stops until all batches retire.
     pub fn advanceRenderEpoch(self: *PresentPipeline) void {
         self.retire.advance(@intCast(Engine.getFramesDrawn()));
     }
@@ -485,10 +445,9 @@ pub const PresentPipeline = struct {
         }
         self.packPushConstants(planes);
 
-        // Allocate/retain BEFORE dispatch or publishing Texture2DRD.changed.
-        // A synchronous signal handler can replace the owner's stream or free
-        // the player. The binding holds its playback alive during this call;
-        // no resource/frame ownership remains ambiguous across that signal.
+        // Retain resources and frame before dispatch or Texture2DRD.changed.
+        // Synchronous handlers may replace the stream or free the player;
+        // the binding keeps playback alive until this call returns.
         self.retire.retain(self.allocator, RetireValue{
             .rd = rd,
             .uniform_set = uniform_set,
@@ -515,10 +474,8 @@ pub const PresentPipeline = struct {
         return .presented;
     }
 
-    /// Build the uniform set binding the decoded planes and the output ring
-    /// slot to the compute shader: luma(0), chroma(1), rgba_out(2). Returns
-    /// whatever rd.uniformSetCreate() returns (si.rid_invalid on failure);
-    /// the caller is responsible for releasing `planes`/`frame` on failure.
+    /// Bind luma(0), chroma(1), and rgba_out(2). Returns an invalid RID on
+    /// failure; the caller remains responsible for planes/frame ownership.
     fn buildUniformSet(self: *PresentPipeline, rd: *RenderingDevice, planes: PlaneTextures, slot: RingSlot) Rid {
         const u_luma = RdUniform.init();
         defer if (u_luma.unreference()) u_luma.destroy();
@@ -553,10 +510,8 @@ pub const PresentPipeline = struct {
         return rd.uniformSetCreate(uniforms, self.shader, 0);
     }
 
-    /// Repack the compute shader's push constants (output dimensions +
-    /// colorimetry + bit depth) into the reusable push_scratch buffer (sized
-    /// once in buildResources), ready for rd.computeListSetPushConstant(). No
-    /// allocation.
+    /// Pack dimensions, colorimetry, and bit depth into pre-sized push_scratch
+    /// for rd.computeListSetPushConstant(), without allocating.
     fn packPushConstants(self: *PresentPipeline, planes: PlaneTextures) void {
         // Pack into a stack buffer, then copy into push_scratch's own storage.
         var buf: [push_constants.push_constant_size]u8 = undefined;
@@ -566,18 +521,15 @@ pub const PresentPipeline = struct {
             @intCast(self.height),
             planes.metadata.color,
         );
-        // index(0) detaches push_scratch's CoW storage and hands back its
-        // unique buffer (same idiom as the audio mix path), so the memcpy
-        // writes in place — no per-frame heap alloc.
+        // index(0) detaches CoW storage and returns the unique writable buffer.
         const dst: [*]u8 = @ptrCast(self.push_scratch.index(0));
         @memcpy(dst[0..buf.len], buf[0..]);
     }
 
     fn freeResources(self: *PresentPipeline) void {
         const rd = self.rd orelse return;
-        // Detach the stable output texture BEFORE freeing the ring textures so
-        // it never dangles. Keep the object alive: the player holds a cached
-        // ref; a rebuild re-points it.
+        // Detach before freeing ring textures to avoid a dangling RID. Keep
+        // the player's cached Texture2DRD alive for the next build.
         if (self.current_texture) |t| t.setTextureRdRid(si.rid_invalid);
         for (0..ring_depth) |i| {
             if (self.ring[i].rgba_rid.isValid()) {
@@ -597,7 +549,7 @@ pub const PresentPipeline = struct {
             rd.freeRid(self.shader);
             self.shader = si.rid_invalid;
         }
-        // Disabled is terminal — only downgrade Ready to Unbuilt.
+        // Disabled is terminal; only change ready to unbuilt.
         if (self.state == .ready) self.state = .unbuilt;
         self.built_output_mode = null;
         self.width = 0;
@@ -635,10 +587,9 @@ pub const PresentPipeline = struct {
 
     /// Tear down all RD resources and drain the retire-ring.
     pub fn shutdown(self: *PresentPipeline) void {
-        // Preserve the existing immediate teardown contract. RD defers its
-        // own RID destruction, but drain is NOT a GPU fence for foreign native
-        // allocations (notably D3D12's borrowed resources). That inherited
-        // shutdown limitation needs a separate deferred-destruction design.
+        // Teardown is immediate. RD defers RID destruction, but drain is not
+        // a GPU fence for native allocations, notably borrowed D3D12 resources.
+        // Safe deferred destruction of those allocations remains unresolved.
         self.retire.drain();
         self.freeResources();
         if (self.importer) |*imp| {

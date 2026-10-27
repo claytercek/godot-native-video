@@ -1,17 +1,10 @@
-//! Godot-free per-stream playback state machine.
+//! Godot-free per-stream playback state machine, owned by NativeVideoStreamPlayback.
+//! Uses MixSink for audio, DecodeScheduler for decoding, and takeWarnings() for
+//! warnings. tick() transfers a frame by value; the caller presents and releases it.
 //!
-//! The Binding (NativeVideoStreamPlayback) owns exactly one of these per
-//! playback and translates its inputs/outputs to Godot types. No Godot
-//! includes, no RenderingDevice, no AudioServer — the controller talks to the
-//! mixer via the MixSink seam, to the decoder via the shared DecodeScheduler,
-//! and surfaces warnings via takeWarnings(). tick() returns the frame to
-//! present BY VALUE; the caller owns the GPU present and the frame's release().
-//!
-//! ALLOCATOR: load() takes and stores a std.mem.Allocator. It owns the
-//! controller's audio ring buffer, mix/drive scratch buffers, the per-track
-//! metadata cache, and the warning strings. deinit() frees all of them.
-//! (The DecodeStream and its Backend are owned by the injected
-//! DecodeScheduler, which uses its own allocator; see decode_scheduler.zig.)
+//! load() stores the allocator for the audio ring, scratch buffers, track cache,
+//! and warning strings; deinit() frees them. The injected DecodeScheduler owns
+//! the DecodeStream and Backend using its own allocator.
 
 const std = @import("std");
 
@@ -105,14 +98,9 @@ pub const PlaybackController = struct {
     canonical_channels: i32 = 0,
     canonical_sample_rate: i32 = 0,
 
-    // --- Audio track reconcile state ---
-    //
-    // desired_track and live_track converge by construction via
-    // reconcileAudioTrack(): desired_track is what the caller asked for (via
-    // requestAudioTrack()), live_track is what the backend is actually
-    // decoding. They can disagree only between a request and the next
-    // reconcile; a failed reselect rolls desired_track back to live_track
-    // instead of leaving the two permanently out of sync.
+    // desired_track is requested; live_track is decoding. reconcileAudioTrack()
+    // applies the request or rolls it back on failure, so they disagree only
+    // until the next reconcile.
     desired_track: i32 = 0,
     live_track: i32 = 0,
 
@@ -430,15 +418,10 @@ pub const PlaybackController = struct {
         }
     }
 
-    // Advance the master clock for this tick and return the resulting media
-    // time. One-clock rule: each tick advances media time from exactly one
-    // source. Audio-master ticks advance from real mixed audio frames; when
-    // audio is exhausted (a shorter audio track fully drained — legitimate in
-    // real-world files) and did not advance the clock, the render delta
-    // substitutes so video keeps moving. Monotonic-master ticks (silent clip,
-    // or the handoff window during a track switch) advance by the render
-    // delta; audio is still pumped so a mid-switch track re-anchors as soon
-    // as its samples flow.
+    // Advance media time from one source per tick: consumed PCM, or render
+    // delta once audio is exhausted and PCM did not advance it. Monotonic mode
+    // (silent clips or track handoff) uses render delta while still pumping
+    // audio, allowing re-anchor as soon as the new track delivers samples.
     fn advanceClock(self: *PlaybackController, delta_seconds: f64, now: WallClockMs, sink: MixSink, c: *ClockBridge) f64 {
         if (c.isAudioMaster()) {
             self.fillAudio();
@@ -463,12 +446,9 @@ pub const PlaybackController = struct {
     //   * Hold  — head in the future: present nothing new.
     // Updates self.position when a frame is chosen.
     fn selectPresentFrame(self: *PlaybackController, sched: *DecodeScheduler, media_now: f64) ?VideoFrame {
-        // A deliberately fixed 30fps-nominal seconds-per-frame. The core tracks
-        // no fps, and this value is never used AS a frame rate: the present
-        // selector consumes it only as a half-interval "due" epsilon
-        // (eps = frame_interval * 0.5). 30fps is the loosest common cadence, so
-        // higher-fps content simply gets a slightly more generous tolerance —
-        // acceptable, and cheaper than plumbing real fps down here.
+        // The core tracks no frame rate. Use a nominal 30fps interval only to
+        // set the selector's due tolerance (half the interval); higher-fps clips
+        // receive the same, more generous tolerance.
         const frame_interval = 1.0 / 30.0;
         var chosen: ?VideoFrame = null;
 
@@ -536,14 +516,9 @@ pub const PlaybackController = struct {
         self.sched.withBackend(self.stream.?, self, fillAudioClosure);
     }
 
-    // Diagnostic, one-shot per load(): compare the first AudioChunk actually
-    // consumed against the Canonical Mix Format (canonical_mix_format.zig),
-    // which is derived from the backend's DECLARED track metadata at load
-    // time, not from what decode actually delivers. canonical_sample_rate
-    // drives the AudioMasterClock, the ring's sizing, and Godot's
-    // _getMixRate(); a mismatch here means audio plays at the wrong speed
-    // regardless of which backend (or which layer within it) introduced the
-    // divergence. Diagnostic only -- no behavior change.
+    // Once per load, compare delivered PCM with the declared canonical format.
+    // canonical_sample_rate sets AudioMasterClock, ring sizing, and _getMixRate();
+    // a mismatch can change playback speed. Log only; do not adjust the format.
     fn checkAudioChunkDivergence(self: *PlaybackController, chunk: backend_mod.AudioChunk) void {
         self.checked_first_audio_chunk = true;
         if (chunk.sample_rate != self.canonical_sample_rate or chunk.channel_count != self.canonical_channels) {
@@ -570,10 +545,8 @@ pub const PlaybackController = struct {
             if (!self.checked_first_audio_chunk) self.checkAudioChunkDivergence(chunk);
             self.audio_telemetry.recordChunk(chunk.frame_count);
             if (chunk.samples.len == 0 or chunk.frame_count <= 0) continue;
-            // Mid-stream track switch: the FSM re-anchors the clock the first
-            // time a genuinely-new-track chunk reaches this point (a no-op on
-            // every other chunk). The "why the first chunk is genuinely new"
-            // reasoning lives in TrackHandoff.onChunk, not here.
+            // Re-anchor on the first new-track chunk; otherwise a no-op.
+            // TrackHandoff.onChunk documents how it identifies that chunk.
             self.track_switch.onChunk(&self.clock.?);
             // Mix native layout -> canonical (no-op memcpy when counts match).
             const nf = chunk.frame_count;
@@ -603,11 +576,9 @@ pub const PlaybackController = struct {
         const needed: usize = @as(usize, @intCast(request)) * @as(usize, @intCast(ch));
         if (!self.ensureScratchCapacity(&self.drive_scratch, needed)) return false;
 
-        // Copy decoded PCM (or silence on underrun) into the staging buffer
-        // WITHOUT consuming it yet: the sink is back-pressured (its downstream
-        // buffer holds fewer FRAMES the more channels we push), so it commonly
-        // accepts fewer than we offer. Any frame it rejects must stay in the
-        // ring for the next tick, not be dropped.
+        // Stage PCM with silence on underrun, without consuming. The sink may
+        // accept fewer frames than offered, especially at higher channel counts;
+        // rejected frames must remain buffered for the next tick.
         const real_frames = ring.peekFrames(self.drive_scratch.items[0..needed], @intCast(request));
 
         // Advance the clock ONLY by frames both real (non-silence) AND accepted —

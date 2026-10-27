@@ -1,22 +1,10 @@
-//! AudioTelemetry — numeric instrumentation for the audio delivery path
-//! (decoded chunks -> AudioRing -> Godot's mix sink).
+//! Allocation-free audio-delivery counters: decoded chunks -> AudioRing ->
+//! Godot mix sink. PlaybackController updates them from fillAudioClosure()
+//! and driveAudio() to diagnose underruns, decoder starvation, and clock drift.
 //!
-//! Exists to replace guessing with numbers when audio sounds wrong: is the
-//! ring underrunning (silence padding), is the shared decoder starving the
-//! ring of chunks, or is media time itself running fast? All four surface
-//! here as plain counters, updated with integer/float adds only -- no
-//! allocation, so this is safe to update on the per-tick mix path.
-//!
-//! Godot-free (no Godot types): PlaybackController owns one instance and
-//! feeds it from fillAudioClosure() (decode side) and driveAudio() (mix
-//! side). Reporting is pull-driven by the caller at existing per-tick and
-//! stop/EOS/shutdown points -- no timer, no background thread. std.log.info
-//! already reaches the Godot editor Output panel via the Binding's logFn
-//! (verbose-gated: visible when Godot itself is run with `--verbose`, same
-//! as `print_verbose()`; still on stderr unconditionally), so logging
-//! straight from core is safe.
-//!
-//! Reset every load() so a reopened clip starts a fresh window.
+//! Callers request reports during ticks or stop/EOS/shutdown; no background
+//! thread or timer runs. The binding routes std.log.info to stderr and, with
+//! `--verbose`, the Godot editor Output panel. Reset on each load().
 
 const std = @import("std");
 const wall_clock_mod = @import("wall_clock.zig");

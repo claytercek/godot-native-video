@@ -1,16 +1,8 @@
-//! hdr_color_math.zig — CPU-side HDR color conversion math.
+//! CPU HDR color math: BT.2100 PQ/HLG EOTFs, SMPTE ST 2084, tone mapping,
+//! and BT.2020-to-BT.709 primary conversion. Tests check ITU reference values
+//! and parse shaders/hdr_color_math.glsl to keep shared constants in sync.
 //!
-//! Shared HDR color conversion math functions.
-//!
-//! Matches ITU-R BT.2100 (PQ/HLG EOTFs), SMPTE ST 2084, BT.2390-4 EETF,
-//! and BT.2020->BT.709 primary-matrix conversion. The same mathematical
-//! constants appear in src/core/shaders/hdr_color_math.glsl for the GPU
-//! path; the tests below verify the Zig constants against published ITU
-//! reference values AND parse the embedded GLSL source text, comparing each
-//! shared constant numerically, so the two files cannot drift independently.
-//!
-//! All luminance values are in candelas per square metre (cd/m^2).
-//! All normalized signal values are in [0, 1] unless noted.
+//! Luminance is in cd/m^2; normalized signals are in [0, 1] unless noted.
 
 const std = @import("std");
 const backend = @import("backend.zig");
@@ -478,12 +470,8 @@ test "hdr_to_sdr: HLG produces watchable output across range" {
 }
 
 // =========================================================================
-// GLSL constant-mirroring guard.
-//
-// Parses the embedded hdr_color_math.glsl source text and checks every
-// `const float kXxx = <expr>;` constant it declares against the Zig
-// constant it mirrors above, so a change to one side without the other
-// fails this test instead of silently producing wrong pixels.
+// Parse embedded GLSL `const float kXxx = <expr>;` declarations and compare
+// them with the Zig constants so changes to either side must stay in sync.
 // =========================================================================
 
 fn isGlslIdentChar(c: u8) bool {

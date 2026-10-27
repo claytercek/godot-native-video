@@ -1,12 +1,9 @@
-//! Reference-value tests for the YCbCr→RGB matrix derivations used by the
-//! NV12→RGB present shader. Platform-independent: no GPU, no Godot. Verifies
-//! the BT.601 / BT.709 / BT.2020 coefficients against ITU-R reference values
-//! AND parses the actual embedded shader SOURCE TEXT (core/shaders.zig) to
-//! catch the shader's code diverging from its own derivation — something a
-//! hand-maintained reference mirror can never see.
+//! Godot/GPU-free tests of the NV12-to-RGB shader's BT.601, BT.709, and BT.2020
+//! matrices. Check ITU-R reference coefficients and parse the embedded GLSL
+//! assignments so a separate reference implementation cannot hide shader drift.
 //!
 //! Run standalone:
-//!   zig test zig/src/core/color_matrix_test.zig
+//!   zig test src/core/color_matrix_test.zig
 
 const std = @import("std");
 const testing = std.testing;
@@ -86,11 +83,7 @@ fn ycbcrToRgb(y: f64, cb: f64, cr: f64, r_cr: f64, g_cb: f64, g_cr: f64, b_cb: f
 const tol: f64 = 0.001;
 
 // -----------------------------------------------------------------------
-// Shader-source coefficient parsing (for the regression guard test below).
-//
-// Parses the actual embedded GLSL SOURCE TEXT (core/shaders.zig's
-// nv12_to_rgb_compute, the SDR embedding) to catch a shader whose code
-// diverges from its own derivation.
+// Parse coefficients from shaders.zig's embedded SDR GLSL for regression tests.
 // -----------------------------------------------------------------------
 
 const ParsedCoeffs = struct {
@@ -191,11 +184,8 @@ test "BT.2020 matrix coefficients match ITU-R BT.2020-2" {
 }
 
 test "Shader source matrix coefficients match ITU-R derivations (regression guard)" {
-    // Parse the embedded shader SOURCE TEXT itself (not a hand-reimplemented
-    // mirror) and check its rgb.r/rgb.g/rgb.b coefficients against the
-    // ITU-derived constants above. The SDR embedding is checked; the HDR
-    // embedding comes from the same source and differs only by an injected
-    // #define, so the matrix-selection code is identical in both.
+    // Compare embedded rgb.r/g/b assignments with the ITU-derived constants.
+    // HDR adds only a #define to the same source, so its matrix code is identical.
     const allocator = testing.allocator;
     const source = shaders.nv12_to_rgb_compute;
 

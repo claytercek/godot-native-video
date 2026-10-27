@@ -1,12 +1,6 @@
-//! colorimetry.zig — pure colorimetry / time-base translation for the Media
-//! Foundation backend.
-//!
-//! Everything here is a pure function of its inputs (no MfBackend state): the
-//! MF_MT_YUV_MATRIX / _VIDEO_PRIMARIES / _TRANSFER_FUNCTION / _VIDEO_NOMINAL_RANGE
-//! attribute parsers, source bit-depth detection, and the 100ns tick <-> seconds
-//! conversion. Split out of mf_backend.zig so the policy core stays small and so
-//! these branches can carry their own unit tests (the backend proper needs live
-//! MF objects to exercise). Structural mirror of the C++ parsers.
+//! Pure MF colorimetry, source bit-depth, and 100ns tick/second conversion.
+//! Translate MF_MT_YUV_MATRIX, _VIDEO_PRIMARIES, _TRANSFER_FUNCTION, and
+//! _VIDEO_NOMINAL_RANGE without backend state or live MF objects.
 
 const std = @import("std");
 const core = @import("core").backend;

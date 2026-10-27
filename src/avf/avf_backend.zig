@@ -1,19 +1,12 @@
-//! avf_backend.zig — AVFoundation Decoder-mode Backend (macOS).
+//! AVFoundation decoder implementing core.Backend through avf_shim.m's C ABI.
+//! Zig owns reader state, track selection/clamping, EOS/errors, and translation
+//! to VideoFrame/AudioChunk. The shim owns AVFoundation objects.
 //!
-//! Implements the core.Backend ptr+vtable contract on top of the C-ABI shim
-//! in avf_shim.m. This file owns all policy: the reader state machine, track
-//! selection/clamping, EOS/error interpretation, and translation of shim
-//! results into VideoFrame / AudioChunk. The shim owns the AVFoundation
-//! object graph.
-//!
-//! Ownership at the boundaries:
-//!  - Video frames: the shim hands out a CVPixelBufferRef carrying a +1
-//!    retain via native_handle; the frame's release hook calls
-//!    nv_avf_frame_release exactly once.
-//!  - Audio samples: shim-owned scratch, valid until the next
-//!    nextAudioChunk()/close() — the AudioChunk slice borrows it.
-//!  - AudioTrackInfo strings: duplicated into backend-owned storage at open,
-//!    freed at close; slices stay valid until close().
+//! Ownership:
+//! - VideoFrame.native_handle owns a +1 CVPixelBufferRef retain. Its release
+//!   hook calls nv_avf_frame_release exactly once.
+//! - AudioChunk borrows shim scratch until the next nextAudioChunk()/close().
+//! - AudioTrackInfo strings belong to the backend from open() until close().
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -134,13 +127,9 @@ fn toColorimetry(c: c_colorimetry) core.Colorimetry {
     };
 }
 
-// The @fromBackingInt calls above (and the pixel_format one in
-// nextVideoFrameImpl) only work because avf_shim.h documents its
-// NV_AVF_MATRIX_*/PRIM_*/TRANSFER_*/RANGE_*/PIXFMT_* tags as matching these
-// core enums' numeric values bit-for-bit. Since the header's #defines
-// aren't reachable from Zig (no @cImport), pin the documented values here
-// so either side moving out of step is a compile error, not a silently
-// wrong color on screen.
+// @fromBackingInt requires the shim's MATRIX/PRIM/TRANSFER/RANGE/PIXFMT tags
+// to match core enum values. Without @cImport, pin those documented values
+// here so numeric drift fails compilation.
 comptime {
     std.debug.assert(@backingInt(core.ColorMatrix.unspecified) == 0);
     std.debug.assert(@backingInt(core.ColorMatrix.bt709) == 1);
@@ -500,15 +489,10 @@ pub const AvfBackend = struct {
     }
 };
 
-// Diagnostic: compare the first delivered audio chunk's actual format
-// (read off the CMSampleBuffer's own format description in avf_shim.m --
-// `cc.channels`/`cc.sample_rate`, 0 if unavailable) against the declared
-// (pre-negotiation, native-descriptor) values already cached in
-// audio_channels/audio_rate at open/select time. CanonicalMixFormat
-// (canonical_mix_format.zig) derives the AudioMasterClock/ring sizing/
-// _getMixRate() rate from the declared values, NOT from what AVFoundation
-// actually delivers, so a mismatch means audio can play at the wrong speed.
-// Diagnostic only -- no behavior change.
+// Compare the first delivered chunk's CMSampleBuffer format (zero if unknown)
+// with audio_channels/audio_rate cached at open/select. CanonicalMixFormat
+// uses the declared values for clock, ring sizing, and _getMixRate(); a
+// mismatch can change playback speed. Log only; do not adjust the format.
 fn logAudioNegotiation(track_index: i32, declared_channels: i32, declared_rate: i32, cc: c_audio_chunk) void {
     if (cc.channels <= 0 or cc.sample_rate <= 0) return; // no format description on this buffer
     if (declared_rate != cc.sample_rate or declared_channels != cc.channels) {

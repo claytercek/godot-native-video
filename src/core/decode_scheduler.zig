@@ -1,58 +1,26 @@
-//! The bounded shared decode-worker pool (Engine Core).
+//! Bounded decode-worker pool shared by active streams.
 //!
-//! PROBLEM: a scene may hold many VideoStreamPlayers. Spawning one decode
-//! thread per video does not scale. Conversely, decoding inline on the
-//! main/render thread blocks presentation. The DecodeScheduler is a single
-//! bounded pool of worker threads, SHARED across all active streams, that
-//! pulls frames from each stream's Backend and fills that stream's FrameQueue
-//! ahead of the present step.
+//! Workers fill each stream's FrameQueue ahead of presentation. Worker count
+//! is independent of stream count. A per-stream busy claim serializes Backend
+//! access and queue production, preserving SPSC ownership and backend decode
+//! order (non-decreasing PTS during linear playback). Main-thread Backend
+//! access uses the same claim. Workers never call Godot or RenderingDevice;
+//! the main/render thread drains the queue and presents frames.
 //!
-//! THREADING CONTRACT (the load-bearing invariant of this slice):
-//!   * The pool has a fixed, bounded number of worker threads — NOT one per
-//!     stream. Worker count is independent of stream count.
-//!   * Each registered stream is decoded SERIALLY: at most ONE worker touches a
-//!     given stream's Backend/FrameQueue at any instant. This is enforced by a
-//!     per-stream "busy" flag — a stream is only ever handed to one worker, and
-//!     is not re-enqueued for decode until that worker finishes its slice. So:
-//!       - The FrameQueue's SPSC contract holds: exactly one producer (whichever
-//!         worker currently owns the stream) and one consumer (the main thread
-//!         calling drain/present). Producers never overlap in time.
-//!       - Per-stream frame ORDER is deterministic — frames enter the queue in
-//!         backend-decode order, which is monotonic PTS for linear playback.
-//!   * The Backend is touched ONLY by the worker that currently owns the stream.
-//!     register()/unregister()/the main thread never call into the Backend
-//!     concurrently with a worker (unregister blocks until the in-flight slice,
-//!     if any, completes — no use-after-free when a stream is destroyed
-//!     mid-decode).
-//!   * Workers touch NO Godot / RenderingDevice APIs. The present + GPU pass
-//!     stays on the main/render thread, which drains the FrameQueue.
+//! The scheduler owns each DecodeStream from registration to unregister or
+//! deinit. Unregister marks it dead, waits for its busy claim, removes queued
+//! work, and frees it; the handle is then invalid. Claimants complete and
+//! requeue under the same mutex before releasing busy, and never dereference
+//! the handle once teardown can proceed.
 //!
-//! SURFACE LIFETIME (acceptance criterion): the decode pool must be sized
-//! `pool_depth + frame_latency` so that every surface that can be in flight
-//! simultaneously — queued for present, being converted/presented, and still
-//! held by the RetireRing for `frame_latency` rendered frames — has a distinct
-//! backing surface and is never recycled while still in use. See
-//! requiredPoolDepth().
+//! Decoder surfaces must cover queued frames, the frame being presented, and
+//! frames retained for GPU latency. Each needs distinct backing storage until
+//! release; requiredPoolDepth() computes the minimum.
 //!
-//! FORCE-SYNC DEBUG MODE (acceptance criterion): when force_synchronous is set
-//! (debug builds only — gated OFF in release) the scheduler runs NO worker
-//! threads. Decode happens synchronously on the calling (main) thread inside
-//! pumpStream(), so a decode->convert->present lifetime bug reproduces
-//! deterministically with no worker handoff and no deferred timing.
-//!
-//! SCRUB SEAM: requestSeek() lets the binding ask a stream to flush + reseek
-//! before resuming decode-ahead; a scrubbing slice uses it to request a
-//! keyframe-only decode without changing the threading model.
-//!
-//! OWNERSHIP NOTE: `StreamHandle = *DecodeStream`, with the DecodeStream
-//! owned solely by the scheduler: register allocates it, unregister (and the
-//! scheduler's deinit for leftovers) frees it. No reference counting is
-//! needed because unregister orders itself against every worker before it
-//! returns — the stream is marked dead, any in-flight busy claim is waited
-//! out, and it is removed from the ready list — so the handle is simply
-//! invalid after unregister, which is exactly how every caller uses it.
-//! A claimant completes and requeues under the same mutex before dropping its
-//! busy lease; it never dereferences the handle after teardown can proceed.
+//! In debug builds, force_synchronous disables workers and runs decode inline
+//! in pumpStream() to reproduce lifetime bugs without worker timing. Release
+//! builds ignore it. requestSeek() flushes and reseeks before decode-ahead
+//! resumes, including keyframe-only scrubbing.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -88,15 +56,9 @@ pub const kDefaultWorkerCount: usize = 3;
 pub const DecodeAheadQueue = frame_queue.FrameQueue(VideoFrame, kDecodeAheadCapacity);
 
 // -----------------------------------------------------------------------
-// requiredPoolDepth — surface-lifetime sizing helper.
-//
-// The decoder must own enough distinct surfaces that every surface which can be
-// alive at once has its own backing store. At any instant a stream may hold:
-//   * up to `queue_usable_depth` decoded frames waiting in the FrameQueue,
-//   * 1 frame popped and being converted/presented this tick,
-//   * up to `frame_latency` frames parked in the RetireRing from prior ticks.
-// Sizing the decode pool to their sum guarantees the Backend never recycles a
-// surface that is still queued, in-flight, or retained. Returns that sum.
+// Minimum distinct decoder surfaces: `queue_usable_depth` queued frames,
+// one frame being converted/presented, and `frame_latency` retired frames.
+// Returns their sum so no surface is recycled while still in use.
 pub fn requiredPoolDepth(queue_usable_depth: usize, frame_latency: usize) usize {
     return queue_usable_depth + 1 + frame_latency;
 }
@@ -140,16 +102,10 @@ pub const DecodeStream = struct {
     // use monotonic loads.
     dead: std.atomic.Value(bool) = .init(false),
 
-    // Monotonicity guard for the FrameQueue producer boundary. The present
-    // selector (present_selector.zig) assumes frames enter the queue in
-    // non-decreasing PTS order — for linear playback the backend delivers
-    // presentation order. `last_enqueued_pts` is the PTS of the most recently
-    // enqueued frame, reset to null across a seek/flush (where a backward jump
-    // is expected and legitimate). `pts_regressed_warned` is a one-shot latch,
-    // per stream = per open, so a backend that ever emits decode order surfaces
-    // once in the log instead of silently churning the selector. Both are
-    // touched only by the owning producer path (serial per stream), so they need
-    // no synchronization.
+    // The selector requires non-decreasing PTS. Track the last enqueued PTS,
+    // clearing it on seek/flush to allow backward seeks. Warn once per open
+    // if the backend violates presentation order. Only the stream's serial
+    // producer accesses these fields; no extra synchronization is needed.
     last_enqueued_pts: ?f64 = null,
     pts_regressed_warned: bool = false,
 };
@@ -336,12 +292,9 @@ pub const DecodeScheduler = struct {
         return f;
     }
 
-    // Run `func(ctx, backend)` with exclusive access to the stream's Backend,
-    // serialized against the worker pool (claims the same per-stream "busy"
-    // guard a decode slice uses, so no worker touches the Backend concurrently).
-    // The binding uses this to pump AUDIO from the main thread without violating
-    // the single-toucher contract. `func` must not call back into the scheduler
-    // for this same stream. No-op if the stream is dead.
+    // Run `func(ctx, backend)` under the stream's busy claim, excluding workers.
+    // Used for main-thread audio pumping. `func` must not call back into the
+    // scheduler for this stream. No-op if the stream is dead.
     pub fn withBackend(
         self: *DecodeScheduler,
         stream: StreamHandle,
@@ -388,12 +341,9 @@ pub const DecodeScheduler = struct {
     pub fn requestSeek(self: *DecodeScheduler, stream: StreamHandle, pts_seconds: f64) void {
         {
             self.mu.lock();
-            // Wait out any in-flight slice, then CLAIM the per-stream guard
-            // ourselves so no worker can start producing into the queue while we
-            // flush it. Without this claim a stream already sitting in ready
-            // (busy == false) could be picked up by a worker the instant we drop
-            // the lock; that worker would seek + push new frames concurrently
-            // with the flush below, corrupting the queue.
+            // Wait for the active slice, then claim busy before unlocking.
+            // Otherwise a ready worker could seek and push during the flush,
+            // corrupting the queue.
             while (stream.busy) self.cv.wait(&self.mu);
             stream.seek_pending = true;
             stream.seek_target = @max(pts_seconds, 0.0);
@@ -412,17 +362,11 @@ pub const DecodeScheduler = struct {
         self.finishClaim(stream);
     }
 
-    // Resolve a seek to the exact target synchronously on the calling thread.
-    // Claims the same per-stream "busy" guard a decode slice uses, then, as
-    // the sole owner of the Backend and queue: flushes buffered frames, seeks
-    // the Backend to (the keyframe at/before) `target_seconds`, and decodes
-    // forward releasing every frame whose PTS is more than `eps_seconds`
-    // before the target. The first surviving frame is pushed into the queue,
-    // so afterwards the queue head is at/after target - eps. Stops at EOS
-    // when the clip ends before the target. Intended for the settle/resume
-    // scrub path, which values precision over latency and is not per-frame
-    // hot. Returns an explicit outcome so callers never re-anchor playback to
-    // an unresolved target.
+    // Resolve a seek synchronously under the stream's busy claim. Flush the
+    // queue, seek to the keyframe at/before `target_seconds`, and decode forward,
+    // releasing frames before target - eps_seconds. Queue the first survivor,
+    // or stop at EOS. Used for scrub settle/resume, outside the per-frame path.
+    // The outcome tells callers whether it is safe to re-anchor playback.
     pub fn seekExact(self: *DecodeScheduler, stream: StreamHandle, target_seconds: f64, eps_seconds: f64) ExactSeekResult {
         const target = @max(target_seconds, 0.0);
         {
@@ -718,17 +662,10 @@ pub const DecodeScheduler = struct {
     }
 };
 
-// Defensive monotonicity check at the FrameQueue producer boundary. Frames are
-// expected to enter the queue in non-decreasing PTS order: the present selector
-// (present_selector.zig) drops any head whose successor is already due, so a
-// backend that emitted decode order (e.g. an MF source reader that failed to
-// reorder H.264 B-frames) would make the selector churn and the picture step
-// forward-then-backward. Rather than misbehave silently, latch a one-shot
-// warning the first time PTS regresses outside of a seek, then update the
-// running baseline. Diagnostic only — it never reorders or drops a frame; the
-// pipeline keeps whatever order the backend delivered. Caller must be the
-// stream's sole producer (the busy claim guarantees this). Public so the
-// monotonicity contract is unit-testable.
+// Warn once when enqueued PTS regresses outside a seek, then update the baseline.
+// The selector requires presentation order; decode-order B-frames could make
+// the picture step backward. This diagnostic neither reorders nor drops frames.
+// Requires the stream's sole-producer busy claim. Public for contract tests.
 pub fn checkEnqueueMonotonic(stream: StreamHandle, pts: f64) void {
     if (stream.last_enqueued_pts) |prev| {
         if (pts < prev and !stream.pts_regressed_warned) {

@@ -1,16 +1,8 @@
-//! scrubber_integration_test.zig — the DecodeScheduler-dependent scrub cases
-//! (the pure Scrubber state-machine cases live in scrubber.zig).
-//!
-//! Two layers, sharing one keyframe-grid model:
-//!  - Scheduler-level: proves the Scrubber's decisions, when mapped onto real
-//!    seeks, give (a) low keyframe-scrub latency during a drag and (b) the
-//!    EXACT target frame once the scrub settles. Runs the scheduler in
-//!    force-synchronous mode so decode happens inline on this thread:
-//!    request_seek's flush + reseek and the decode-forward are fully
-//!    deterministic with no worker race.
-//!  - Controller-level: drives the same seam through
-//!    PlaybackController.seek()/tick(), pinning drop counts, the exact-resolve
-//!    epsilon, EOS clamping, and the settled frame presented after a drag.
+//! Scrub integration tests using a shared keyframe-grid decoder model.
+//! Scheduler cases check keyframe-scrub latency and exact resolution after
+//! settling, with synchronous decode to remove worker races. Controller
+//! seek()/tick() cases check drops, resolve epsilon, EOS clamping, and the
+//! settled frame. Pure policy tests live in scrubber.zig.
 
 const std = @import("std");
 

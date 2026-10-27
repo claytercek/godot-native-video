@@ -1,26 +1,20 @@
 //! Byte-packing for the NV12-to-RGB compute shader's push-constant block.
 //!
-//! The GLSL shader declares a std430 push-constant block with seven uint32
-//! fields plus four bytes of trailing padding (32 bytes total). This file
-//! provides the CPU side of that contract: a single pack function that
-//! writes the correct bytes so the shader reads them back in the expected
-//! layout.
+//! Pack seven uint32 fields and four padding bytes into the shader's 32-byte
+//! std430 layout. Assumes little-endian x86-64 or ARM64:
 //!
-//! Layout (std430, little-endian assumed — x86-64 and ARM64 both are):
 //!   offset 0: out_width       (uint32)
 //!   offset 4: out_height      (uint32)
-//!   offset 8: matrix_select   (uint32) — core.ColorMatrix
-//!   offset 12: range_select   (uint32) — core.ColorRange
-//!   offset 16: bit_depth      (uint32) — 8 or 10
-//!   offset 20: transfer_select (uint32) — core.TransferFunction
-//!   offset 24: primaries_select (uint32) — core.ColorPrimaries
+//!   offset 8: matrix_select   (uint32), core.ColorMatrix
+//!   offset 12: range_select   (uint32), core.ColorRange
+//!   offset 16: bit_depth      (uint32), 8 or 10
+//!   offset 20: transfer_select (uint32), core.TransferFunction
+//!   offset 24: primaries_select (uint32), core.ColorPrimaries
 //!   offset 28: pad0           (uint32, always 0)
 //!   Total: push_constant_size (32) bytes
 //!
-//! A 16-byte multiple is required because pre-4.7 Godot rounds the required
-//! push-constant size up to 32 and 4.7+ validates the exact declared size of
-//! 32 bytes — pad0 keeps this layout at 32 bytes even though there are only
-//! seven meaningful fields.
+//! pad0 keeps the size at 32 bytes: pre-4.7 Godot rounds to that size, and
+//! Godot 4.7+ validates the exact declared size.
 
 const std = @import("std");
 const backend = @import("backend.zig");
@@ -56,14 +50,9 @@ comptime {
     if (@offsetOf(PushConstants, "pad0") != 28) @compileError("pad0 offset must be 28");
 }
 
-/// Pack the frame's colorimetry and output dimensions into the
-/// push_constant_size-byte buffer `dst`. `dst` must be at least
-/// push_constant_size bytes; only the first push_constant_size bytes are
-/// written (anything beyond that in the slice is untouched). The encoding
-/// matches the GLSL std430 layout declared in nv12_to_rgb.glsl.
-///
-/// This is a pure function: no side effects on anything outside `dst`,
-/// no heap allocation, no Godot API calls.
+/// Pack colorimetry and output dimensions into the first push_constant_size
+/// bytes of `dst`, matching nv12_to_rgb.glsl's std430 layout. Requires at least
+/// that many bytes; leaves the rest untouched. No allocation or Godot calls.
 pub fn packPushConstants(
     dst: []u8,
     width: u32,
@@ -230,12 +219,8 @@ test "Push constant: does not write past byte 31" {
 }
 
 // =========================================================================
-// GLSL layout-mirroring guard.
-//
-// Parses the `layout(push_constant, std430) uniform Params {...}` block out
-// of the embedded shader source text and checks its member order, names,
-// and types against PushConstants, so a field reorder/retype/rename on
-// either side fails this test instead of silently corrupting GPU memory.
+// Parse the embedded GLSL Params block and compare member order, names, and
+// types with PushConstants so layout changes on either side fail the test.
 // =========================================================================
 
 /// Extract the member-declaration text between the braces of the shader's

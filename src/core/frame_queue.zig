@@ -1,16 +1,9 @@
-//! FrameQueue(T, Capacity) — a bounded, lock-free Single-Producer /
-//! Single-Consumer (SPSC) ring queue.
+//! Bounded, lock-free single-producer/single-consumer ring queue.
+//! Exactly one thread may push and one may pop. push() returns false when
+//! full; pop() returns null when empty. Capacity must be a positive power of two.
 //!
-//! Guarantees:
-//!  - Exactly one thread calls push(); exactly one calls pop().
-//!  - push() never blocks — it returns false when the queue is full, so
-//!    the producer can apply its own back-pressure strategy.
-//!  - pop() returns null when the queue is empty.
-//!  - cap must be a power of two and > 0.
-//!
-//! Memory model: the head and tail indices are ordered with
-//! .acquire / .release so that the item written by the producer is visible
-//! to the consumer without a mutex.
+//! Acquire/release ordering on head and tail makes produced items visible to
+//! the consumer without a mutex.
 
 const std = @import("std");
 

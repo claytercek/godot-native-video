@@ -1,10 +1,5 @@
-//! native_video_resource_format_loader.zig — loads a clip path into a
-//! NativeVideoStream resource so VideoStreamPlayer can play it.
-//!
-//! Registered with ResourceLoader for the video container extensions the OS
-//! decodes (mp4/mov/m4v). It does NOT decode anything here — it just
-//! produces a VideoStream pointing at the file; decoding happens lazily in
-//! the playback.
+//! ResourceLoader for MP4/MOV/M4V clips. Creates a NativeVideoStream holding
+//! the file path; the playback opens the decoder lazily.
 
 const NativeVideoResourceFormatLoader = @This();
 
@@ -98,11 +93,8 @@ pub fn _load(
     _ = cache_mode;
     const stream = NativeVideoStream.create(&self.allocator) catch return Variant.nil;
     stream.base.setFile(path);
-    // Two refs exist here: the one create() gave us, and the one
-    // Variant.init() took when it boxed the stream. Only the Variant's ref
-    // should outlive this call -- it is what we hand the engine -- so drop
-    // ours. Plain unreference(), not the `if (unreference()) destroy()` form:
-    // the Variant still holds a ref, so this can never reach zero.
+    // Variant.init() retained the stream for the engine. Drop create()'s ref;
+    // unreference() cannot reach zero while the Variant owns its ref.
     const v = Variant.init(*NativeVideoStream, stream);
     _ = stream.base.unreference();
     return v;

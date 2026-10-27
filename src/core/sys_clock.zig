@@ -1,19 +1,9 @@
-//! sys_clock.zig — zig 0.16 replacements for the OS threading/timing
-//! primitives std.Thread.Mutex/Condition/sleep and std.time.*Timestamp used
-//! to expose directly. In 0.16 those moved under std.Io as Io.Mutex/
-//! Io.Condition/Io.Clock, all requiring an `Io` instance to be threaded
-//! through every call.
+//! OS synchronization and timing wrappers for Zig 0.16's std.Io primitives.
+//! Keep an infallible API without passing Io through each call site.
 //!
-//! This codebase spawns its own worker threads directly via std.Thread.spawn
-//! and has no event loop or cancelation needs, so the std-provided
-//! single-threaded Io singleton is a correct, zero-setup backing instance.
-//! `Mutex`/`Condition` below wrap the new primitives behind the old
-//! infallible, io-free call shape (lock/unlock/wait/signal/broadcast) so
-//! call sites elsewhere are unchanged.
-//!
-//! global_single_threaded only disables Io's async task spawning; its futex
-//! ops are real OS futexes, so Mutex/Condition here are fully correct across
-//! std.Thread.spawn worker pools — that's why this io-free facade is sound.
+//! Workers use std.Thread.spawn and need no event loop or cancellation, so
+//! std.Io.Threaded.global_single_threaded supplies the backing Io. It disables
+//! async task spawning only; its OS futex operations still synchronize workers.
 
 const std = @import("std");
 

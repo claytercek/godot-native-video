@@ -1,16 +1,7 @@
-//! Regression coverage for backend.Colorimetry, the single struct carrying
-//! a video frame's color primaries, transfer function, matrix coefficients,
-//! range, and bit depth.
-//!
-//! Pins the two default conventions that must coexist:
-//!   - Per-frame (VideoFrame.color): Colorimetry{} defaults to all
-//!     Unspecified, 8-bit — the shader treats Unspecified as BT.709 video
-//!     range.
-//!   - Negotiated (Backend.colorimetry() and backend impls):
-//!     Colorimetry.bt709_defaults returns concrete BT709/BT709/BT709/Video/8
-//!     values.
-//!
-//! Kept as a sibling file rather than appended to backend.zig.
+//! Tests for backend.Colorimetry defaults. Per-frame Colorimetry{} is
+//! Unspecified, 8-bit; the shader interprets it as BT.709 video range.
+//! Negotiated colorimetry uses bt709_defaults with explicit BT.709 primaries,
+//! transfer, and matrix, video range, and 8-bit depth.
 
 const std = @import("std");
 const backend_mod = @import("backend.zig");

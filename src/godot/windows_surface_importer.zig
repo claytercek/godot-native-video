@@ -1,19 +1,11 @@
-//! windows_surface_importer.zig — the Windows surface importer the present
-//! pipeline uses, shaped exactly like MetalSurfaceImporter.
+//! Windows importer selection and delegation for the present pipeline.
+//! initialize() reads the RD driver and Godot version from RenderingServer and
+//! Engine, then calls importer_selector.selectImporter. D3D12 zero-copy requires
+//! the d3d12 driver and Godot >= 4.5; Vulkan always uses CPU-copy because its
+//! DXGI zero-copy path is not ported (see importer_selector.zig).
 //!
-//! Windows can run Godot's Vulkan or D3D12 RenderingDevice driver, and this
-//! build links two concrete importers: a D3D12 zero-copy path and a CPU-copy
-//! fallback. The choice depends only on the active RD driver name and the Godot
-//! version, so at initialize() this thin wrapper reads both from Godot's
-//! singletons (RenderingServer + Engine), asks the pure
-//! importer_selector.selectImporter which path to take, instantiates that
-//! concrete importer, and delegates every later call to it. This is the ONE
-//! place the driver/version selection happens — the present pipeline stays
-//! platform- and driver-agnostic.
-//!
-//! The DXGI Vulkan zero-copy path the C++ port also carried is not ported (see
-//! importer_selector's module doc comment); Vulkan on Windows always takes the
-//! CPU-copy fallback here.
+//! D3D12 binding or permanent interop failure switches to CPU-copy for the rest
+//! of the session. Both paths expose the same interface to the present pipeline.
 
 const std = @import("std");
 
@@ -54,10 +46,9 @@ pub const WindowsSurfaceImporter = struct {
         return .{ .allocator = allocator };
     }
 
-    /// Read driver name + Godot version from the singletons, select the import
-    /// path, instantiate it, and bind it to RD. Returns whatever the concrete
-    /// importer's initialize() returns. If the D3D12 path is selected but its
-    /// importer cannot bind a D3D12 device, degrade to the CPU-copy path.
+    /// Select and initialize an importer from the live driver/version.
+    /// If D3D12 cannot bind its device, initialize CPU-copy instead.
+    /// Returns the selected importer's initialization result.
     pub fn initialize(self: *WindowsSurfaceImporter, rd: *RenderingDevice) bool {
         if (self.concrete != null) return self.isInitialized();
         self.rd = rd;
@@ -112,19 +103,14 @@ pub const WindowsSurfaceImporter = struct {
         }
     }
 
-    /// Tear down the current D3D12 importer and switch `self.concrete` to a
-    /// freshly constructed CPU-copy importer bound to `rd`, for the rest of
-    /// this importer's life. Called both when initialize() can't bind a D3D12
-    /// device and when the first import() finds the zero-copy pipeline can't
-    /// come up (cross-adapter OpenSharedHandle failure).
+    /// Tear down D3D12 and bind a new CPU-copy importer to rd for this session.
+    /// Used after device-binding failure or permanent interop failure, such as
+    /// cross-adapter OpenSharedHandle failure before the first successful import.
     ///
-    /// Atomic in the sense that matters: `self.concrete` never holds the
-    /// torn-down D3D12 importer once this returns. On failure (cpu_copy itself
-    /// won't initialize — should not happen; texture_create/texture_update
-    /// need no particular RD driver) `self.concrete` is left null rather than
-    /// pointing at an importer that lies about being usable, so callers must
-    /// go through isInitialized()/import(), both of which treat a null
-    /// concrete as "not ready" rather than crashing.
+    /// On return, concrete holds the initialized CPU-copy importer or null,
+    /// never the torn-down D3D12 instance. CPU-copy initialization is
+    /// driver-agnostic, but callers must still use isInitialized()/import(),
+    /// which handle null as not ready.
     fn degradeToCpuCopy(self: *WindowsSurfaceImporter, rd: *RenderingDevice) bool {
         if (self.concrete) |*c| {
             if (c.* == .d3d12) c.d3d12.deinit();
@@ -136,10 +122,8 @@ pub const WindowsSurfaceImporter = struct {
         return true;
     }
 
-    /// Frames imported through the CPU-copy path so far this session — the
-    /// one sanctioned exception to the zero-copy contract, counted honestly
-    /// whether this session ran CPU-copy from the start or degraded into it
-    /// mid-flight from a failed D3D12 zero-copy attempt.
+    /// Successful CPU-copy imports this session, whether selected initially
+    /// or used after D3D12 fallback.
     pub fn cpuCopyCount(self: *const WindowsSurfaceImporter) u64 {
         const c = &(self.concrete orelse return 0);
         return switch (c.*) {

@@ -1,29 +1,12 @@
-//! AudioRing — Godot-free interleaved-PCM ring buffer for the audio path.
+//! Godot-free ring buffer for interleaved float32 PCM. A frame is one sample
+//! per channel. Audio is pumped and drained on the main thread; this buffer
+//! has no synchronization and requires single-threaded access.
 //!
-//! The decode side pushes interleaved float32 samples decoded from the
-//! backend (backend.AudioChunk.samples) into the ring; the mix side drains
-//! them into the buffer Godot hands us. Keeping this here (no Godot types)
-//! makes the partial-read / underrun behaviour unit-testable without an
-//! AudioServer.
-//!
-//! Units: a "frame" is one sample per channel. The ring stores raw
-//! interleaved floats and tracks channel count so frame<->float arithmetic
-//! stays correct.
-//!
-//! Threading: this is intended for a single producer (decode pump) and single
-//! consumer (mix), but unlike FrameQueue it is NOT lock-free — in the
-//! binding, audio is pumped and drained from the same place inside _update on
-//! the main thread for this slice (the shared decode-worker pool is a later
-//! slice). A small ring of plain floats is enough; we guard nothing here and
-//! document the single-thread assumption.
-//!
-//! Behaviour contract (the acceptance criterion: "handle partial
-//! reads/underrun gracefully, output silence on underrun, never block"):
-//!   * write() drops samples that don't fit (returns the count actually
-//!     stored) rather than blocking or growing unboundedly.
-//!   * readFrames() fills as many frames as are available, ZERO-FILLS the
-//!     rest (silence on underrun), and reports how many real frames it
-//!     produced.
+//! write() stores whole frames that fit and returns the count, dropping excess
+//! input without blocking or growing. readFrames() returns real frames copied,
+//! min(frame_count, availableFrames()), excluding silence padding on underrun.
+//! peekFrames()/consume() support
+//! sinks that accept only part of an offered block.
 
 const std = @import("std");
 
@@ -101,14 +84,11 @@ pub const AudioRing = struct {
         return n;
     }
 
-    /// Copy up to `frame_count` frames into `out` (frame_count * channels
-    /// floats) WITHOUT consuming them — the read cursor is left untouched.
-    /// Frames not available are written as silence (0.0). Returns the number
-    /// of REAL (non-silence) frames copied.
-    ///
-    /// Pairs with consume(): a caller offers the peeked frames to a
-    /// back-pressured sink, then consumes exactly the count the sink accepted,
-    /// so frames the sink rejects stay buffered instead of being dropped.
+    /// Copy without consuming into `out` (frame_count * channels floats),
+    /// padding unavailable frames with silence. Return real frames copied:
+    /// min(frame_count, availableFrames()), excluding silence padding.
+    /// After offering the block to a back-pressured sink, consume() only the
+    /// accepted count so rejected frames remain buffered.
     pub fn peekFrames(self: *AudioRing, out: []f32, frame_count: usize) usize {
         const ch: usize = @intCast(self.channels);
         const real = @min(frame_count, self.availableFrames());
@@ -309,15 +289,10 @@ test "AudioRing consume never advances past what is available" {
 }
 
 test "AudioRing 6ch chunked fill + back-pressure conserves every decoded frame" {
-    // Ring-level reproduction of the cross-platform "audio too fast + choppy"
-    // bug. A 6-channel ring is topped up to a half-fill target in 1024-frame
-    // chunks (exactly fillAudioClosure's `while freeFrames() > availableFrames()`
-    // loop), then a back-pressured sink accepts only ~1/6 of the offered frames
-    // each round (the 6-channel case). The fixed drain path — peekFrames() then
-    // consume() ONLY the accepted count — must never drop a decoded frame:
-    // everything pulled is stored, and everything stored is either consumed or
-    // still buffered. The ring must also stay bounded and the fill loop must
-    // stop below capacity.
+    // Reproduce multi-channel sink back-pressure: half-fill a 6-channel ring
+    // in 1024-frame chunks, then accept ~1/6 of each offer. Peeking and consuming
+    // only accepted frames must conserve decoded PCM: every stored frame is
+    // consumed or still buffered. The fill loop must stop below capacity.
     const channels = 6;
     const capacity_frames = 24000; // canonical_sample_rate/2, as sized in load()
     var r = try AudioRing.init(std.testing.allocator, channels, capacity_frames);

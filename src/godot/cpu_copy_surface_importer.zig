@@ -1,41 +1,20 @@
-//! cpu_copy_surface_importer.zig — Windows CPU-copy import path.
+//! Windows CPU-copy fallback for RenderingDevice drivers without zero-copy
+//! import, including Vulkan. MF still decodes on hardware; this path reads back
+//! NV12/P010 and uploads R8/RG8 or R16/RG16 plane textures.
 //!
-//! The fallback importer for the common case: a stock Vulkan RenderingDevice
-//! driver on any Godot version, where neither zero-copy path is reachable (the
-//! DXGI Vulkan import is not ported, and the D3D12 path needs the d3d12 RD
-//! driver). Hardware decode is untouched — the MF backend's DXGI device manager
-//! still drives the decoder — and this adds a GPU->CPU readback so the decoded
-//! NV12/P010 surface reaches Godot RD as ordinary R8/RG8 (8-bit) or R16/RG16
-//! (10-bit) textures instead of an aliased import.
+//! Each import() queues CopySubresourceRegion into slot (frame % ring_depth),
+//! then maps the oldest slot, written ring_depth-1 calls earlier. The first
+//! ring_depth-1 calls return `not_ready`. After warmup, every result retains
+//! that fixed lag, giving the GPU copy time to finish before Map(). Each slot
+//! carries its original presentation metadata, including its crop.
 //!
-//! This is the ONE import path that violates the zero-copy contract, by design.
+//! An NV12/P010 staging mapping has one pointer: Y starts at pData and UV at
+//! pData + RowPitch * height. Both use RowPitch, which may include alignment
+//! padding. Row-by-row packing removes that padding for texture_update.
 //!
-//! The readback ring, in detail: each import() writes into ring slot
-//! (frame % ring_depth) via CopySubresourceRegion (GPU-side, no CPU copy), then
-//! reads back the slot written ring_depth-1 frames ago — the oldest occupied
-//! slot, whose GPU copy has had that many frames to drain, so Map() reads
-//! resident data instead of stalling the render thread. During the first
-//! ring_depth-1 frames after initialize() no slot is old enough (has_data is
-//! false) and import() returns an invalid PlaneTextures; the present pipeline
-//! presents nothing until the ring fills. This same accounting means every
-//! frame presented on this path — not just during startup — is the pixel
-//! content from ring_depth-1 frames earlier: a fixed, permanent presentation
-//! lag traded for never stalling on Map().
-//!
-//! Mapping an NV12/P010 staging texture returns ONE pointer for the whole
-//! resource: the Y plane's rows start at pData with stride RowPitch, and the
-//! interleaved UV plane starts immediately after all Y rows, at
-//! pData + RowPitch * height, using the SAME RowPitch. Both planes are copied
-//! row-by-row into tightly packed buffers because RowPitch is generally wider
-//! than a plane's exact byte width (driver row alignment) while texture_update
-//! expects tightly packed data.
-//!
-//! P010 bit justification: each 10-bit sample is stored left-justified in a
-//! 16-bit word (value = code << 6), the opposite of CoreVideo's x420 (the AVF
-//! backend's 10-bit format, right-justified in the low 10 bits). The shared
-//! present shader assumes the x420 convention (code = sampled * 65535), so the
-//! 10-bit packing path shifts every sample right by 6 while copying, producing
-//! the same right-justified layout on both platforms.
+//! P010 stores each 10-bit code left-justified in a 16-bit word (code << 6).
+//! Packing shifts it right by 6 to match CoreVideo x420 and the present shader's
+//! right-justified convention (code = sampled * 65535).
 
 const std = @import("std");
 
@@ -59,19 +38,14 @@ const CachedTex2D = wic.CachedTex2D;
 
 const log = std.log.scoped(.native_video_cpu_copy_import);
 
-/// Ring depth matches PresentPipeline's frame latency: the same number of
-/// rendered frames every other import path's transient surfaces survive before
-/// retirement.
+/// Matches PresentPipeline's transient-surface retirement latency.
 const readback_ring_depth: usize = 3;
 
 const ReadbackSlot = struct {
     staging: CachedTex2D = .{},
     has_data: bool = false, // true once a CopySubresourceRegion has targeted it
-    // The display-aperture crop THIS slot's frame carried, captured at write
-    // time. The read side resolves it against `staging`'s own (aligned)
-    // dimensions rather than whatever crop the CURRENT call() received, since
-    // the slot being read back was written by an earlier, different import()
-    // call -- see the ring-buffer accounting in the module doc comment.
+    // Captured when written. Readback resolves this delayed frame's crop
+    // against its own staging dimensions, not the current import's crop.
     metadata: si.PresentationMetadata = .{},
 };
 
@@ -79,9 +53,8 @@ pub const CpuCopySurfaceImporter = struct {
     allocator: std.mem.Allocator,
     rd: ?*RenderingDevice = null,
 
-    // Bound lazily on the first import(), straight from the decoder texture —
-    // no device of our own, no adapter matching: the readback runs on the SAME
-    // device the decoder texture already lives on.
+    // Bound on first import to the decoder texture's device. D3D11 readback
+    // must use that device, even if another device matches its adapter.
     device: ?*d3d11.ID3D11Device = null,
     context: ?*d3d11.ID3D11DeviceContext = null,
 
@@ -92,20 +65,15 @@ pub const CpuCopySurfaceImporter = struct {
     source_format: dxgi.DXGI_FORMAT = dxgi.DXGI_FORMAT_UNKNOWN,
     initialized: bool = false,
 
-    // Session-scoped: every frame actually imported through this path, honest
-    // accounting for the one importer allowed to violate the zero-copy
-    // contract. Persists across a mid-flight D3D12->CPU-copy degrade, since
-    // the WindowsSurfaceImporter wrapper keeps reusing the same instance for
-    // the rest of the session once it switches over.
+    // Successful CPU-copy imports for this session. After D3D12 fallback,
+    // WindowsSurfaceImporter keeps this instance for the rest of the session.
     cpu_copy_count: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) CpuCopySurfaceImporter {
         return .{ .allocator = allocator };
     }
 
-    /// Always succeeds for a non-null RD: unlike the zero-copy importers this
-    /// path needs no particular RD driver or GPU extension — texture_create /
-    /// texture_update are driver-agnostic.
+    /// Always succeeds: texture_create/texture_update work with any RD driver.
     pub fn initialize(self: *CpuCopySurfaceImporter, rd: *RenderingDevice) bool {
         self.rd = rd;
         self.initialized = true;
@@ -116,16 +84,15 @@ pub const CpuCopySurfaceImporter = struct {
         return self.initialized;
     }
 
-    /// Import the NV12/P010 ID3D11Texture2D (opaque handle == ID3D11Texture2D*)
-    /// into two RD plane textures via a GPU->CPU readback, CROPPED to `crop`
-    /// (the frame's display aperture -- see core.backend.CropRect). Returns an
-    /// A typed failure on error, or `not_ready` while the readback ring warms.
+    /// Read back an NV12/P010 ID3D11Texture2D into two RD plane textures,
+    /// cropped to the delayed frame's display aperture (core.backend.CropRect).
+    /// Returns a typed failure on error or `not_ready` during ring warmup.
     pub fn import(self: *CpuCopySurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) ImportResult {
         if (!self.initialized) return .transient_failure;
         const handle = frame_info.native_handle orelse return .bad_frame;
         const decoded: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(handle));
 
-        // Lazily bind to the SAME device the decoder texture lives on.
+        // Bind lazily to the decoder texture's device.
         if (self.device == null) {
             const bound = wic.bindDecoderDevice(decoded) orelse {
                 log.err("CPU-copy importer: ID3D11Texture2D.GetDevice failed.", .{});
@@ -166,8 +133,7 @@ pub const CpuCopySurfaceImporter = struct {
         const write_slot = frame % readback_ring_depth;
         const read_slot = (frame + 1) % readback_ring_depth;
 
-        // --- Queue this frame's GPU-side readback into the ring slot with the
-        // most time left before it is read. No CPU copy here.
+        // Queue a GPU copy into the slot with the longest time until readback.
         const write = &self.ring[@as(usize, @intCast(write_slot))];
         if (!write.staging.ensure(device, width, height, src_desc.Format, d3d11.D3D11_USAGE_STAGING, 0, d3d11.D3D11_CPU_ACCESS_READ)) {
             log.err("CPU-copy importer: staging texture create failed.", .{});
@@ -186,7 +152,7 @@ pub const CpuCopySurfaceImporter = struct {
         write.has_data = true;
         write.metadata = si.PresentationMetadata.fromFrame(frame_info, submission);
 
-        // --- Read back the oldest slot. Still warming up: nothing old enough.
+        // Read the oldest slot; return not_ready during warmup.
         const read = &self.ring[@as(usize, @intCast(read_slot))];
         if (!read.has_data) return .not_ready;
 
@@ -200,8 +166,7 @@ pub const CpuCopySurfaceImporter = struct {
             }
             defer context.Unmap(read.staging.texture.?.asResource(), 0);
 
-            // Resolve THIS delayed slot's crop against its physical dimensions,
-            // preserving Windows' existing clamp/fallback geometry policy.
+            // Resolve the delayed slot's crop against its own dimensions.
             const aligned_width = std.math.cast(i32, read.staging.width) orelse return .bad_frame;
             const aligned_height = std.math.cast(i32, read.staging.height) orelse return .bad_frame;
             const rc = wic.resolveCrop(read.metadata.crop, read.staging.width, read.staging.height);
@@ -236,8 +201,7 @@ pub const CpuCopySurfaceImporter = struct {
             log.err("CPU-copy importer: plane texture upload failed: {s}.", .{@errorName(err)});
             return .transient_failure;
         };
-        // Honest accounting: this is the one import path allowed to violate
-        // the zero-copy contract, so every frame it actually hands back counts.
+        // Count only completed CPU-copy imports.
         self.cpu_copy_count += 1;
         return .{ .success = out };
     }

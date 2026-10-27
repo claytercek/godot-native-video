@@ -1,56 +1,29 @@
-//! mf_backend.zig — Media Foundation Decoder-mode Backend (Windows).
+//! Windows Media Foundation decoder using IMFSourceReader and a DXGI device
+//! manager. Video uses D3D11 NV12 (8-bit) or P010 (HEVC Main10); audio uses
+//! interleaved float32 PCM. No Godot or RenderingDevice dependencies.
 //!
-//! The Windows analog of avf::AvfBackend. Drives an IMFSourceReader bound to an
-//! IMFDXGIDeviceManager as a pure hardware decoder: video decodes straight into
-//! D3D11 textures (DXGI_FORMAT_NV12 for 8-bit sources, DXGI_FORMAT_P010 for
-//! 10-bit HEVC Main10), audio into interleaved float32 PCM. Every decoded frame
-//! is snapshotted out of the decoder's recycled sample pool into a frame-owned
-//! ID3D11Texture2D handed out as the native surface, whose single +1 reference
-//! is released via VideoFrame.release. No Godot / RenderingDevice symbols appear
-//! here — this is a decode pump only.
+//! This file owns reader state, track selection, EOS/errors, and translation
+//! to VideoFrame/AudioChunk. MfPipeline owns COM/D3D objects; colorimetry.zig
+//! holds pure metadata and time-base conversion. Windows-specific negotiation
+//! and track-order workarounds are documented inline.
 //!
-//! This file owns policy only, exactly as avf_backend.zig does: the reader
-//! state machine, track selection/clamping, EOS/error interpretation, and the
-//! translation of MF results into VideoFrame / AudioChunk. The COM/D3D object
-//! graph (device, DXGI manager, source readers) lives behind `pipeline.MfPipeline`,
-//! composed in as a field — the Windows counterpart to AVF's C-ABI shim. Zig
-//! splits a struct across files by composition, not by scattering one struct's
-//! methods; that seam is what keeps this core small. The pure colorimetry /
-//! time-base parsers live in colorimetry.zig. Policy decisions (bit-depth
-//! negotiation, colorimetry-from-native-type, reversed audio enumeration,
-//! dedicated-reader reselect) match the C++ exactly — each is a
-//! verified-on-Windows-11 workaround, noted inline where it matters.
+//! Ownership:
+//! - Video: copy the pooled decoder slice into a frame-owned, single-slice
+//!   ID3D11Texture2D while IMFSample still pins the source. Release the pooled
+//!   sample/texture after enqueueing the copy. native_handle owns the copy's +1
+//!   reference; VideoFrame.release releases it exactly once.
+//! - AudioChunk borrows backend scratch until the next nextAudioChunk()/close().
+//! - AudioTrackInfo strings belong to the backend from open() until close().
 //!
-//! Ownership at the boundaries:
-//!  - Video frames: the pooled decoder slice is copied into a fresh, frame-owned
-//!    single-slice ID3D11Texture2D adopted into native_handle; the release hook
-//!    Releases that copy exactly once. The pooled sample/texture is released as
-//!    soon as the copy is enqueued, so the decoder is free to recycle it — the
-//!    frame's content is immutable no matter what the pool does behind it.
-//!  - Audio samples: copied into backend-owned scratch, valid until the next
-//!    nextAudioChunk()/close() — the AudioChunk slice borrows it.
-//!  - AudioTrackInfo strings: normalized/duplicated into backend-owned storage
-//!    at open, freed at close; slices stay valid until close().
-//!
-//! COM/MF lifecycle is per-open(), but the COM apartment is NOT the caller's.
-//! Godot's D3D12 renderer runs the engine main thread — our open()/close()
-//! caller — in an STA, where CoInitializeEx(MTA) fails (RPC_E_CHANGED_MODE) and
-//! MFCreateSourceReaderFromURL then fails intermittently. So the backend owns a
-//! ComExecutor: a dedicated thread it puts in the MTA and marshals the whole
-//! COM open (MFStartup + device/reader creation + stream configuration) and the
-//! whole COM teardown (object release + MFShutdown) onto. CoInitializeEx and its
-//! paired CoUninitialize stay on that one thread; the thread lives from open()
-//! to close(), anchoring the process MTA for the reader's decode-time lifetime.
-//! The scheduler still pumps ReadSample off-thread on its workers — a sync
-//! source reader has no single-thread affinity, and the anchored MTA keeps the
-//! reader a true free-threaded object. open()/close() still return synchronously
-//! to their caller: the caller blocks on the executor job.
+//! ComExecutor runs MFStartup, object creation, object teardown, and MFShutdown
+//! on its dedicated MTA thread. It pairs COM initialization/uninitialization
+//! there and stays alive from open() to close(), anchoring the MTA for worker
+//! ReadSample calls. open()/close() block for executor completion. See
+//! com_executor.zig for the caller-STA constraint and serialization contract.
 
 const std = @import("std");
-// Reach core through the build.zig-wired "core" named module: a module root
-// forbids cross-directory @import, and routing through the shared module keeps
-// core.Backend one identity across the mf backend, the engine core, and the
-// Godot glue. Mirrors avf_backend.zig.
+// Use the named core module to stay within module roots and share one
+// core.Backend type across the backend, core, and binding.
 const core = @import("core").backend;
 
 const win = @import("win.zig");
@@ -242,15 +215,9 @@ pub const MfBackend = struct {
         return true;
     }
 
-    // Read the display/clean aperture off the video stream's CURRENT media
-    // type: MF_MT_MINIMUM_DISPLAY_APERTURE first (what H.264/HEVC decoders
-    // actually populate for non-mod-16 content), MF_MT_GEOMETRIC_APERTURE as
-    // a fallback, and -- when neither attribute is present -- the full
-    // negotiated frame (self.width/self.height, already read from
-    // MF_MT_FRAME_SIZE), which is the correct crop for a decoder that never
-    // pads its backing texture. A negative aperture offset is defensively
-    // clamped to 0 (never observed in practice; MF decoders report whole-
-    // frame, non-negative apertures).
+    // Read the current media type's MF_MT_MINIMUM_DISPLAY_APERTURE (used by
+    // H.264/HEVC decoders), falling back to MF_MT_GEOMETRIC_APERTURE, then the
+    // full MF_MT_FRAME_SIZE dimensions. Clamp negative offsets to zero.
     fn readDisplayAperture(self: *MfBackend, t: *mf.IMFMediaType) void {
         const attrs = t.asAttributes();
         const area = attrs.getVideoArea(&mf.MF_MT_MINIMUM_DISPLAY_APERTURE) orelse
@@ -550,13 +517,9 @@ pub const MfBackend = struct {
     }
 
     fn closeImpl(self: *MfBackend) void {
-        // Tear the COM object graph + MF platform down on the SAME MTA thread
-        // that built them, then stop that thread (its CoUninitialize pairs the
-        // CoInitializeEx it made when it started). Every COM object this backend
-        // owns — the shared reader/device built in openInner and the dedicated
-        // audio reader built in prepareAudioReader — is created only inside an
-        // executor job, so there is nothing to release when the executor was
-        // never started.
+        // Tear down objects and MF on their creating MTA thread, then stop it
+        // to pair CoUninitialize. All objects, including dedicated audio readers,
+        // are created by executor jobs; an unstarted executor has none to release.
         if (self.executor.isRunning()) {
             self.executor.run(closeComThunk, self);
             self.executor.stop();
@@ -623,25 +586,15 @@ pub const MfBackend = struct {
         const target = @max(pts_seconds, 0.0);
         const mf_index = self.audio_stream_indices.items[@intCast(clamped)];
 
-        // Dedicated audio-only reader for the new track, primed at target, while
-        // the shared reader keeps decoding video from its current position. The
-        // pipeline builds it into a local and swaps only on success, so a
-        // failure here leaves any existing dedicated reader intact. Construction
-        // is marshaled onto the executor (MFCreateSourceReaderFromURL must run in
-        // our MTA); reselect itself is driven from the STA main thread.
+        // Prime a dedicated reader at target without repositioning video. Build
+        // on the executor's MTA; swap only on success so failure preserves the
+        // active reader. Reselect is called from the STA main thread.
         //
-        // Teardown (resetAudioReader -> Release) is deliberately NOT marshaled.
-        // The reader is created on a real MTA thread, so it is a free-threaded
-        // MTA object with no thread affinity: Release needs no cross-apartment
-        // marshaling from any thread already in the MTA. Its retire paths are all
-        // in-MTA — buildAudioReader's own swap (executor) and the shared reader's
-        // seek (decode workers, implicit MTA). The one STA path (a scrub-settle
-        // seekExact on the main thread retiring a dedicated reader) is the same
-        // pre-existing STA-touches-reader residual that already applies to every
-        // audio/seek call the main thread makes, not something this construction
-        // fix introduces; a bare refcount decrement is the cheapest, most
-        // apartment-tolerant COM call, so marshaling only it would add a hot-path
-        // executor round-trip for no correctness gain.
+        // resetAudioReader -> Release remains on the calling thread. Executor
+        // swaps and worker seeks run in the MTA, where this free-threaded reader
+        // needs no marshaling. Main-thread seekExact can also retire it from the
+        // STA; this retains the existing cross-apartment limitation of main-thread
+        // audio/seek calls. Only construction is dispatched to the executor.
         var job: BuildAudioReaderJob = .{ .self = self, .mf_index = mf_index, .start_ticks = colorimetry.secondsToTicks(target) };
         self.executor.run(BuildAudioReaderJob.thunk, &job);
         var prepared = job.prepared orelse return false;
@@ -691,14 +644,10 @@ pub const MfBackend = struct {
             };
             defer com.release(dxgi_buffer);
 
-            // GetResource yields a +1 reference to the decoder's POOLED output
-            // texture — an array whose slices the decoder recycles the instant
-            // this frame's IMFSample is released (below), independent of any ref
-            // we hold on the array itself. In H.264 decode order (B-frames) that
-            // recycle overwrites the slice with a temporally-earlier frame long
-            // before the present pipeline samples it, so the pooled slice must
-            // NOT travel downstream. Snapshot it into a frame-owned texture now,
-            // while the sample still pins the slice, and let the pool recycle.
+            // GetResource retains the pooled texture array, not this slice's
+            // contents. Releasing IMFSample lets the decoder overwrite the slice,
+            // including with an earlier B-frame. Copy it while the sample still
+            // pins it; never send a pooled slice downstream.
             var raw: ?*anyopaque = null;
             if (com.FAILED(dxgi_buffer.GetResource(&d3d11.ID3D11Texture2D.IID, &raw)) or raw == null) return null;
             const pooled: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(raw.?));
@@ -730,16 +679,11 @@ pub const MfBackend = struct {
         }
     }
 
-    // Copy one slice of the decoder's pooled texture into a freshly-created,
-    // single-slice texture this frame owns outright, so the frame's pixel
-    // content is immutable for its whole queue-to-present lifetime regardless of
-    // how the decoder recycles the pool behind it. Runs on the decoder's OWN
-    // device+context (D3D11 resources are per-device; the device is
-    // multithread-protected, so this decode-worker copy is serialized against
-    // the render thread's later import copy). The copy is enqueued while the
-    // caller still holds the source IMFSample, so it captures this frame's
-    // content before the slice can be reused. Returns a +1 texture the caller
-    // adopts into native_handle (released by frameRelease), or null on failure.
+    // Snapshot a pooled slice into a frame-owned texture on the decoder's
+    // device/context. Multithread protection serializes this worker copy with
+    // render-thread import copies. The caller must hold the source IMFSample
+    // until the copy is enqueued, preventing slice reuse. Return a +1 texture
+    // for native_handle/frameRelease, or null on failure.
     fn snapshotFrame(self: *MfBackend, pooled: *d3d11.ID3D11Texture2D, slice: com.UINT) ?*d3d11.ID3D11Texture2D {
         const device = self.pipeline.d3d_device orelse return null;
         const context = self.pipeline.d3d_context orelse return null;
@@ -891,12 +835,9 @@ pub const MfBackend = struct {
     }
 };
 
-// Diagnostic: compare a just-negotiated PCM format against the track's
-// declared (pre-negotiation, native-descriptor) values and log the result.
-// CanonicalMixFormat (canonical_mix_format.zig) derives the AudioMasterClock
-// / ring sizing / _getMixRate() rate from the declared values, NOT from what
-// PCM negotiation actually delivers here, so a mismatch means audio can play
-// at the wrong speed. Diagnostic only -- no behavior change.
+// Log negotiated PCM versus declared track format. CanonicalMixFormat uses
+// declared values for AudioMasterClock, ring sizing, and _getMixRate(); a
+// mismatch can change playback speed. Diagnostic only; do not alter the format.
 fn logAudioNegotiation(track_index: i32, declared: core.AudioTrackInfo, fmt: pipe.PcmFormat) void {
     if (declared.sample_rate != fmt.rate or declared.channels != fmt.channels) {
         log.warn(

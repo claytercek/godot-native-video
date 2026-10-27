@@ -1,40 +1,20 @@
-//! channel_mixer.zig — deterministic channel-format converter (Engine Core).
+//! Deterministic interleaved-PCM channel conversion using fixed float literals.
 //!
-//! The canonical mix format for a clip is the maximum channel count across
-//! all audio tracks. Backends emit each track's native channel layout (1/2/6
-//! ch). This mixer converts any supported source layout to any supported
-//! target layout using fixed float constants so the result is identical on
-//! every platform — no OS-level mixer, no platform rounding, no undefined
-//! behaviour.
+//! Backends emit native layouts; the clip's canonical mix uses the maximum
+//! track channel count. Supported layouts are mono (C), stereo (L, R), and
+//! SMPTE/ITU-R BS.775 5.1 (L, R, C, LFE, Ls, Rs).
 //!
-//! The contract is total: mixChannels() always writes exactly
-//! frame_count * dst_channels floats and never reads or writes outside the
-//! buffers the caller sized for those channel counts, regardless of what
-//! src_channels and dst_channels are.
+//! Downmixes omit LFE and attenuate surrounds by 3 dB (0.707 ~= 1/sqrt(2)).
+//! Mono upmixes to both stereo channels or the 5.1 center; stereo upmixes to
+//! 5.1 mains only. Coefficients use no platform-dependent math functions.
 //!
-//! Supported layouts (by channel count), with semantic downmix/upmix rules:
-//!   1  — Mono                (C)
-//!   2  — Stereo              (L, R)
-//!   6  — 5.1 surround        (L, R, C, LFE, Ls, Rs)  — SMPTE/ITU-R BS.775
+//! Unsupported layouts (3, 4, 5, 7, 8+ channels) copy the first
+//! min(src_channels, dst_channels) samples per frame and zero the remaining
+//! destination channels. They have no semantic channel mapping.
 //!
-//! Mixing conventions for the layouts above:
-//!   * LFE (subwoofer) content is EXCLUDED from all downmixes (consumer-side
-//!     bass management reproduces it from the mains).
-//!   * Surround channels (Ls, Rs) are attenuated 3 dB relative to mains in
-//!     downmixes (coefficient 0.707 ~= 1/sqrt(2), typed as a float literal).
-//!   * Upmixes place source content into the semantically closest channels:
-//!     mono centre -> centre-only in 5.1, both L/R in stereo; stereo -> mains
-//!     only in 5.1 (no phantom centre).
-//!   * All coefficients are float literals — no sqrt, no pow, no
-//!     platform-varying math functions.
-//!
-//! Everything else — any (src_channels, dst_channels) pair not listed above,
-//! including source or destination layouts we don't understand (3, 4, 5, 7,
-//! 8+ channels) — falls back to a documented, layout-agnostic behaviour:
-//! copy the first min(src_channels, dst_channels) samples of each frame and
-//! zero any remaining destination channels. This is a known limitation, not
-//! an error: we have no semantic mapping for those layouts, so we preserve
-//! as many channels as fit and stay silent (never garbage) on the rest.
+//! For positive dimensions, mixChannels() writes exactly
+//! frame_count * dst_channels floats within caller-sized buffers, including
+//! unsupported layouts. Degenerate dimensions write nothing.
 
 const std = @import("std");
 
@@ -417,11 +397,8 @@ test "mix_channels converts multiple frames correctly" {
 }
 
 // -----------------------------------------------------------------------
-// Unrecognised layouts: generic copy-min-channels fallback.
-//
-// These are the total-contract regression cases: the mixer must never write
-// past frame_count * dst_channels floats, and must never leave destination
-// channels beyond src_channels uninitialized garbage — it zeros them.
+// Unsupported layouts copy the channels that fit and zero the rest.
+// Tests check every destination channel and guard against buffer overruns.
 // -----------------------------------------------------------------------
 
 test "mix_channels 8ch source to 6ch dst never overflows the dst buffer" {
@@ -489,11 +466,9 @@ test "mix_channels 3ch to 3ch uses the memcpy fast path" {
 }
 
 // -----------------------------------------------------------------------
-// Fuzz: the total contract under arbitrary channel counts, frame counts,
-// and sample bits (including NaN/inf). mixChannels must write exactly
-// frame_count * dst_channels floats — never past them — and write nothing
-// at all for degenerate arguments. Run with `zig build test --fuzz` for
-// real fuzzing; a normal test run does one smoke pass.
+// Fuzz channel/frame counts and sample bits, including NaN/inf. Check exact
+// output bounds and no writes for degenerate arguments. Run with
+// `zig build test --fuzz`; normal tests run one smoke pass.
 // -----------------------------------------------------------------------
 
 test "fuzz: mix_channels writes exactly the contract region" {

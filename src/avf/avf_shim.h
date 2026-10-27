@@ -1,17 +1,9 @@
 // -----------------------------------------------------------------------
-// avf_shim.h — pure C ABI over the AVFoundation decode object graph.
-//
-// The shim (avf_shim.m, compiled with -fobjc-arc) owns ALL AVFoundation /
-// Objective-C state: the AVURLAsset, the combined AVAssetReader with its
-// per-track outputs, the dedicated audio-only reader used for mid-decode
-// track reselect, track enumeration, colorimetry extraction, and sample
-// pumping. It exposes nothing but this header's opaque handle and C
-// functions (prefix `nv_avf_`). All policy — the state machine, retries,
-// EOS/error interpretation, clamping, track bookkeeping — lives in the Zig
-// backend (avf_backend.zig), which mirrors these declarations by hand.
-//
-// Enum values below are chosen to match core::/backend.zig numeric tags so
-// the Zig side can @enumFromInt directly.
+// C ABI for AVFoundation decoding. avf_shim.m (-fobjc-arc) owns the asset,
+// combined reader, dedicated audio reader, and track outputs. It exposes
+// opaque handles and nv_avf_ functions for enumeration, colorimetry, and samples.
+// avf_backend.zig owns playback policy and mirrors these declarations by hand.
+// Enum values match core/backend.zig tags for direct Zig enum conversion.
 // -----------------------------------------------------------------------
 #ifndef NV_AVF_SHIM_H
 #define NV_AVF_SHIM_H
@@ -122,13 +114,10 @@ typedef struct {
 	int sample_rate;
 } nv_avf_audio_chunk;
 
-// Actual sizes and per-field offsets of the five structs above, as this
-// translation unit's compiler laid them out. avf_backend.zig hand-mirrors
-// these as extern structs (no @cImport by project convention); nothing
-// short of a runtime probe catches one side's field order or size drifting
-// from the other. Filled by nv_avf_abi_probe_fill and compared field-by-field
-// against @sizeOf/@offsetOf on the Zig side, so a reorder of same-size
-// fields (which leaves sizeof unchanged) is caught too.
+// Compiler-reported sizes and offsets for the five structs above.
+// nv_avf_abi_probe_fill supplies them for comparison with Zig @sizeOf/@offsetOf
+// on the hand-mirrored extern structs. Per-field checks catch same-size field
+// reorders that a sizeof check would miss.
 typedef struct {
 	size_t sizeof_colorimetry;
 	size_t off_colorimetry[5]; // matrix, primaries, transfer, range, bit_depth

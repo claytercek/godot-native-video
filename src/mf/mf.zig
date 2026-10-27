@@ -1,10 +1,5 @@
-//! mf.zig — root of the Media Foundation Windows backend module.
-//!
-//! Bundles the hand-written Windows bindings (`win`) and the MF decoder backend
-//! (`backend`) into one module so both can be reached through a single import
-//! and so the backend can pull in `core` via the build.zig-wired named module
-//! without escaping a module root. Mirrors how avf_backend.zig is exposed on
-//! macOS.
+//! Media Foundation module exposing Windows bindings (`win`) and the decoder
+//! (`backend`). build.zig supplies the named core import within this module root.
 
 pub const win = @import("win.zig");
 pub const backend = @import("mf_backend.zig");

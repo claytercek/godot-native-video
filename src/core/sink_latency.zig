@@ -1,30 +1,18 @@
-//! SinkLatencyEstimator — measures how far the audio mix sink runs AHEAD of
-//! real-time playout, so the present selector can be shifted back onto what the
-//! listener actually hears.
+//! Estimate the mix sink's buffered audio depth so video follows audible PCM.
 //!
-//! WHY: Godot's VideoStreamPlayback.mix_audio() feeds an engine-side audio
-//! resampler ring whose size comes from `buffering_msec` (default 500 ms,
-//! user-configurable 10..1000 ms) rounded UP to a power of two by
-//! AudioRBResampler::setup — ~0.68 s (32768 frames) at 48 kHz. At playback
-//! start the sink GULPS enough frames to prime that ring, then accepts at
-//! real-time rate. Because the master clock (AudioMasterClock) advances by
-//! every frame the sink ACCEPTS, media time races ~gulp seconds ahead of what
-//! is audible and stays there. Video, paced against media time, then LEADS
-//! audio by that constant depth (the classic "audio lags video" symptom).
+//! mix_audio() primes Godot's resampler ring before accepting at playback rate.
+//! AudioMasterClock advances on acceptance, so it leads audible audio by that
+//! depth. buffering_msec (default 500 ms, configurable 10..1000 ms) is rounded
+//! up to a power of two: 32768 frames, about 0.68 s, at 48 kHz.
 //!
-//! The depth is not a knowable constant — buffering_msec is configurable and
-//! power-of-two rounded — so it is MEASURED: accepted-frames-as-seconds minus
-//! real wall time since the first accept converges to the buffered depth once
-//! the gulp is done and the sink is draining 1x. The estimate is FROZEN after a
-//! short warmup so per-tick wall-clock jitter cannot wobble video pacing, and
-//! RESET (re-measured) on an explicit delivery generation change such as a
-//! seek/flush. Upstream queue emptiness is not evidence that the sink drained.
+//! Measure accepted audio duration minus wall time since the first accept.
+//! Freeze after warmup to avoid pacing jitter; reset on delivery-generation
+//! changes such as seek/flush. An empty upstream queue does not prove that the
+//! sink drained. Silent clips (sample_rate == 0) retain zero compensation.
 //!
-//! Scope: this measures ONLY the accept-side ring depth (the gulp). Downstream
-//! AudioServer output latency is a DISJOINT delay already handled by the
-//! clock's own latency_seconds; the two are kept separate so neither is
-//! double-counted. A silent clip (sample_rate == 0) never feeds the estimator,
-//! so its compensation stays exactly zero.
+//! This measures only the accept-side ring. AudioServer output latency is
+//! separate and already covered by the clock's latency_seconds; do not count
+//! either delay twice.
 
 const std = @import("std");
 const wall_clock_mod = @import("wall_clock.zig");

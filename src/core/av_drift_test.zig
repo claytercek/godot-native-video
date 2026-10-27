@@ -1,40 +1,13 @@
-//! A/V drift simulation — the key correctness gate for this slice.
+//! Deterministic A/V drift simulation without Godot or a GPU.
 //!
-//! Model (no Godot, no GPU, fully deterministic with a fixed RNG seed):
+//! Fixed mix blocks advance AudioMasterClock by block_frames / sample_rate.
+//! A simulated decoder delivers PTS-ordered frames with fixed-seed random
+//! jitter and a deliberate stall. Each render tick applies the real present
+//! selector and records the displayed PTS.
 //!
-//!   * The MASTER CLOCK is the AudioMasterClock. We "consume" audio in fixed
-//!     mix blocks (like Godot's AudioServer pulling a buffer), each call
-//!     advancing the clock by block_frames / sample_rate. This is exactly how
-//!     the binding drives the clock from real audio consumption.
-//!
-//!   * A simulated DECODE THREAD delivers video frames into a decode-ahead
-//!     buffer (a PTS-ordered queue, like the binding's FrameQueue). Frame N
-//!     has the ideal PTS N*frame_interval, but it ARRIVES with INDUCED
-//!     JITTER: a random, sometimes large delay relative to when it "should"
-//!     have been decoded. A deliberate JITTER SPIKE stalls decode entirely
-//!     for a span of ticks to test recovery (a decode hiccup).
-//!
-//!   * Each render tick we run the REAL present-selector (drop-late/hold-early)
-//!     against the buffer head/next and the master clock, applying its
-//!     decisions (Drop pops the head; Show presents the head; Hold keeps the
-//!     current frame). We record the PTS of whatever frame is on screen.
-//!
-//! Assertions:
-//!   (a) Steady state: once frames are flowing, the presented PTS stays within
-//!       half a frame interval of the master clock (the standard "in sync"
-//!       budget — a frame is correct for ~its own display interval).
-//!   (b) Recovery: after the jitter spike drains, the player catches back up to
-//!       within the steady-state budget within a bounded number of ticks (it
-//!       does NOT drift permanently — drop-late collapses the backlog).
-//!
-//! This file lives as a sibling test (rather than inside clock.zig or
-//! present_selector.zig) because it exercises both modules together.
-//!
-//! NOTE: jitter is drawn from a fixed-seed std.Random.DefaultPrng, so the
-//! run is deterministic but the assertions below are statistical bounds
-//! (steady-state drift budget, spike-recovery bound), not exact-value
-//! checks — that's what makes the fixed seed meaningful without pinning
-//! the literal per-tick jitter sequence.
+//! Assert steady-state drift within half a frame interval and bounded recovery
+//! after the stall. These are statistical bounds over a reproducible run,
+//! rather than exact checks of the per-tick jitter sequence.
 
 const std = @import("std");
 const clock_mod = @import("clock.zig");

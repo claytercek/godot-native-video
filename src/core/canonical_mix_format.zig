@@ -1,27 +1,11 @@
-//! Pure derivation of a playback's Canonical Mix Format from a Backend's
-//! audio tracks.
+//! Derive the canonical mix format from Backend track metadata, without a
+//! scheduler or clock. The channel count and sample rate stay fixed after load().
 //!
-//! The Canonical Mix Format (channel count + sample rate) is fixed for a
-//! playback's entire lifetime once load() returns. Deriving it is a pure
-//! function of a Backend's audioTrackCount()/audioTrackInfo() queries — no
-//! DecodeScheduler, no clock, no state. Pulling it out of
-//! PlaybackController.load() lets the mixed-sample-rate / channel-clamp
-//! logic be unit-tested without spinning up the process-wide scheduler
-//! singleton the controller registers with.
-//!
-//! channels       — max channel count across all audio tracks, clamped to
-//!                   channel_mixer.max_mix_source_channels.
-//! sample_rate    — the FIRST audio-bearing track's rate (NOT a shared rate
-//!                   across tracks). Mixed-sample-rate clips are a documented
-//!                   limitation: the default track's rate wins, and a later
-//!                   track with a differing rate gets exactly one warning
-//!                   here.
-//! has_audio      — true when any track carries audio.
-//! track_infos    — per-track metadata cached for mid-stream switch
-//!                   sample-rate validation.
-//! warnings       — mixed-sample-rate notice(s) generated during derivation;
-//!                   the controller drains these into its own
-//!                   take_warnings() queue.
+//! channels is the maximum channel count across audio tracks, capped at
+//! channel_mixer.max_mix_source_channels. sample_rate comes from the first
+//! audio-bearing track with a valid rate; has_audio records whether one exists.
+//! Mixed-rate clips produce one warning, which the controller collects.
+//! track_infos caches metadata for sample-rate checks during track switches.
 
 const std = @import("std");
 const backend_mod = @import("backend.zig");

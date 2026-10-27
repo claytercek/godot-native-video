@@ -1,22 +1,10 @@
-//! com.zig — COM plumbing and generic Win32 glue for the Media Foundation port.
+//! COM and Win32 bindings transcribed from Zig's mingw-w64 headers, without
+//! @cImport. GUIDs use literal constants to avoid missing MinGW GUID_NULL and
+//! DirectX IID import symbols. See win.zig for binding conventions.
 //!
-//! Everything here is hand-declared. This repo forbids `@cImport`: every OS
-//! type, function, and interface vtable is transcribed by hand from the
-//! mingw-w64 headers Zig ships (see the module doc in win.zig for the rules).
-//! That keeps the ABI surface auditable and sidesteps a class of MinGW
-//! import-library gaps (e.g. `GUID_NULL` and the DirectX IID symbols are
-//! missing from the mingw import libs — so we never reference them; every GUID
-//! this port needs is a Zig `const` with a literal value instead).
-//!
-//! Design choices for Zig:
-//!  - COM interfaces are `extern struct { lpVtbl: *const Vtbl }`, mirroring the
-//!    C-ABI view MinGW emits. The Vtbl lists EVERY slot in declared order
-//!    (parent interface methods first); methods this port never calls are kept
-//!    as opaque `*const anyopaque` slots so the slot index of the methods we DO
-//!    call is exact. Never reorder or drop a slot.
-//!  - Lifetime is managed with `ComPtr(T)`: a thin move-only wrapper that calls
-//!    `Release` on `deinit`. It mirrors the spirit of the C++ `ComPtr`/`com_raii`
-//!    but leans on Zig `defer`/`errdefer` at call sites rather than RAII.
+//! COM interfaces start with lpVtbl. Preserve every vtable slot in declaration
+//! order, parents first; unused methods remain *const anyopaque placeholders.
+//! ComPtr(T) is move-only and calls Release on deinit; callers use defer/errdefer.
 
 const std = @import("std");
 const windows = std.os.windows;

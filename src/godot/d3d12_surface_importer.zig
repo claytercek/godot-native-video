@@ -1,69 +1,32 @@
-//! d3d12_surface_importer.zig — zero-copy NV12/P010 D3D11 texture -> RD
-//! textures (Windows / D3D12 RD driver).
+//! GPU-only NV12/P010 import from MF's D3D11 decoder textures into Godot's
+//! D3D12 RenderingDevice as R8/R16 luma and RG8/RG16 chroma textures.
 //!
-//! The D3D12-RD zero-copy import path. Takes a hardware-decoded NV12 or P010
-//! ID3D11Texture2D (from the MF backend) and produces two Godot RenderingDevice
-//! plane textures — luma (R8/R16) + chroma (RG8/RG16) — the shared NV12->RGB
-//! compute pass consumes, WITHOUT any CPU copy of the pixel data.
+//! All D3D11 work uses the decoder texture's device, obtained through GetDevice
+//! on first import. D3D11 resources are per-device: even a separate device with
+//! the same adapter LUID cannot copy from the decoder texture. Shared textures
+//! and a fence are opened on Godot's ID3D12Device. Cross-adapter OpenSharedHandle
+//! failure reports `capability_unavailable`, selecting the CPU-copy fallback.
 //!
-//! Device ownership: the entire D3D11 pipeline — intermediate blit texture,
-//! plane-split compute state, output plane textures, shared fence, NT shared
-//! handles — runs on the device that OWNS the incoming decoder texture, taken
-//! lazily from the first imported texture via ID3D11Texture2D.GetDevice. The MF
-//! backend decodes onto its own D3D11 device, and D3D11 resources are
-//! per-device: CopySubresourceRegion (and every other op that touches the
-//! decoder texture) is only valid on that texture's own device. We deliberately
-//! do NOT create a device of our own — a separate LUID-matched device would put
-//! the blit's source (decoder texture) and destination on different devices,
-//! which is invalid usage that merely happens to work on single-adapter setups
-//! and produces garbage or failure on multi-adapter / hybrid-GPU machines.
+//! initialize() binds Godot's D3D12 device. The first import builds the D3D11
+//! compute pipeline and a persistent D3D11.4 SHARED fence, exported through an
+//! NT handle and opened as an ID3D12Fence. Its signal value advances per frame.
 //!
-//! Cross-adapter fallback: the shared handles/fence are opened on Godot's
-//! ID3D12Device. That succeeds whenever Godot runs on the same adapter as the
-//! decoder (the overwhelmingly common case). On a true cross-adapter / hybrid-
-//! GPU setup OpenSharedHandle fails; import() reports a permanent capability
-//! mismatch and the WindowsSurfaceImporter wrapper degrades to CPU-copy.
+//! Each import GPU-blits the decoder slice into a cached NV12/P010 intermediate,
+//! creates PlaneSlice SRVs, and dispatches a plane-split pass into fresh,
+//! NT-shareable output textures. P010 samples are scaled by 1/64 in UNORM space
+//! to convert code << 6 into the present shader's right-justified 10-bit layout.
+//! Output textures bind RENDER_TARGET alongside SHADER_RESOURCE/UNORDERED_ACCESS
+//! because Godot assumes an imported texture starts in RENDER_TARGET state
+//! (godot#117115). RD import uses SAMPLING | COLOR_ATTACHMENT for the same reason;
+//! neither plane is rendered to.
 //!
-//! The interop chain (see the C++ reference for the full rationale):
-//!   initialize() once:
-//!     - Pull Godot's ID3D12Device out of RD (RD driver == d3d12).
-//!   first import() (lazy, once the decoder's own D3D11 device is known):
-//!     - Take the decoder texture's ID3D11Device via GetDevice.
-//!     - Create a D3D11.4 SHARED fence, export its NT handle, open it on the
-//!       D3D12 side as an ID3D12Fence. One fence persists for the importer's
-//!       lifetime; only its signal value increments per frame.
-//!     - Compile the plane-split compute shader (embedded HLSL) and create the
-//!       D3D11 compute pipeline state.
-//!
-//!   import(frame) per frame:
-//!     1. GPU-blit the decoder slice into a cached intermediate texture of the
-//!        same format on the decoder's own D3D11 device (never leaves the
-//!        device, so no sharing flags / keyed mutex).
-//!     2. Create PlaneSlice SRVs (luma/chroma) over the intermediate.
-//!     3. Dispatch one compute pass copying both planes into two freshly
-//!        created, independently NT-shareable output textures. For P010 it also
-//!        rescales each sample from P010's left-justified layout (code << 6) to
-//!        the right-justified 10-bit-in-16 layout the shared present shader
-//!        expects — a x1/64 multiply in UNORM space. Both outputs bind
-//!        RENDER_TARGET (in addition to SHADER_RESOURCE/UNORDERED_ACCESS)
-//!        purely because Godot's D3D12 RD driver hardcodes an imported
-//!        texture's initial state as RENDER_TARGET (godot#117115); neither is
-//!        ever actually rendered to.
-//!     4. Signal the shared fence for this frame and Flush so the GPU processes
-//!        the signal.
-//!     5. Export both output textures as NT handles and open them on the D3D12
-//!        side as ID3D12Resource.
-//!     6. Hand each ID3D12Resource to RenderingDevice.texture_create_from_
-//!        extension with SAMPLING | COLOR_ATTACHMENT usage (COLOR_ATTACHMENT
-//!        for the same driver reason as the RENDER_TARGET bind flag above).
-//!     7. CPU-wait on the D3D12-side fence before exposing either imported RID.
-//!        This keeps every success and failure path under the same ownership
-//!        rule: plane resources are never sampled or destroyed while D3D11 is
-//!        still writing them.
-//!
-//! Known limitation: no keyed mutex and no release-sync. The plane textures are
-//! single-use (the retire-ring destroys them, they are never reused), so
-//! nothing needs to hand GPU access back to the D3D11 side.
+//! After dispatch, import signals and flushes the shared fence, then CPU-waits
+//! on its D3D12 side before exporting or wrapping the planes. Neither success
+//! nor failure paths may sample or destroy a plane while D3D11 is writing it.
+//! Each output is exported as an NT handle, opened as an ID3D12Resource, and
+//! passed to texture_create_from_extension. The retire ring later destroys it.
+//! Outputs are single-use, so no keyed mutex or release-sync is needed to return
+//! access to D3D11.
 
 const std = @import("std");
 
@@ -105,22 +68,14 @@ const dxgi_error_device_removed: com.HRESULT = @bitCast(@as(u32, 0x887A0005));
 const dxgi_error_device_hung: com.HRESULT = @bitCast(@as(u32, 0x887A0006));
 const dxgi_error_device_reset: com.HRESULT = @bitCast(@as(u32, 0x887A0007));
 
-// -----------------------------------------------------------------------
-// Plane-split compute shader. Reads two source planes (PlaneSlice SRVs over the
-// intermediate NV12/P010 texture) and copies the display-aperture CROP of each
-// into its own standalone, exactly-display-sized output texture -- decoder
-// padding from a macroblock-aligned backing texture (see CropRect's doc
-// comment in core/backend.zig) never reaches the output. Dispatched at the
-// luma crop's resolution; the chroma bounds check keeps the half-res writes in
-// range within the same dispatch. luma_offset_x/y and chroma_offset_x/y are
-// the crop's top-left corner within the (possibly larger, padded) source
-// planes; dst indices stay 0-based in the smaller cropped output.
+// Plane-split shader: copy each display-aperture crop from the intermediate's
+// PlaneSlice SRV into a display-sized output, excluding macroblock padding
+// (core.backend.CropRect). luma_offset_x/y and chroma_offset_x/y locate the
+// crop in the source; destination indices start at zero. Dispatch uses luma
+// resolution, with a bounds check for half-resolution chroma writes.
 //
-// sample_scale is 1.0 for NV12 (straight copy) and 1/64 for P010: P010 stores
-// each 10-bit code left-justified (word = code << 6), and the shared present
-// shader expects the right-justified layout (code in the low 10 bits). In UNORM
-// space that shift is exactly a divide by 64.
-// -----------------------------------------------------------------------
+// sample_scale is 1.0 for NV12 and 1/64 for P010, converting left-justified
+// words (code << 6) to the present shader's low-10-bit layout in UNORM space.
 const plane_split_hlsl =
     \\Texture2D<float>    SrcLuma    : register(t0);
     \\Texture2D<float2>   SrcChroma  : register(t1);
@@ -150,8 +105,7 @@ const plane_split_hlsl =
     \\}
 ;
 
-/// cbuffer layout for the plane-split shader. cbuffer sizes must be a 16-byte
-/// multiple — the 36 payload bytes are padded to 48.
+/// Plane-split cbuffer: pad 36 payload bytes to a 16-byte multiple (48 bytes).
 const PlaneSplitParams = extern struct {
     luma_width: u32,
     luma_height: u32,
@@ -207,9 +161,8 @@ pub const D3D12SurfaceImporter = struct {
     // Godot's D3D12 device (borrowed but COM-retained while we hold it).
     d3d12_device: ?*d3d12.ID3D12Device = null,
 
-    // The decoder texture's OWN D3D11 device + immediate context, bound lazily
-    // on the first import() via ID3D11Texture2D.GetDevice. The whole blit /
-    // compute / share pipeline runs here so it never crosses a device boundary.
+    // Decoder texture's D3D11 device and immediate context, bound on first
+    // import via GetDevice. All D3D11 work must stay on this device.
     device: ?*d3d11.ID3D11Device = null,
     context: ?*d3d11.ID3D11DeviceContext = null,
 
@@ -237,20 +190,16 @@ pub const D3D12SurfaceImporter = struct {
     // True once the first import() built the D3D11 pipeline on the decoder's
     // own device (fence, extended interfaces, compute state).
     pipeline_ready: bool = false,
-    // Once one frame has crossed the entire interop boundary successfully,
-    // later per-frame failures are retryable. Before that point, failure to
-    // open a plane on D3D12 or wrap it as an RD texture proves that this
-    // device/driver combination cannot support the zero-copy contract.
+    // After one successful import, per-frame failures are retryable. Before
+    // that, deterministic D3D12 open/wrap failures authorize CPU fallback.
     imported_once: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) D3D12SurfaceImporter {
         return .{ .allocator = allocator };
     }
 
-    /// Bind to the RenderingDevice and its underlying D3D12 device. Returns
-    /// false if the RD is not D3D12. The D3D11-side pipeline is NOT built here —
-    /// it needs the decoder texture's own device, so it is bootstrapped lazily
-    /// on the first import() (see ensurePipeline).
+    /// Bind RD's D3D12 device; return false for a non-D3D12 RD. ensurePipeline
+    /// builds the D3D11 side on first import, using the decoder texture's device.
     pub fn initialize(self: *D3D12SurfaceImporter, rd: *RenderingDevice) bool {
         if (self.initialized) return true;
         self.rd = rd;
@@ -269,12 +218,10 @@ pub const D3D12SurfaceImporter = struct {
         return true;
     }
 
-    /// Build the D3D11-side pipeline (shared fence, extended interfaces, compute
-    /// state) on the device that OWNS `decoded` — the decoder texture's own
-    /// device, obtained via GetDevice. Called once, on the first import(). On
-    /// Permanent interface/interop incompatibilities authorize CPU fallback;
-    /// allocation/bootstrap failures clear their partial state and retry on a
-    /// later frame.
+    /// Lazily build the shared fence, extended interfaces, and compute state on
+    /// `decoded`'s device (GetDevice). Permanent interface/interop failures
+    /// authorize CPU fallback; allocation/bootstrap failures clear partial state
+    /// for retry on a later frame.
     fn ensurePipeline(self: *D3D12SurfaceImporter, decoded: *d3d11.ID3D11Texture2D) BootstrapResult {
         if (self.pipeline_ready) return .ready;
 
@@ -282,8 +229,8 @@ pub const D3D12SurfaceImporter = struct {
         // decoder-side pipeline rather than leaking or mixing partial COM state.
         self.resetDecoderPipeline();
 
-        // Bind to the SAME device the decoder texture lives on. GetDevice /
-        // GetImmediateContext AddRef; teardown() Releases both.
+        // Use the decoder's device. GetDevice/GetImmediateContext AddRef;
+        // teardown() releases both.
         const bound = wic.bindDecoderDevice(decoded) orelse {
             log.err("init: ID3D11Texture2D.GetDevice failed.", .{});
             return .transient_failure;
@@ -400,19 +347,17 @@ pub const D3D12SurfaceImporter = struct {
         return self.initialized;
     }
 
-    /// Import the NV12/P010 ID3D11Texture2D (opaque handle == ID3D11Texture2D*)
-    /// into two RD plane textures, zero-copy (GPU-only), CROPPED to `crop`
-    /// (the frame's display aperture -- see core.backend.CropRect). Does NOT
-    /// take ownership of the decoder texture.
+    /// Import an NV12/P010 ID3D11Texture2D into two RD planes using only GPU
+    /// copies, cropped to frame_info.crop (core.backend.CropRect). Borrows the
+    /// decoder texture.
     pub fn import(self: *D3D12SurfaceImporter, frame_info: core.backend.VideoFrame, submission: u64) si.ImportResult {
         var out: PlaneTextures = .{};
         if (!self.initialized) return .transient_failure;
         const handle = frame_info.native_handle orelse return .bad_frame;
         const decoded: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(handle));
 
-        // Lazily bootstrap the D3D11 pipeline on the decoder texture's own
-        // device. A failure here (including OpenSharedHandle on a cross-adapter
-        // setup) is the capability failure that lets the wrapper use CPU-copy.
+        // Bootstrap on the decoder's device. Only capability_unavailable
+        // permits CPU fallback; transient bootstrap failures remain retryable.
         switch (self.ensurePipeline(decoded)) {
             .ready => {},
             .transient_failure => return .transient_failure,
@@ -568,9 +513,8 @@ pub const D3D12SurfaceImporter = struct {
             return if (self.imported_once) .transient_failure else .capability_unavailable;
         }
 
-        // --- 7. Build the release closure. Ownership of the two D3D12
-        // resources moves into its box; the D3D11-side transients are released
-        // by the defers above (shared memory survives via the D3D12 references).
+        // Transfer D3D12 resources into the release box. They retain shared
+        // memory after the defers release the D3D11 transients.
         const release = si.boxClosure(self.allocator, ReleaseValue{
             .rd = rd,
             .luma = luma,
@@ -654,9 +598,7 @@ pub const D3D12SurfaceImporter = struct {
         self.initialized = false;
     }
 
-    /// Drop a partial or complete decoder-side bootstrap while preserving the
-    /// RenderingDevice binding. This makes transient bootstrap failures truly
-    /// retryable on the next frame.
+    /// Release decoder-side state but keep the RD binding for bootstrap retry.
     fn resetDecoderPipeline(self: *D3D12SurfaceImporter) void {
         if (self.params_cb) |p| {
             // @alignCast: ID3D11Buffer/ComputeShader are opaque (align-1)
@@ -702,9 +644,9 @@ pub const D3D12SurfaceImporter = struct {
     }
 };
 
-/// Create one standalone, NT-shareable plane output texture. Binds RENDER_TARGET
-/// alongside SHADER_RESOURCE/UNORDERED_ACCESS purely to satisfy the D3D12 RD
-/// driver's hardcoded initial-state assumption; never actually rendered to.
+/// Create an NT-shareable plane. RENDER_TARGET supplements
+/// SHADER_RESOURCE/UNORDERED_ACCESS to match RD's assumed initial state;
+/// the texture is never rendered to.
 fn makeOutputTexture(device: *d3d11.ID3D11Device, format: dxgi.DXGI_FORMAT, w: com.UINT, h: com.UINT, out: *?*d3d11.ID3D11Texture2D) bool {
     var desc = std.mem.zeroes(d3d11.D3D11_TEXTURE2D_DESC);
     desc.Width = w;
@@ -715,16 +657,14 @@ fn makeOutputTexture(device: *d3d11.ID3D11Device, format: dxgi.DXGI_FORMAT, w: c
     desc.SampleDesc.Count = 1;
     desc.Usage = d3d11.D3D11_USAGE_DEFAULT;
     desc.BindFlags = d3d11.D3D11_BIND_SHADER_RESOURCE | d3d11.D3D11_BIND_UNORDERED_ACCESS | d3d11.D3D11_BIND_RENDER_TARGET;
-    // MISC_SHARED_NTHANDLE is invalid on its own; pair with plain SHARED (not
-    // SHARED_KEYEDMUTEX — this pass never Acquire/ReleaseSync's a keyed mutex,
-    // and SHARED_KEYEDMUTEX made CSSetUnorderedAccessViews hang on-device).
+    // MISC_SHARED_NTHANDLE requires SHARED. SHARED_KEYEDMUTEX caused
+    // CSSetUnorderedAccessViews to hang; this pass uses no Acquire/ReleaseSync.
     desc.MiscFlags = d3d11.D3D11_RESOURCE_MISC_SHARED_NTHANDLE | d3d11.D3D11_RESOURCE_MISC_SHARED;
     return com.SUCCEEDED(device.CreateTexture2D(&desc, null, out));
 }
 
-/// The DXGI_FORMAT sibling of si.planeFormat: same is_10bit x is_chroma ->
-/// r8/r16/rg8/rg16 selection, but for the DXGI enum the D3D11-side SRV/UAV
-/// views need instead of RenderingDevice.DataFormat.
+/// DXGI equivalent of si.planeFormat for D3D11 SRV/UAV views:
+/// is_10bit and is_chroma select R8/R16/RG8/RG16.
 fn dxgiPlaneFormat(is_10bit: bool, is_chroma: bool) dxgi.DXGI_FORMAT {
     return if (is_chroma)
         (if (is_10bit) dxgi.DXGI_FORMAT_R16G16_UNORM else dxgi.DXGI_FORMAT_R8G8_UNORM)

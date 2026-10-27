@@ -1,11 +1,6 @@
-//! A typed monotonic wall-clock timestamp (milliseconds).
-//!
-//! PlaybackController and Scrubber consume wall-clock time to measure scrub
-//! velocity and debounce settle. A bare `f64` carries no contract that two
-//! values came from the same clock; WallClockMs makes the "monotonic
-//! wall-clock milliseconds" contract a type. Construction from a raw f64 is
-//! explicit (a caller must opt in), and there is no implicit conversion
-//! back, so a value can never silently masquerade as an ordinary number.
+//! Monotonic wall-clock milliseconds for scrub velocity and settle timing.
+//! WallClockMs requires explicit conversion to/from f64 to distinguish these
+//! timestamps from media time and other numeric values.
 
 const std = @import("std");
 

@@ -1,26 +1,18 @@
-//! godot_dict.zig — small typed helper for building Godot Dictionaries.
-//!
-//! Both the VideoStream (audio-track metadata) and the VideoStreamPlayback
-//! (colorimetry info) build result Dictionaries the same way: a Latin-1 key
-//! String plus a value Variant. This hoists that one pattern so the Variant
-//! conversions live in exactly one place.
+//! Typed Dictionary construction for audio-track metadata and colorimetry.
+//! Keys are Latin-1 Strings; value types select their Variant conversions.
 
 const godot = @import("godot");
 const String = godot.builtin.String;
 const Dictionary = godot.builtin.Dictionary;
 const Variant = godot.builtin.Variant;
 
-/// Sets `dict[key] = value`, choosing the Variant conversion from `value`'s
-/// type: integers box as i64, bools as bool, and byte slices as a String
-/// (UTF-8, Latin-1 fallback). These are the exact conversions the former
-/// per-file setDictInt/setDictBool/setDictString helpers performed.
+/// Set dict[key] to value: integers box as i64, bools as bool, and byte slices
+/// as Strings (UTF-8 with Latin-1 fallback).
 pub fn setDict(dict: *Dictionary, comptime key: [:0]const u8, value: anytype) void {
     var k = String.fromLatin1(key);
     defer k.deinit();
-    // Every Variant below is a temporary. `dict.set` copies both key and
-    // value into the Dictionary, so the Dictionary owns the surviving copies
-    // and each temporary must be deinit'd here -- otherwise its +1 on the
-    // boxed String's CoW buffer is never released.
+    // dict.set copies both Variants. Deinit the temporaries to release their
+    // references, including those to boxed String CoW buffers.
     const kv = Variant.init(String, k);
     defer kv.deinit();
     switch (@typeInfo(@TypeOf(value))) {

@@ -1,36 +1,13 @@
-//! present_selector — Godot-free drop-late / hold-early present policy.
+//! Godot-free drop-late/hold-early presentation policy.
 //!
-//! Linear-playback A/V sync needs a deterministic rule for "which decoded
-//! frame should be on screen right now?" given the master clock. This is
-//! the heart of staying in sync, so it lives here in the Engine Core,
-//! isolated from Godot and unit-tested headlessly.
+//! Requires a queue in non-decreasing PTS order. Compare its head and successor
+//! with the master clock, allowing half a nominal frame interval as tolerance:
+//! - Hold if the queue is empty or the head is not due; keep the current frame.
+//! - Show if the head is the newest due frame.
+//! - Drop if the successor is also due, then re-evaluate the queue.
 //!
-//! Each stream's DecodeScheduler entry owns a FrameQueue<VideoFrame> of
-//! decode-ahead frames sorted by PTS (the backend pumps them in PTS order).
-//! Each render tick, the playback controller asks the selector what to do
-//! with the queue head, given:
-//!   - the master clock time `now` (audio-master or monotonic fallback), and
-//!   - the nominal frame interval (1 / fps), used to decide what "late" means.
-//!
-//! Policy: drop-late / hold-early.
-//!   * Hold — the head frame's PTS is in the future (PTS > now). It is not
-//!            due yet; keep showing the current frame and wait.
-//!   * Show — the head frame is due (PTS <= now) AND it is the newest frame
-//!            that is still due (the next frame, if any, is in the future).
-//!            Present it.
-//!   * Drop — the head frame is due, but a *newer* frame is ALSO already due
-//!            (next.PTS <= now). The head is stale; drop it so we catch up
-//!            to real time instead of replaying a backlog in slow motion.
-//!
-//! "Late by more than one frame" is implicit: if only the head is due and
-//! the next frame is still in the future, we Show the head even if it is
-//! slightly behind `now` (a frame is on screen for ~one interval, so being
-//! up to one interval behind the clock is normal and must NOT be dropped —
-//! dropping it would blank the display). We only Drop when a strictly
-//! better (newer, due) frame exists to replace it. This guarantees we never
-//! drop the only frame we could show, and never fall permanently behind:
-//! any backlog is collapsed in a single tick by repeated Drop decisions
-//! until exactly one due frame remains.
+//! Repeated drops collapse a backlog in one tick. The only due frame is always
+//! shown, even when late; dropping it would leave no replacement.
 
 const std = @import("std");
 
@@ -124,14 +101,9 @@ test "within half-interval tolerance counts as due" {
 }
 
 test "out-of-order queue steps backward (why presentation order is required)" {
-    // The selector compares each PTS to `now`, never head-vs-next, so a FIFO
-    // whose successor carries a LOWER PTS than the head — frames enqueued out of
-    // presentation order, as a B-frame stream would if the backend leaked decode
-    // order — makes it DROP the newer head and then Show the older successor.
-    // That is exactly the forward-then-backward step this pipeline's
-    // monotonic-order contract (and the decode_scheduler enqueue guard) exists to
-    // prevent. This test pins the contract: given non-monotonic input, the
-    // selector will misbehave, so the ordering must be guaranteed upstream.
+    // The selector compares PTS to `now`, not head to successor. Out-of-order
+    // input can drop a newer head and show an older successor, stepping backward.
+    // This test documents why the backend and scheduler must preserve PTS order.
     const now = 1.00;
     // head 0.90 is due; its successor 0.80 is ALSO due but earlier -> drop head.
     try std.testing.expectEqual(PresentAction.drop, selectPresentAction(0.90, 0.80, now, test_interval));

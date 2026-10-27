@@ -10,12 +10,9 @@ pub fn build(b: *Build) !void {
         else => return error.UnsupportedPlatform,
     }
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
-    // gdzig no longer downloads Godot: it resolves the executable from
-    // -Dgodot-path, then GODOT_PATH, then `godot` on PATH, and panics at
-    // configure time if none of them hit. The binary is only used to run the
-    // demo and the smoke step -- bindings come from the Godot API description
-    // gdzig vendors -- but the lookup happens unconditionally, so every build
-    // host needs a Godot on hand.
+    // gdzig requires Godot at configure time: -Dgodot-path, then GODOT_PATH,
+    // then `godot` on PATH. Only demo/smoke execution uses the binary; bindings
+    // come from gdzig's bundled API description, but all builds need the lookup.
     const env_godot = b.graph.environ_map.get("GODOT_PATH");
     const opt_godot_path = b.option([]const u8, "godot-path", "Path to a Godot executable") orelse env_godot;
     // Precision must match the Godot build the extension loads into: gdzig bakes
@@ -59,10 +56,8 @@ pub fn build(b: *Build) !void {
     b.step("test-linux-fixture-pts", "Run indexed Linux fixture PTS oracle tests").dependOn(&fixture_pts_run.step);
     test_step.dependOn(&fixture_pts_run.step);
 
-    // Windows import-path selector: lives in src/godot/ (it picks between the
-    // D3D12 zero-copy and CPU-copy surface importers) but is a pure function
-    // with zero Godot dependencies, so its tests run standalone here rather
-    // than needing the full extension build.
+    // The Windows importer selector is pure Zig despite living in src/godot/;
+    // test D3D12/CPU-copy selection without building the extension.
     const importer_selector_mod = b.createModule(.{
         .root_source_file = b.path("src/godot/importer_selector.zig"),
         .target = target,
@@ -96,16 +91,10 @@ pub fn build(b: *Build) !void {
     b.step("test-linux-packing", "Alias for test-cpu-packing").dependOn(&packing_run.step);
     test_step.dependOn(&packing_run.step);
 
-    // --- Media Foundation Windows bindings (Windows only). ---
-    // Hand-written OS bindings layer that the eventual MF decoder backend and
-    // the D3D11/D3D12 surface importers build on. Its own module so the future
-    // backend can import "core" without escaping a module root, mirroring how
-    // avf_mod is wired below. The runtime bindings test is folded into the main
-    // `test` step; it exercises real MF + D3D11 objects, so it needs Windows and
-    // a D3D11-capable GPU (it SkipZigTests when no device is available).
-    // Held past the Windows block so the Godot extension below can wire it into
-    // ext_mod as the "mf" import (the D3D11/D3D12 surface importers reach the
-    // bindings through `@import("mf").win`). Null off Windows.
+    // Windows MF backend and hand-written bindings. Keep the module for the
+    // extension's "mf" import; importers reach bindings via @import("mf").win.
+    // Runtime tests exercise MF/D3D11 objects, falling back to WARP or skipping
+    // if no device is available. Null on other platforms.
     var mf_mod: ?*Build.Module = null;
     if (target.result.os.tag == .windows) {
         const m = b.createModule(.{
@@ -344,15 +333,10 @@ fn linkAvfShim(b: *Build, mod: *Build.Module) void {
     }
 }
 
-/// Add the Apple SDK's framework/library/include search paths to `mod`.
-///
-/// Zig 0.16 only auto-adds these for the fully-native default target query;
-/// any explicit `-Dtarget=...macos`/`...ios` disables that autodetection, so
-/// framework lookups (Foundation, AVFoundation, ...) and libobjc fail to
-/// resolve. Derive the active SDK path from `xcrun` at build time (never
-/// hardcode it — SDK locations vary across Xcode/Command Line Tools installs)
-/// and wire it in explicitly. Picks the macOS SDK or the iOS (device) SDK
-/// based on the target's OS tag.
+/// Add framework/library/include paths from xcrun's active macOS or iOS device
+/// SDK. Zig 0.16 skips SDK autodetection for explicit `-Dtarget=...macos`/`...ios`;
+/// these paths are then required to resolve frameworks and libobjc. Query xcrun
+/// rather than hardcoding paths that vary by Xcode/Command Line Tools install.
 fn addAppleSdkPaths(b: *Build, mod: *Build.Module, target: Build.ResolvedTarget) void {
     const sdk = switch (target.result.os.tag) {
         .ios => std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "iphoneos", "--show-sdk-path" }), " \n"),

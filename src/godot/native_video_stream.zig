@@ -1,11 +1,7 @@
-//! native_video_stream.zig — the VideoStream resource for native clips.
-//!
-//! A stock VideoStreamPlayer holds a VideoStream and calls
-//! _instantiatePlayback() to get a VideoStreamPlayback. This resource
-//! carries the clip's file path (set by the ResourceFormatLoader) and
-//! instantiates a NativeVideoStreamPlayback bound to it. It also exposes a
-//! lazy, cached audio-track probe (getAudioTracks()) so GDScript can query
-//! per-track metadata before playback.
+//! VideoStream resource for native clips. Stores the path set by the
+//! ResourceFormatLoader and creates NativeVideoStreamPlayback instances for
+//! VideoStreamPlayer. getAudioTracks() lazily probes and caches track metadata
+//! for GDScript queries before playback.
 
 const NativeVideoStream = @This();
 
@@ -49,10 +45,8 @@ pub fn unregister(r: *Registry) void {
     r.removeClass(NativeVideoStream);
 }
 
-/// One probed audio track, in plain Zig. `language`/`name` borrow storage
-/// owned by `owned_strings` below: the backend's AudioTrackInfo slices point
-/// at shim-owned storage that is freed when the probe closes the backend, so
-/// they are duplicated into that shared bucket instead.
+/// Cached track metadata. language/name borrow copies in owned_strings;
+/// the backend's original AudioTrackInfo slices expire when the probe closes.
 const AudioTrack = struct {
     language: []const u8,
     name: []const u8,
@@ -66,27 +60,19 @@ base: *VideoStream,
 
 output_mode: OutputMode = .sdr,
 
-// Instance ids of playbacks instantiated from this stream. ObjectIDs, not
-// refs, on purpose: the stream must never extend a playback's lifetime.
-// Dead ids are pruned whenever the list is walked.
+// Weak playback ObjectIDs: the stream must not extend playback lifetimes.
+// Each walk prunes dead IDs.
 playback_ids: std.ArrayList(ObjectId) = .empty,
 
-// The cached audio-track probe, held as plain Zig data rather than as a Godot
-// Array. A bound method returning an Array leaves through gdzig's ptrcall
-// path as a bitwise struct move with no refcount bump, so a typed GDScript
-// call would have the engine adopt -- and later release -- a reference this
-// struct still owns. getAudioTracks() therefore builds a fresh Array from
-// this table on every call and never hands out a cached one.
+// Cache plain Zig data. gdzig's ptrcall returns Arrays by bitwise move without
+// retaining them, so returning a cached Array would let GDScript release a
+// reference still owned here. getAudioTracks() builds a fresh Array per call.
 audio_tracks: std.ArrayList(AudioTrack) = .empty,
 
-// Backs every `language`/`name` slice in audio_tracks: one bucket owning all
-// duplicated strings, freed in a single loop in destroy() rather than
-// per-field. AudioTrack itself holds plain borrowed slices into this.
+// Owns all language/name copies borrowed by audio_tracks; freed in destroy().
 owned_strings: std.ArrayList([]u8) = .empty,
 
-// Set once getAudioTracks() has probed the clip, whether or not the probe
-// succeeded. Distinguishes "not probed yet" from "probed and found no audio
-// tracks" so a failed probe or an audio-less clip doesn't re-open the file.
+// Set even on probe failure or no audio, preventing repeated file opens.
 audio_tracks_probed: bool = false,
 
 pub fn create(allocator: *Allocator) !*NativeVideoStream {
@@ -121,16 +107,7 @@ pub fn hdrDecodeSupported(self: *NativeVideoStream) bool {
     };
 }
 
-// -----------------------------------------------------------------------
-// Live-playback resolution.
-//
-// Resolve playback_ids to the playbacks still alive, pruning dead ids, using
-// gdzig's instanceFromId + typed downcast.
-// -----------------------------------------------------------------------
-// Single pass over playback_ids that compacts out dead ids as it goes. Pruning
-// in one walk keeps the "dead" and "skipped" cases identical -- there is no
-// separate post-prune pass where a resolution failure could skip a playback
-// without pruning it.
+// Resolve and compact in one pass so every failed resolution prunes its ID.
 fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
     var write: usize = 0;
     for (self.playback_ids.items) |id| {
@@ -142,17 +119,14 @@ fn pruneDeadPlaybacks(self: *NativeVideoStream) void {
     self.playback_ids.shrinkRetainingCapacity(write);
 }
 
-// resolvePlayback can, in principle, resolve an id whose object is already
-// freed: Godot only drops an id from ObjectDB after the extension's
-// free_instance callback returns, so the window between allocator.destroy(self)
-// in NativeVideoStreamPlayback.destroy and Godot finishing ~Object() still
-// resolves. Only reachable if the unref lands on a different thread than the
-// setOutputMode() caller, which normal single-threaded script execution never does.
+// ObjectDB removes the ID only after free_instance returns. An ID can still
+// resolve between NativeVideoStreamPlayback.destroy's allocator.destroy(self)
+// and Godot's completed ~Object(). This requires unref on a different thread
+// from setOutputMode(); normal single-threaded script execution avoids it.
 fn resolvePlayback(id: ObjectId) ?*NativeVideoStreamPlayback {
     const obj = godot.general.instanceFromId(object_id.toEngineInt(id)) orelse return null;
-    // Object -> engine VideoStreamPlayback (opaque cast) -> our bound instance.
-    // godot.class.downcast rejects user-struct targets, so we go through the
-    // engine class's asInstance() (the same seam Variant.as uses).
+    // Downcast to the engine class, then use asInstance() for the bound struct;
+    // godot.class.downcast rejects user-struct targets.
     const vsp = godot.class.VideoStreamPlayback.downcast(obj) orelse return null;
     return vsp.asInstance(NativeVideoStreamPlayback);
 }
@@ -160,10 +134,7 @@ fn resolvePlayback(id: ObjectId) ?*NativeVideoStreamPlayback {
 pub fn setOutputMode(self: *NativeVideoStream, mode: i64) void {
     const om = OutputMode.fromInt(mode) orelse return;
     self.output_mode = om;
-    // Forward to every still-alive playback instantiated from this stream,
-    // pruning dead ids in the same pass: a SINGLE pass that compacts as it
-    // goes, so there is no separate post-prune pass where a resolution
-    // failure could skip a playback without pruning it.
+    // Forward to live playbacks and prune every failed resolution in this pass.
     var write: usize = 0;
     for (self.playback_ids.items) |id| {
         if (resolvePlayback(id)) |playback| {
@@ -179,12 +150,10 @@ pub fn getOutputMode(self: *NativeVideoStream) i64 {
     return @backingInt(self.output_mode);
 }
 
-/// Lazy, cached probe of audio track metadata. The clip is opened at most once
-/// (a failed probe or a legitimately audio-less clip still counts as probed, so
-/// the file is never re-opened). Returns a freshly built Array of Dictionaries
-/// -- empty if the probe failed -- where array position is the track index for
-/// VideoStreamPlayer.audio_track. The Array is built per call, never cached and
-/// handed out, because the caller takes ownership of it on the ptrcall path.
+/// Probe at most once, including failed opens and clips without audio.
+/// Return a fresh Array of Dictionaries for the caller to own through ptrcall.
+/// Array positions match VideoStreamPlayer.audio_track indices; an empty probe
+/// result returns an empty Array.
 pub fn getAudioTracks(self: *NativeVideoStream) Array {
     self.probeAudioTracksOnce();
 
@@ -222,16 +191,12 @@ fn probeAudioTracksOnce(self: *NativeVideoStream) void {
 
     const count: usize = @intCast(@max(backend.audioTrackCount(), 0));
     self.audio_tracks.ensureTotalCapacity(self.allocator, count) catch return;
-    // Two owned strings per track, reserved up front so the appends below
-    // cannot fail and a freshly duped string can never be dropped on the floor
-    // between dupe and hand-off to the bucket.
+    // Reserve both strings per track so appending cannot fail after duplication.
     self.owned_strings.ensureTotalCapacity(self.allocator, count * 2) catch return;
     for (0..count) |i| {
         const dinfo = backend.audioTrackInfo(@intCast(i));
-        // dinfo.language/.name borrow storage the backend frees on close()
-        // below, so the cache takes its own copies, owned by owned_strings.
-        // On OOM we keep the tracks recorded so far rather than failing the
-        // whole probe.
+        // Copy backend strings before close() frees them. On OOM, keep tracks
+        // already cached; owned_strings retains every completed duplication.
         const language = self.allocator.dupe(u8, dinfo.language) catch return;
         self.owned_strings.appendAssumeCapacity(language);
         const name = self.allocator.dupe(u8, dinfo.name) catch return;
@@ -248,8 +213,7 @@ fn probeAudioTracksOnce(self: *NativeVideoStream) void {
     backend.close();
 }
 
-/// Called by NativeVideoStreamPlayback? No — the engine calls this virtual on
-/// the stream to obtain a playback.
+/// Engine virtual that creates a playback for this stream.
 pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     const playback = NativeVideoStreamPlayback.create(&self.allocator) catch return null;
     playback.applyOutputMode(self.output_mode);
@@ -258,16 +222,14 @@ pub fn _instantiatePlayback(self: *NativeVideoStream) ?*VideoStreamPlayback {
     // reach it later. The list stays bounded across many instantiations.
     self.pruneDeadPlaybacks();
     self.playback_ids.append(self.allocator, object_id.fromRaw(playback.base.getInstanceId())) catch {
-        // Degrade, don't fail: the playback still runs, but future
-        // setOutputMode() calls won't reach it until it's re-instantiated.
+        // Playback still runs, but will not receive future output-mode updates.
         log.warn("failed to record playback id; it will not receive output_mode updates", .{});
     };
 
     // VideoStream.getFile() holds the path the ResourceFormatLoader recorded.
     var file = self.base.getFile();
     defer file.deinit();
-    // Return an (empty) playback even on load failure so the player degrades
-    // gracefully instead of crashing; _getTexture() yields a null texture.
+    // Return an empty playback on load failure; _getTexture() yields null.
     _ = playback.load(file);
     return playback.base;
 }

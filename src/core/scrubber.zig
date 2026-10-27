@@ -1,39 +1,20 @@
-//! scrubber.zig — Godot-free adaptive-scrubbing state machine (Engine Core).
+//! Godot-free adaptive-scrubbing policy.
 //!
-//! Godot drives seeking with nothing but repeated VideoStreamPlayback._seek(time)
-//! calls. There is no "drag started / drag ended" signal: a rapid BURST of seeks
-//! is a user dragging the playhead, and a GAP (or a playback resume) means they
-//! settled. The Scrubber turns that bare stream of (target, wall-clock-now) seek
-//! events into a decision about HOW to resolve each seek:
+//! Repeated VideoStreamPlayback._seek(time) calls carry no drag-start/end
+//! signals. Infer a drag from target velocity and seek timing, supplied as
+//! monotonic WallClockMs values for deterministic tests.
 //!
-//!   * keyframe (fast feedback) — during a fast drag burst we only want to decode
-//!     + present the nearest keyframe at/just-before each target. Skipping the
-//!     inter-frame decode-forward gives near-instant visual feedback while the
-//!     user is still moving, even though the shown frame is approximate.
+//! Fast drags resolve to the keyframe at/before the target, skipping decode
+//! forward for lower latency. Slow seeks, settled drags, and playback resume
+//! resolve exactly by seeking the preceding keyframe and decoding to the target.
+//! The binding maps these decisions to DecodeScheduler operations.
 //!
-//!   * exact (precise) — when the user is moving slowly, or has SETTLED (a
-//!     debounced ~80-120ms gap with no new seek), or playback resumes, we resolve
-//!     to the exact target PTS (seek the preceding keyframe, decode forward to the
-//!     target). Correctness over latency once motion stops.
-//!
-//! THRESHOLDS (all tunable via ScrubConfig, covered by the unit test):
-//!   * velocity_threshold — media-seconds of target movement per wall-second
-//!     between two consecutive seeks. At/above this, and within the burst window,
-//!     the seek is treated as part of a fast drag (Keyframe). Below it, Exact.
-//!   * burst_window_ms — two seeks farther apart than this in wall time do not
-//!     form a burst; the later one starts fresh and resolves Exact.
-//!   * settle_debounce_ms — wall time with no new seek after which the scrub is
-//!     considered settled; poll() then emits a single Exact resolve at the last
-//!     target so the final on-screen frame is precise.
-//!
-//! TIME IS INJECTED (a WallClockMs monotonic millisecond timestamp, see
-//! wall_clock.zig) so the state machine is deterministic and unit-testable
-//! with no real clock — same pattern as present_selector.zig.
-//!
-//! NO Godot / RenderingDevice / Backend types here — pure policy. The binding
-//! maps a Keyframe resolve to a tolerant keyframe seek (the existing
-//! DecodeScheduler.requestSeek path) and an Exact resolve to a precise
-//! seek-and-decode-forward to the target PTS.
+//! ScrubConfig controls detection:
+//! - velocity_threshold: target movement in media-seconds per wall-second.
+//!   At/above it, seeks within the burst window resolve as Keyframe.
+//! - burst_window_ms: seeks farther apart start a new burst and resolve Exact.
+//! - settle_debounce_ms: after this gap, poll() emits one Exact resolve at the
+//!   last keyframe-scrub target. The next keyframe scrub re-arms it.
 
 const std = @import("std");
 
@@ -77,10 +58,8 @@ pub const Scrubber = struct {
         return .{ .config = config };
     }
 
-    /// Feed one _seek(target) event observed at wall time `now`. Returns how
-    /// this seek should be resolved RIGHT NOW (Keyframe for a fast drag, Exact
-    /// otherwise). Records the target/time so a later poll() can detect a
-    /// settle.
+    /// Record a _seek(target) event at wall time `now`. Return Keyframe for a
+    /// fast drag, Exact otherwise. poll() uses the saved target/time to settle.
     pub fn onSeek(self: *Scrubber, target_seconds: f64, now: WallClockMs) ScrubResolve {
         var out: ScrubResolve = .{ .target_seconds = target_seconds };
 
@@ -118,12 +97,9 @@ pub const Scrubber = struct {
         return out;
     }
 
-    /// Called each tick (or on a timer) with the current wall time. If the
-    /// scrub has settled — at least `settle_debounce_ms` since the last seek
-    /// AND the last seek was an approximate keyframe scrub — returns a
-    /// one-shot Exact resolve at the last target so the final frame is
-    /// precise. Returns null otherwise. Fires at most once per settle;
-    /// re-armed by the next keyframe scrub.
+    /// Poll each tick or on a timer. Once `settle_debounce_ms` has elapsed
+    /// after a keyframe scrub, return one Exact resolve at its target; otherwise
+    /// return null. The next keyframe scrub re-arms this one-shot resolve.
     pub fn poll(self: *Scrubber, now: WallClockMs) ?ScrubResolve {
         if (!self.settle_pending or !self.have_prev) {
             return null;
