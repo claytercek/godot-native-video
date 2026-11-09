@@ -164,6 +164,17 @@ test "paused preview: lone exact seek transfers one target frame, then holds" {
     try expectIdle(&f, 2000);
 }
 
+test "paused preview: rewind to zero delivers exactly one preview frame" {
+    var f: Fixture = .{};
+    try f.init();
+    defer f.deinit();
+    f.controller.seek(1.3, at(1000));
+    try expectPreview(&f, 1000, 39);
+    f.controller.seek(0.0, at(2000));
+    try expectPreview(&f, 2000, 0);
+    try expectIdle(&f, 3000);
+}
+
 test "paused preview: superseding burst flushes old frames and settles exactly once" {
     var f: Fixture = .{};
     try f.init();
