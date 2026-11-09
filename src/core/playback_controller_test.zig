@@ -28,6 +28,24 @@ fn makeSched() *DecodeScheduler {
     return DecodeScheduler.init(alloc, 1, true) catch @panic("sched init failed");
 }
 
+// Clock/track unit tests start after the asynchronous rewind has filled its
+// queue. Transport latency itself is exercised with real workers and blocked
+// decoders in transport_latency_test.zig, not hidden behind this helper.
+fn playReady(controller: *PlaybackController) !void {
+    controller.play(WallClockMs.init(0.0));
+    const sys_clock = @import("sys_clock.zig");
+    const deadline = sys_clock.milliTimestamp() + 5000;
+    while (true) {
+        controller.sched.mu.lock();
+        const stream = controller.stream.?;
+        const ready = !stream.seeking and !stream.busy and !stream.queued;
+        controller.sched.mu.unlock();
+        if (ready) return;
+        if (sys_clock.milliTimestamp() >= deadline) return error.DecodeDidNotBecomeReady;
+        sys_clock.sleep(100 * std.time.ns_per_us);
+    }
+}
+
 // Free every warning string and the list (transfers back ownership).
 fn drainWarnings(controller: *PlaybackController) void {
     var w = controller.takeWarnings();
@@ -324,7 +342,7 @@ test "drive_audio advances the clock by only the accepted-and-real frame count" 
     var controller = PlaybackController.init();
     defer controller.deinit();
     try controller.load(alloc, sched, makeStereoBackend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
 
     // The sink accepts far fewer frames than fillAudio() will have topped the
     // ring up with, so the clock must advance by exactly the accepted count.
@@ -346,7 +364,7 @@ test "a mid-stream reselect the backend refuses rolls the desired track back" {
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
     be.reselect_should_succeed = false;
     try controller.load(alloc, sched, be.backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
     try std.testing.expectEqual(1, controller.desired_track);
@@ -376,7 +394,7 @@ test "an unresolved exact seek does not re-anchor the playback clock" {
     try controller.load(alloc, sched, fake.backend(), 0.0);
 
     fake.seek_should_succeed = false;
-    controller.play(WallClockMs.init(0.0));
+    controller.seek(1.0, WallClockMs.init(0.0));
 
     try std.testing.expectApproxEqAbs(0.0, controller.mediaTime(), 1e-9);
     try std.testing.expectApproxEqAbs(0.0, controller.position, 1e-9);
@@ -427,9 +445,19 @@ fn expectPlaybackStartsAt(controller: *PlaybackController, sink: MixSink, target
     try std.testing.expect(controller.playing);
     try std.testing.expectApproxEqAbs(target, controller.position, 1e-9);
     try std.testing.expectApproxEqAbs(target, controller.mediaTime(), 1e-9);
-    const frame = controller.tick(0.0, WallClockMs.init(now_ms), sink) orelse return error.MissingRestartFrame;
-    defer frame.release();
-    try std.testing.expectApproxEqAbs(target, frame.pts_seconds, 1e-9);
+    // Rewinds deliver asynchronously in release builds. Keep media time fixed
+    // while waiting so the selector cannot skip the first frame under test.
+    const sys_clock = @import("sys_clock.zig");
+    const deadline = sys_clock.milliTimestamp() + 5000;
+    while (true) {
+        if (controller.tick(0.0, WallClockMs.init(now_ms), sink)) |frame| {
+            defer frame.release();
+            try std.testing.expectApproxEqAbs(target, frame.pts_seconds, 1e-9);
+            return;
+        }
+        if (sys_clock.milliTimestamp() >= deadline) return error.MissingRestartFrame;
+        sys_clock.sleep(100 * std.time.ns_per_us);
+    }
 }
 
 test "play after sought playback reaches EOS restarts at zero on every loop" {
@@ -518,7 +546,7 @@ test "6-channel back-pressure never races the source reader ahead (bounded backl
         &.{.{ .channels = 6, .sample_rate = 48000 }},
         1024, // 1024-frame chunks, as real AAC delivers
     ).backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
 
     var sink = CappedMixSink{ .accept_cap = 170 }; // ~1024/6: heavy back-pressure
 
@@ -571,7 +599,7 @@ test "a live reselect success converges desired/live, and a converged reconcile 
     defer controller.deinit();
     const be = MultiTrackFakeBackend.create(alloc, &.{ .{ .channels = 2, .sample_rate = 48000 }, .{ .channels = 2, .sample_rate = 48000 } }, 4096);
     try controller.load(alloc, sched, be.backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
 
     controller.requestAudioTrack(1); // deferred: applied on the next tick()
     try std.testing.expectEqual(1, controller.desired_track);
@@ -626,7 +654,7 @@ test "one-clock rule: audio-master tick() never adds the render delta on top of 
     var controller = PlaybackController.init();
     defer controller.deinit();
     try controller.load(alloc, sched, makeStereoBackend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
 
     var sink = CappedMixSink{ .accept_cap = 480 }; // 480 frames @ 48kHz = 10ms of real audio
     // A deliberately huge render delta: if the clock ever added this on top of
@@ -645,7 +673,7 @@ test "one-clock rule: a silent clip advances the clock by exactly the render del
     var controller = PlaybackController.init();
     defer controller.deinit();
     try controller.load(alloc, sched, MultiTrackFakeBackend.create(alloc, &.{}, 4096).backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
 
     var sink = CappedMixSink{ .accept_cap = 4096 }; // never invoked: no audio track
 
@@ -663,7 +691,7 @@ test "one-clock rule: audio exhaustion falls back to the render delta exactly on
     var controller = PlaybackController.init();
     defer controller.deinit();
     try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
     var sink = AcceptAllMixSink{};
 
     // Tick 1: the ring's one real chunk (100 frames) drains in full — the clock
@@ -688,7 +716,7 @@ test "one-clock rule: the transition tick (drained AND exhausted) advances by re
     var controller = PlaybackController.init();
     defer controller.deinit();
     try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
     var sink = AcceptAllMixSink{};
 
     // A huge render delta: if the transition tick stacked it on top of the 100
@@ -706,7 +734,7 @@ test "one-clock rule: a partial drain that leaves audio remaining does NOT trigg
     var controller = PlaybackController.init();
     defer controller.deinit();
     try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 1000).backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
     // Accept far fewer than the 1000-frame chunk so the ring is NOT empty after.
     var sink = CappedMixSink{ .accept_cap = 100 };
 
@@ -724,7 +752,7 @@ test "accepted-vs-real: silence offered during underrun is never counted as real
     var controller = PlaybackController.init();
     defer controller.deinit();
     try controller.load(alloc, sched, ShortAudioBackend.create(alloc, 100).backend(), 0.0);
-    controller.play(WallClockMs.init(0.0));
+    try playReady(&controller);
     var sink = AcceptAllMixSink{}; // accepts every frame offered, including silence
 
     _ = controller.tick(1.0 / 60.0, WallClockMs.init(16.6), sink.sink()); // drains the one real 100-frame chunk

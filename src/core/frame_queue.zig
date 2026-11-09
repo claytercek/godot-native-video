@@ -30,6 +30,11 @@ pub fn FrameQueue(comptime T: type, comptime cap: usize) type {
         // full from empty without a separate counter.
         storage: [cap]T = undefined,
 
+        /// Slots that can actually hold an item (cap - 1). Callers that
+        /// need to size a drain buffer should derive it from this rather
+        /// than restating the off-by-one.
+        pub const usable_capacity: usize = cap - 1;
+
         /// Ring-advance: the slot index one step past `idx`, wrapping via
         /// mask. Shared by push()/full()/peekNext() so the wrap arithmetic
         /// lives in exactly one place.

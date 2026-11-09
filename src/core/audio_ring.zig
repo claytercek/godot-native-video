@@ -59,6 +59,11 @@ pub const AudioRing = struct {
         return free_floats / @as(usize, @intCast(self.channels));
     }
 
+    /// Total frames the ring can hold (available + free).
+    pub fn frameCapacity(self: AudioRing) usize {
+        return self.availableFrames() + self.freeFrames();
+    }
+
     pub fn empty(self: AudioRing) bool {
         return self.head == self.tail;
     }

@@ -19,8 +19,8 @@
 //!
 //! In debug builds, force_synchronous disables workers and runs decode inline
 //! in pumpStream() to reproduce lifetime bugs without worker timing. Release
-//! builds ignore it. requestSeek() flushes and reseeks before decode-ahead
-//! resumes, including keyframe-only scrubbing.
+//! builds ignore it. requestSeek() invalidates old decode work without waiting
+//! for it; workers apply the latest target before resuming decode-ahead.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -85,21 +85,31 @@ pub const DecodeStream = struct {
     queued: bool = false,
     busy: bool = false,
     wants_more: bool = false,
+    // Consumer-side seek flushes release frames outside mu without waiting for
+    // busy. Teardown must also wait for these release hooks before dropping
+    // the backend (some hooks carry backend-owned state).
+    retire_claims: usize = 0,
 
     // A pending seek target requested via requestSeek(); applied by the owning
-    // path before the next decode slice. Guarded by mu.
+    // path before the next decode slice. Guarded by mu. Each request advances
+    // the generation, invalidating an in-flight seek/frame/EOS. Publication and
+    // requestSeek's consumer-side flush use the same mutex, so stale work can
+    // never appear after that flush, even if decode was already in progress.
     seek_pending: bool = false,
     seek_target: f64 = 0.0,
+    seek_generation: u64 = 0,
+    // Remains true through Backend.seek() and the first new frame (or EOS),
+    // not just until the worker takes the request. The controller holds its
+    // clock/audio delivery during this asynchronous gap.
+    seeking: bool = false,
+    seek_failed: bool = false,
 
     // True once the Backend reports EOS. Cleared on seek. Guarded by mu.
     eos: bool = false,
 
     // Set when unregisterStream begins teardown so a worker that wakes up does
-    // not start a new slice. Write-once (never cleared), so it is an atomic
-    // flag rather than a mu-guarded field: the hot decode-ahead loop reads it
-    // lock-free (acquire) instead of taking mu per frame. The teardown store is
-    // release; the mutex already orders every other (mu-held) read, so those
-    // use monotonic loads.
+    // not start a new slice. Write-once (never cleared). Reads under mu use
+    // monotonic ordering because the mutex already orders them.
     dead: std.atomic.Value(bool) = .init(false),
 
     // The selector requires non-decreasing PTS. Track the last enqueued PTS,
@@ -118,6 +128,16 @@ pub const ExactSeekResult = enum {
     backend_seek_failed,
     decode_budget_exhausted,
     stream_unavailable,
+};
+
+/// Asynchronous seek progress, read under one lock so a per-tick check cannot
+/// straddle a state change.
+pub const SeekState = struct {
+    /// The seek has not delivered its first new frame (or EOS) yet.
+    seeking: bool = false,
+    /// The seek failed. Latched until the next seek so a stopped or paused
+    /// controller can still observe it.
+    failed: bool = false,
 };
 
 // -----------------------------------------------------------------------
@@ -251,14 +271,14 @@ pub const DecodeScheduler = struct {
         {
             self.mu.lock();
             // Mark dead so no worker starts a new slice, and wait until any
-            // in-flight slice for THIS stream finishes (busy drops) — guarantees
-            // no worker is touching the Backend/queue when we tear it down.
+            // in-flight slice and seek-flush release hooks for THIS stream.
+            // No worker or release hook may touch backend state after teardown.
             stream.dead.store(true, .release);
             stream.wants_more = false;
             // In synchronous mode there are no workers, so busy can never be set
             // by anyone but the calling thread; the wait below returns
             // immediately.
-            while (stream.busy) self.cv.wait(&self.mu);
+            while (stream.busy or stream.retire_claims != 0) self.cv.wait(&self.mu);
 
             // Drop it from the registry and the ready queue.
             removeHandle(&self.registered, stream);
@@ -293,8 +313,8 @@ pub const DecodeScheduler = struct {
     }
 
     // Run `func(ctx, backend)` under the stream's busy claim, excluding workers.
-    // Used for main-thread audio pumping. `func` must not call back into the
-    // scheduler for this stream. No-op if the stream is dead.
+    // Used for explicit serialized backend operations (e.g. track selection).
+    // `func` must not call back into this stream. No-op if the stream is dead.
     pub fn withBackend(
         self: *DecodeScheduler,
         stream: StreamHandle,
@@ -318,6 +338,27 @@ pub const DecodeScheduler = struct {
         self.finishClaim(stream);
     }
 
+    // Nonblocking counterpart for per-tick audio delivery. A busy video decoder
+    // must not turn the first update after an async rewind into a blocking wait.
+    // False means no callback ran; buffered audio can still be delivered.
+    pub fn tryWithBackend(
+        self: *DecodeScheduler,
+        stream: StreamHandle,
+        ctx: anytype,
+        comptime func: fn (@TypeOf(ctx), *Backend) void,
+    ) bool {
+        self.mu.lock();
+        if (stream.busy or stream.seeking or stream.seek_failed or stream.dead.load(.monotonic) or stream.backend == null) {
+            self.mu.unlock();
+            return false;
+        }
+        self.claimLocked(stream);
+        self.mu.unlock();
+        func(ctx, &stream.backend.?);
+        self.finishClaim(stream);
+        return true;
+    }
+
     // Peek the PTS of the head / second decode-ahead frame WITHOUT removing it
     // (consumer/main-thread only). Returns null when fewer than one / two frames
     // are buffered.
@@ -335,31 +376,56 @@ pub const DecodeScheduler = struct {
         return null;
     }
 
-    // Ask the scheduler to flush the stream's queue and reseek the Backend to
-    // `pts_seconds` before resuming decode-ahead. Blocks until any in-flight
-    // slice completes so the reseek does not race a worker. (The scrub seam.)
+    // Consumer-thread-only: invalidate old frames and queue the latest seek.
+    // Never wait for Backend.seek()/decode or a busy claim. The active worker
+    // discards any superseded result and yields to the new request. Only the
+    // consumer pops; workers serialize publication against this bounded flush.
+    // Debug force-synchronous mode deliberately still decodes inline.
     pub fn requestSeek(self: *DecodeScheduler, stream: StreamHandle, pts_seconds: f64) void {
-        {
-            self.mu.lock();
-            // Wait for the active slice, then claim busy before unlocking.
-            // Otherwise a ready worker could seek and push during the flush,
-            // corrupting the queue.
-            while (stream.busy) self.cv.wait(&self.mu);
-            stream.seek_pending = true;
-            stream.seek_target = @max(pts_seconds, 0.0);
-            stream.eos = false;
-            if (stream.dead.load(.monotonic)) {
-                self.mu.unlock();
-                return; // torn down concurrently; nothing to flush/resume.
-            }
-            self.claimLocked(stream); // exclude workers for the duration of the flush
-            stream.wants_more = true;
+        var retired: [DecodeAheadQueue.usable_capacity]VideoFrame = undefined;
+        var retired_count: usize = 0;
+        self.mu.lock();
+        if (stream.dead.load(.monotonic)) {
             self.mu.unlock();
+            return;
         }
-        // Flush queued frames on the consumer side (single-consumer: the caller).
-        // We hold busy, so no worker is producing concurrently.
-        while (stream.queue.pop()) |f| f.release();
-        self.finishClaim(stream);
+        stream.seek_generation +%= 1;
+        stream.seek_pending = true;
+        stream.seek_target = @max(pts_seconds, 0.0);
+        stream.seeking = true;
+        stream.seek_failed = false;
+        stream.eos = false;
+        stream.wants_more = true;
+        while (stream.queue.pop()) |f| {
+            // Bounded by the ring's usable depth; never let a full queue
+            // overrun the drain buffer.
+            std.debug.assert(retired_count < retired.len);
+            retired[retired_count] = f;
+            retired_count += 1;
+        }
+        if (retired_count != 0) stream.retire_claims += 1;
+        const wake = if (self.synchronous) false else self.enqueueLocked(stream);
+        self.mu.unlock();
+        if (wake) self.cv.signal();
+
+        // Release hooks may touch platform resources; never run them with the
+        // pool mutex held. A retire claim keeps their backend state alive.
+        for (retired[0..retired_count]) |f| f.release();
+        if (retired_count != 0) {
+            self.mu.lock();
+            stream.retire_claims -= 1;
+            self.mu.unlock();
+            self.cv.broadcast();
+        }
+        if (self.synchronous) self.notify(stream);
+    }
+
+    /// One lock for both seek flags, so the per-tick gate cannot read `seeking`
+    /// from one generation and `failed` from the next.
+    pub fn seekState(self: *DecodeScheduler, stream: StreamHandle) SeekState {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return .{ .seeking = stream.seeking, .failed = stream.seek_failed };
     }
 
     // Resolve a seek synchronously under the stream's busy claim. Flush the
@@ -377,7 +443,10 @@ pub const DecodeScheduler = struct {
                 return .stream_unavailable;
             }
             // We seek right here, so any older pending seek is superseded.
+            stream.seek_generation +%= 1;
             stream.seek_pending = false;
+            stream.seeking = false;
+            stream.seek_failed = false;
             stream.eos = false;
             self.claimLocked(stream); // exclude workers while we own the stream
             stream.wants_more = true;
@@ -462,7 +531,7 @@ pub const DecodeScheduler = struct {
         }
     }
 
-    // Claim the per-stream busy guard from a NON-worker thread (requestSeek /
+    // Claim the per-stream busy guard from a NON-worker thread (seekExact /
     // withBackend). Requires mu held and busy == false. Also dequeues the stream
     // from ready so no worker can claim it concurrently; a queued work demand is
     // folded back into wants_more.
@@ -504,8 +573,7 @@ pub const DecodeScheduler = struct {
         if (self.synchronous) {
             // Synchronous mode: pump inline on the caller's thread. Claim busy so
             // the contract (single producer per stream) is honoured even though
-            // there is no worker — requestSeek/unregister still wait on busy
-            // correctly.
+            // there is no worker. Exclusive leases/teardown still honor busy.
             {
                 self.mu.lock();
                 if (stream.dead.load(.monotonic) or stream.busy or !stream.wants_more) {
@@ -603,8 +671,8 @@ pub const DecodeScheduler = struct {
                 _ = self.enqueueLocked(stream);
                 self.mu.unlock();
             }
-            // Wake unregister/requestSeek waiters (busy just dropped) and, if we
-            // requeued, a worker to pick the stream up.
+            // Wake exclusive-lease/teardown waiters (busy just dropped) and,
+            // if we requeued, a worker to pick the stream up.
             self.cv.broadcast();
         }
     }
@@ -616,45 +684,72 @@ pub const DecodeScheduler = struct {
     fn pumpStream(self: *DecodeScheduler, stream: StreamHandle) void {
         const backend_ptr = if (stream.backend) |*b| b else return;
 
-        // Apply any pending seek before decoding (the scrub seam).
-        var do_seek = false;
-        var seek_target: f64 = 0.0;
-        {
+        // Snapshot the request under mu, but never hold mu over backend work.
+        // A newer request may arrive during either seek or decode.
+        self.mu.lock();
+        const generation = stream.seek_generation;
+        const do_seek = stream.seek_pending;
+        const seek_target = stream.seek_target;
+        stream.seek_pending = false;
+        self.mu.unlock();
+        if (do_seek) {
+            const ok = backend_ptr.seek(seek_target);
             self.mu.lock();
-            if (stream.seek_pending) {
-                do_seek = true;
-                seek_target = stream.seek_target;
-                stream.seek_pending = false;
+            if (stream.dead.load(.monotonic) or generation != stream.seek_generation) {
+                self.mu.unlock();
+                return;
+            }
+            stream.last_enqueued_pts = null;
+            if (!ok) {
+                // Do not publish frames from the old backend position on a
+                // failed async seek. Exact nonzero seeks report richer outcomes
+                // through seekExact(); this path terminates delivery instead.
+                stream.seeking = false;
+                stream.seek_failed = true;
+                stream.eos = true;
+                stream.wants_more = false;
+                self.mu.unlock();
+                log.warn("async seek to {d:.3}s failed", .{seek_target});
+                return;
             }
             self.mu.unlock();
         }
+
         if (do_seek) {
-            _ = backend_ptr.seek(seek_target);
-            self.mu.lock();
-            stream.eos = false;
-            self.mu.unlock();
-            // PTS legitimately jumps across a seek — reset the monotonicity
-            // baseline so the new position does not trip the guard.
-            stream.last_enqueued_pts = null;
+            // requestSeek's flush runs under this same mutex, so a requested seek
+            // always starts from an empty queue. A full queue here would skip the
+            // loop below and leave `seeking` latched forever -- a permanent
+            // freeze, not a hitch. A full queue on a plain refill slice is fine
+            // (the loop just does nothing), so only the seek case is checked.
+            std.debug.assert(!stream.queue.full());
         }
 
-        // Decode-ahead: fill the queue until full or EOS. We re-check dead each
-        // iteration so a concurrent unregister cuts the slice short promptly.
+        // A short publication lock orders each result against requestSeek's
+        // generation change + flush. Decoding and release hooks stay outside
+        // the mutex; an obsolete slice stops after at most its in-flight call.
         while (!stream.queue.full()) {
-            // Lock-free hot-path read of the write-once dead flag (acquire pairs
-            // with the release store in unregisterStream). No mu per frame.
-            if (stream.dead.load(.acquire)) return;
+            self.mu.lock();
+            const obsolete = stream.dead.load(.monotonic) or generation != stream.seek_generation;
+            self.mu.unlock();
+            if (obsolete) return;
             const f = backend_ptr.nextVideoFrame();
+            self.mu.lock();
+            if (stream.dead.load(.monotonic) or generation != stream.seek_generation) {
+                self.mu.unlock();
+                if (f) |frame| frame.release();
+                return;
+            }
             if (f == null) {
-                self.mu.lock();
                 stream.eos = true;
+                stream.seeking = false;
                 self.mu.unlock();
                 return;
             }
             checkEnqueueMonotonic(stream, f.?.pts_seconds);
-            if (!stream.queue.push(f.?)) {
-                // Lost a race against capacity (should not happen with one
-                // producer); release the frame to stay leak-safe and stop.
+            const pushed = stream.queue.push(f.?);
+            stream.seeking = false;
+            self.mu.unlock();
+            if (!pushed) {
                 f.?.release();
                 return;
             }

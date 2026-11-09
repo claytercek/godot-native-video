@@ -43,6 +43,19 @@ const StreamHandle = decode_scheduler.StreamHandle;
 
 pub const MixSink = audio_delivery.MixSink;
 
+// A seek that has not delivered its first frame after this long is treated as
+// stalled rather than merely slow: the controller stops delivery and warns
+// instead of holding a frozen image forever with no diagnostic. Generous enough
+// that a slow GOP decode or a busy worker pool never trips it.
+const kSeekStallLimitMs: f64 = 5000.0;
+
+// Consecutive ticks that could not claim the backend for audio before the fill
+// falls back to a blocking claim (see fillAudio).
+const kAudioFillMissLimit: u32 = 4;
+
+// The audio ring counts as low below this fraction of its capacity (1/N).
+const kAudioLowWaterDivisor: usize = 4;
+
 // -----------------------------------------------------------------------
 // PlaybackController — Godot-free per-stream playback state machine.
 // -----------------------------------------------------------------------
@@ -77,6 +90,15 @@ pub const PlaybackController = struct {
     loaded: bool = false,
     playing: bool = false,
     paused: bool = false,
+    // stop() already queued (or decoded) the start. Repeated stop() and the
+    // following play() reuse it rather than rebuilding the decoder again.
+    rewind_prepared: bool = false,
+    // Wall time the in-flight asynchronous seek was first observed by tick()/
+    // pollPausedPreview(); null when not seeking. Drives the stall watchdog.
+    seek_stall_since_ms: ?f64 = null,
+    // Consecutive render ticks that could not claim the backend for audio
+    // (a video decode slice held it). Drives the low-ring fallback in fillAudio.
+    audio_fill_misses: u32 = 0,
     // A successful paused seek owes exactly one preview. A later seek flushes
     // the scheduler queue before rearming this flag, so callbacks never retain
     // frames or targets from an older seek generation.
@@ -87,7 +109,10 @@ pub const PlaybackController = struct {
     has_audio: bool = false, // clip carries an audio track -> audio is master
     audio_track_count: i32 = 0, // cached from the backend at load time
     length: f64 = 0.0,
-    position: f64 = 0.0, // PTS of the most recently presented frame
+    // PTS of the most recently presented frame. A seek re-anchors it to the
+    // requested target immediately, so during an asynchronous rewind it leads
+    // the image that is still on screen.
+    position: f64 = 0.0,
 
     width: i32 = 0,
     height: i32 = 0,
@@ -231,6 +256,9 @@ pub const PlaybackController = struct {
         }
 
         self.loaded = true;
+        self.rewind_prepared = false;
+        self.seek_stall_since_ms = null;
+        self.audio_fill_misses = 0;
         self.preview_pending = false;
         self.position = 0.0;
         self.audio_eos = false;
@@ -263,11 +291,16 @@ pub const PlaybackController = struct {
         self.paused = false;
         self.preview_pending = false;
         if (self.master()) |c| c.setPaused(false);
-        // Resuming after a scrub: force an exact resolve at the last scrub target
-        // so play starts from the precise frame, not an approximate keyframe one.
+        // Nonzero scrub targets still resolve precisely. Starting at zero
+        // needs no forward-decode resolve and runs on the worker instead.
+        // stop() has already prepared that rewind; do not invalidate it again.
+        // A prepared rewind that already failed stays latched in the scheduler,
+        // so reusing it would leave play() a no-op forever -- resolve instead.
         if (!was_playing and self.stream != null) {
-            self.applyScrubResolve(self.scrubber.onResume(now));
+            const reuse = self.rewind_prepared and !self.sched.seekState(self.stream.?).failed;
+            if (!reuse) self.applyScrubResolve(self.scrubber.onResume(now));
         }
+        self.rewind_prepared = false;
     }
 
     pub fn stop(self: *PlaybackController) void {
@@ -280,8 +313,13 @@ pub const PlaybackController = struct {
         if (self.master()) |c| c.setTime(0.0);
         if (self.audio_ring) |*r| r.clear();
         self.beginSinkGeneration();
-        // Flush + reseek to start (serialized against the worker).
-        if (self.stream) |s| self.sched.requestSeek(s, 0.0);
+        // Invalidate old delivery immediately, without waiting for a decoder.
+        if (self.stream) |s| {
+            if (!self.rewind_prepared) self.sched.requestSeek(s, 0.0);
+            self.rewind_prepared = true;
+            self.seek_stall_since_ms = null; // the prepared rewind gets a fresh window
+        }
+        self.audio_fill_misses = 0;
         self.scrubber = Scrubber.init(self.scrubber.config); // no stale velocity/settle
         // Track selection persists across stop (desired_/live_track are NOT
         // reset here). Cancel any half-complete switch: end the handoff and
@@ -361,6 +399,7 @@ pub const PlaybackController = struct {
     pub fn pollPausedPreview(self: *PlaybackController, now: WallClockMs) ?VideoFrame {
         if (!self.needsPausedPreview()) return null;
         self.settleScrub(now);
+        if (self.seekBlocksDelivery(now)) return null;
         self.reconcileAudioTrack();
         if (!self.preview_pending) return null;
         const stream = self.stream.?;
@@ -385,6 +424,11 @@ pub const PlaybackController = struct {
         // Settle check runs regardless of play/pause: scrubbing commonly happens
         // while paused (dragging a timeline).
         self.settleScrub(now);
+
+        // A rewind may take several render frames. Hold the old image and the
+        // new clock anchor until the worker has delivered a new frame/EOS.
+        // In particular, do not wait for that worker via audio/track access.
+        if (self.seekBlocksDelivery(now)) return null;
 
         // Reconcile any pending track switch. Runs even while paused so a switch
         // requested mid-pause (or during a scrub) is picked up promptly.
@@ -483,6 +527,7 @@ pub const PlaybackController = struct {
             // observes both conditions true (tick() no-ops until play()).
             self.audio_telemetry.reportFinal(now, media_now);
             self.playing = false;
+            self.rewind_prepared = false;
             // Godot loops by calling play() alone. The completed run's scrub
             // target must not become its loop start; a new seek after EOS can
             // still establish an intentional target before the next play().
@@ -499,6 +544,47 @@ pub const PlaybackController = struct {
         return null;
     }
 
+    /// True while an asynchronous seek must hold the current image and clock:
+    /// the seek is still in flight, or it failed (which stops delivery for good
+    /// until the next seek). Also arms and trips the stall watchdog.
+    fn seekBlocksDelivery(self: *PlaybackController, now: WallClockMs) bool {
+        const async_seek = self.sched.seekState(self.stream.?);
+        if (async_seek.seeking) {
+            self.noteSeekStall(now);
+            return true;
+        }
+        self.seek_stall_since_ms = null;
+        if (!async_seek.failed) return false;
+        self.abandonForSeek("Asynchronous seek failed; playback was stopped.", .{});
+        return true;
+    }
+
+    /// Abandon delivery after a fatal asynchronous-seek condition, warning once
+    /// with `fmt`. Shared by the failure and the stall paths so neither can
+    /// resume delivering from a stream whose position is unknown.
+    fn abandonForSeek(self: *PlaybackController, comptime fmt: []const u8, args: anytype) void {
+        if (self.playing or self.preview_pending) self.warnFmt(fmt, args);
+        self.playing = false;
+        self.preview_pending = false;
+        self.scrubber.settle_pending = false;
+        self.audio_eos = true;
+    }
+
+    /// Bound a seek that never completes. Without this the controller holds the
+    /// image and clock forever with no diagnostic; the synchronous path at least
+    /// presented as a hang on the calling thread.
+    fn noteSeekStall(self: *PlaybackController, now: WallClockMs) void {
+        const since = self.seek_stall_since_ms orelse {
+            self.seek_stall_since_ms = now.ms;
+            return;
+        };
+        if (now.ms - since < kSeekStallLimitMs) return;
+        self.abandonForSeek(
+            "Asynchronous seek did not complete within {d:.0}s; playback was stopped.",
+            .{kSeekStallLimitMs / 1000.0},
+        );
+    }
+
     fn audioExhausted(self: *PlaybackController) bool {
         // True when no real audio samples will ever advance the clock again:
         // silent clips, and a shorter audio track once it has fully drained.
@@ -511,9 +597,25 @@ pub const PlaybackController = struct {
 
     fn fillAudio(self: *PlaybackController) void {
         if (self.stream == null or self.audio_ring == null or self.audio_eos) return;
-        // Pump under the scheduler's per-stream exclusion so we never race the
-        // worker decoding video ahead on the same Backend.
+        // Never wait for a video decode batch on the render thread. If its
+        // claim is busy, deliver buffered PCM and retry filling on a later tick.
+        if (self.sched.tryWithBackend(self.stream.?, self, fillAudioClosure)) {
+            self.audio_fill_misses = 0;
+            return;
+        }
+        self.audio_fill_misses +|= 1;
+        // A single miss is harmless: a completed fill leaves ~half the ring
+        // buffered. Sustained contention with a ring that has drained low is
+        // not -- an audible gap, and on an audio-master clip a stalled clock.
+        // One bounded wait is the lesser evil at that point.
+        if (self.audio_fill_misses < kAudioFillMissLimit or !self.audioRingLow()) return;
+        self.audio_fill_misses = 0;
         self.sched.withBackend(self.stream.?, self, fillAudioClosure);
+    }
+
+    fn audioRingLow(self: *const PlaybackController) bool {
+        const ring = &self.audio_ring.?;
+        return ring.availableFrames() * kAudioLowWaterDivisor < ring.frameCapacity();
     }
 
     // Once per load, compare delivered PCM with the declared canonical format.
@@ -626,6 +728,9 @@ pub const PlaybackController = struct {
         const c = self.master() orelse return;
         if (self.stream == null) return;
         const target = @max(resolve.target_seconds, 0.0);
+        self.rewind_prepared = false;
+        self.seek_stall_since_ms = null; // a new seek gets a fresh stall window
+        self.audio_fill_misses = 0;
 
         if (self.audio_ring) |*r| r.clear(); // stale audio must not play after a (re)seek
         // A seek begins a new delivery generation, so re-measure sink depth.
@@ -633,11 +738,11 @@ pub const PlaybackController = struct {
         const sched = self.sched;
         var resolved_target = target;
 
-        if (resolve.mode == .exact) {
-            // Settle/resume wants the precise frame: seek and decode forward
-            // to the target synchronously on this thread (serialized against
-            // the workers inside the scheduler). Precision over latency —
-            // this never runs on the hot per-frame path.
+        if (resolve.mode == .exact and target > 0.0) {
+            // Nonzero exact targets need forward decoding from the preceding
+            // keyframe. Keep precise scrub-settle behavior for these targets.
+            // Zero is already the beginning: let normal worker decode deliver
+            // its first frame rather than blocking play()/loop/seek(0).
             const eps = 1.0 / 120.0; // ~half a frame at 60fps tolerance
             const outcome = sched.seekExact(self.stream.?, target, eps);
             switch (outcome) {
@@ -652,8 +757,8 @@ pub const PlaybackController = struct {
                 },
             }
         } else {
-            // Keyframe scrub: flush and reseek to the preceding keyframe;
-            // whatever the backend yields first is the fast approximate frame.
+            // Keyframe scrub or rewind: queue the seek without waiting for
+            // in-flight decode. The first new frame arrives asynchronously.
             sched.requestSeek(self.stream.?, target);
         }
 
@@ -664,7 +769,7 @@ pub const PlaybackController = struct {
 
         // Reconcile any pending track switch at the resolved position (position
         // == target here) so a new selection is primed at the correct spot.
-        self.reconcileAudioTrack();
+        if (!sched.seekState(self.stream.?).seeking) self.reconcileAudioTrack();
     }
 
     // Range-check a requested audio-track index against the clip's track count,
@@ -687,8 +792,9 @@ pub const PlaybackController = struct {
 
         if (!self.playing) {
             // Stopped / pre-play: cheap apply. Deferred in the backend until its
-            // next seek — which play()'s scrub-resume resolve always issues first.
+            // next seek; invalidate any prepared rewind so play() applies it.
             sched.withBackend(self.stream.?, self, applyDesiredTrack);
+            self.rewind_prepared = false;
             self.live_track = self.desired_track;
             return;
         }
