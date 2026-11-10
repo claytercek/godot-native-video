@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 RUNNER = Path(__file__).with_name("run_smoke.py")
-PROBE = "ERROR: Attempt to get non-existent interface function: 'classdb_construct_object3'."
+INTERFACE_ERROR = "ERROR: Attempt to get non-existent interface function: 'classdb_construct_object3'."
 
 
 @unittest.skipIf(os.name == "nt", "fake engine uses a POSIX executable script")
@@ -78,9 +78,8 @@ sys.exit(int(os.environ.get("TEST_STATUS", "0")))
             with self.subTest(error=error):
                 self.run_smoke(expected=1, TEST_MESSAGE="SMOKE: PASS\n" + error)
 
-    def test_reuses_exact_46_probe_allowlist(self):
-        self.run_smoke(TEST_VERSION="4.6.3", TEST_MESSAGE=PROBE + "\nSMOKE: PASS")
-        self.run_smoke(expected=1, TEST_MESSAGE=PROBE + "\nSMOKE: PASS")
+    def test_rejects_interface_probe_on_46(self):
+        self.run_smoke(expected=1, TEST_VERSION="4.6.3", TEST_MESSAGE=INTERFACE_ERROR + "\nSMOKE: PASS")
 
     def test_rejects_headless_or_compatibility_banner_even_with_pass(self):
         for banner in ("", "OpenGL API 4.5 - Compatibility - Using Device: llvmpipe",

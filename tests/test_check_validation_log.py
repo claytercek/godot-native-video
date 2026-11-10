@@ -36,12 +36,12 @@ class ValidationLogTests(unittest.TestCase):
             result = subprocess.run(command, text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
-    def test_accepts_each_exact_known_46_probe(self):
+    def test_rejects_46_interface_probe(self):
         for probe in PROBES:
             with self.subTest(probe=probe):
-                self.check_log([diagnostic(probe)], 0)
+                self.check_log([diagnostic(probe)], 1)
 
-    def test_rejects_script_assertion_ending_in_known_probe(self):
+    def test_rejects_script_assertion_ending_in_probe(self):
         self.check_log([
             "SCRIPT ERROR: Assertion failed: Attempt to get non-existent interface function: classdb_construct_object3."
         ], 1)
@@ -57,10 +57,10 @@ class ValidationLogTests(unittest.TestCase):
     def test_rejects_unknown_probe(self):
         self.check_log([diagnostic("unknown_interface")], 1)
 
-    def test_rejects_known_probe_on_47(self):
+    def test_rejects_interface_probe_on_47(self):
         self.check_log([diagnostic(PROBES[0])], 1, version="4.7.2")
 
-    def test_rejects_known_probe_without_engine_version(self):
+    def test_rejects_interface_probe_without_engine_version(self):
         self.check_log([diagnostic(PROBES[0])], 1, version="unknown")
 
     def test_version_mention_is_not_an_engine_header(self):
