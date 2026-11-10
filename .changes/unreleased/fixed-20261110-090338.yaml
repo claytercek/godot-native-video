@@ -1,3 +1,0 @@
-kind: fixed
-body: Update gdzig to 665e8fa, which gates optional GDExtension interfaces by measured engine availability. Godot 4.6 no longer logs `Attempt to get non-existent interface function` for the 4.7-only `variant_get_type_by_name`, `classdb_construct_object3`, and `classdb_register_extension_class6` entries during extension load. Validation now treats any such diagnostic as a failure on every engine version instead of allowlisting it for 4.6.
-time: 2026-11-10T09:03:38.157993-05:00
