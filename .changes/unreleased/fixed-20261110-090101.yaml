@@ -1,4 +1,4 @@
-kind: Fixed
+kind: fixed
 body: >
   Avoid main-thread decoder waits when starting or looping a video, seeking back
   to zero, or stopping repeatedly. Rewinds now decode asynchronously, holding the
@@ -7,3 +7,4 @@ body: >
   yield to an in-flight video decode instead of stalling the render thread, and a
   seek that never completes now warns and stops playback rather than freezing the
   image silently.
+time: 2026-11-10T09:01:01.926767-05:00
