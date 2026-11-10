@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1](https://github.com/claytercek/godot-native-video/compare/v0.4.0...v0.4.1) (2026-11-10)
+
+### Fixed
+* Avoid main-thread decoder waits when starting or looping a video, seeking back to zero, or stopping repeatedly. Rewinds now decode asynchronously, holding the current image and playback clock until the first new frame is ready. Nonzero frame-accurate seeks retain their existing synchronous behavior. Audio top-ups yield to an in-flight video decode instead of stalling the render thread, and a seek that never completes now warns and stops playback rather than freezing the image silently.
+* Update gdzig to 665e8fa, which gates optional GDExtension interfaces by measured engine availability. Godot 4.6 no longer logs `Attempt to get non-existent interface function` for the 4.7-only `variant_get_type_by_name`, `classdb_construct_object3`, and `classdb_register_extension_class6` entries during extension load. Validation now treats any such diagnostic as a failure on every engine version instead of allowlisting it for 4.6.
+
 ## [0.4.0](https://github.com/claytercek/godot-native-video/compare/v0.3.1...v0.4.0) (2026-10-21)
 
 ### Added
