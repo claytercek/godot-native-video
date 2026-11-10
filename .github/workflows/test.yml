@@ -32,8 +32,9 @@ jobs:
     defaults:
       run:
         shell: bash
-    # Bindings target 4.7; the rendered smoke also enforces the 4.6 floor.
-    # Native tests do not run Godot, so run them only on the primary version.
+    # Bindings target 4.7; rendered smoke also runs on the 4.6 floor and
+    # rejects every engine error. Native tests do not run Godot, so run them
+    # only on the primary version.
     strategy:
       fail-fast: false
       matrix:

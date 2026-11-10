@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject engine errors even when Godot exits zero; allow only known 4.6 probes."""
+"""Reject engine errors even when Godot exits zero."""
 import argparse
 import pathlib
 import re
@@ -11,19 +11,8 @@ parser.add_argument("--marker", required=True)
 parser.add_argument("--physical", action="store_true")
 args = parser.parse_args()
 text = args.log.read_text(errors="replace")
-is_46 = re.search(r"^Godot Engine v4\.6\.", text, re.M) is not None
-known_46 = {
-    f"ERROR: Attempt to get non-existent interface function: '{name}'."
-    for name in (
-        "variant_get_type_by_name",
-        "classdb_construct_object3",
-        "classdb_register_extension_class6",
-    )
-}
 errors = []
 for line in text.splitlines():
-    if is_46 and line in known_46:
-        continue
     if re.search(r"(^|\s)(ERROR:|SCRIPT ERROR:|USER ERROR:|error(?:\([^)]*\))?:|panic:)", line, re.I):
         errors.append(line)
     elif re.search(r"undefined symbol|error loading extension|failed to load.*(?:gdextension|libnative_video)|leaked at exit|memory address .* leaked|ObjectDB instances leaked|Segmentation fault", line, re.I):

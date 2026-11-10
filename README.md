@@ -134,12 +134,6 @@ hardware decoding but adds a readback before presentation. See
   certify OS/compositor HDR signaling or HDR display output.
 - Windows HEVC needs a registered decoder MFT, typically the "HEVC Video
   Extensions" package. Some Windows installations lack one.
-- Godot 4.6 logs `Attempt to get non-existent interface function` for
-  `variant_get_type_by_name`, `classdb_construct_object3`, and
-  `classdb_register_extension_class6`. gdzig's bindings use Godot 4.7's API
-  description and probe these 4.7-only functions at load. On 4.6, gdzig uses
-  older entry points without calling them; playback is unaffected. No API
-  hash used by the extension changed between 4.6 and 4.7, and CI tests both.
 - Prebuilt libraries require standard single-precision Godot. They won't
   load into a double-precision (`precision=double`) build because core type
   layouts differ. Build from source with `-Dprecision=double`; see
@@ -257,8 +251,7 @@ sample rate; switching to a track with a different rate is refused.
    This builds and installs the extension, then runs `tests/run_smoke.py`
    with the resolved Godot and writes `zig-out/smoke.log`. Unlike
    `zig build run -- --smoke`, it requires completion within 75 seconds, an
-   exact PASS line, a Forward+ device banner, and no engine errors except
-   the known Godot 4.6 probes.
+   exact PASS line, a Forward+ device banner, and no engine errors.
 
    Smoke uses dummy audio on every OS, Vulkan on Linux, D3D12 on Windows,
    and the default rendering driver on macOS. It needs a display and a
