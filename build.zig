@@ -34,7 +34,8 @@ pub fn build(b: *Build) !void {
 
     const validation_mod = b.createModule(.{
         .root_source_file = b.path("tools/validation_runner.zig"),
-        .target = b.graph.host,
+        // CI runs this executable on other hosts of the same OS and architecture.
+        .target = b.resolveTargetQuery(.{ .cpu_model = .baseline }),
         .optimize = .fast,
     });
     const validation_exe = b.addExecutable(.{ .name = "validation-runner", .root_module = validation_mod });
