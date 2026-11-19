@@ -15,6 +15,11 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      linux_extended:
+        description: Run GStreamer and additional rendered regressions
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,13 +45,18 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-22.04, windows-latest]
         godot: ["4.7.2", "4.6.3"]
+    env:
+      PRIMARY_LINUX: ${{ matrix.os == 'ubuntu-22.04' && matrix.godot == '4.7.2' }}
+      LINUX_EXTENDED: ${{ matrix.os == 'ubuntu-22.04' && matrix.godot == '4.7.2' && inputs.linux_extended }}
+      DECODE_FIXTURES: ${{ github.workspace }}/tests/fixtures/decode
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Setup Zig
-        if: matrix.godot == '4.7.2'
         uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
@@ -58,24 +68,17 @@ jobs:
           version: ${{ matrix.godot }}
           use-dotnet: false
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
       - name: Record versions
         run: |
           mkdir -p ci-logs
-          {
-            if command -v zig >/dev/null 2>&1; then zig version; else echo 'Zig not installed (rendered smoke only)'; fi
-            godot --version
-            python --version
-          } 2>&1 | tee ci-logs/versions.log
+          godot=$(command -v godot)
+          if [[ "$RUNNER_OS" == Windows ]]; then godot=$(cygpath -am "$godot"); fi
+          printf 'GODOT_PATH=%s\n' "$godot" >> "$GITHUB_ENV"
+          { zig version; "$godot" --version; } 2>&1 | tee ci-logs/versions.log
 
-      - name: Test Python validation harnesses
-        if: runner.os == 'Linux' && matrix.godot == '4.7.2'
+      - name: Install host validation runner
         timeout-minutes: 3
-        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p 'test_*.py' -v 2>&1 | tee ci-logs/smoke-runner-tests.log
+        run: zig build validation-runner 2>&1 | tee ci-logs/validation-runner-build.log
 
       - name: Install Linux GStreamer and software Vulkan
         if: runner.os == 'Linux'
@@ -90,7 +93,7 @@ jobs:
           gst-inspect-1.0 avdec_aac > ci-logs/aac-decoder.log
 
       - name: Install Linux GStreamer development packages
-        if: runner.os == 'Linux' && matrix.godot == '4.7.2'
+        if: env.PRIMARY_LINUX == 'true'
         run: |
           # Ubuntu runner's LLVM unwinder conflicts with libunwind-dev.
           sudo apt-get remove -y libunwind-14-dev
@@ -105,8 +108,6 @@ jobs:
           name: native-video-${{ runner.os == 'macOS' && 'macos' || runner.os == 'Windows' && 'windows' || 'linux' }}
           path: staging
 
-      # Runtime coverage remains fast/release only. Native tests and decode
-      # smoke build their own harnesses without installing the extension.
       - name: Install release extension
         run: |
           mkdir -p project/lib
@@ -123,11 +124,11 @@ jobs:
           ldd -r project/lib/libnative_video.so 2>&1 | tee ci-logs/ldd.log
           if grep -E 'undefined symbol|not found' ci-logs/ldd.log; then exit 1; fi
 
-      # One short synthetic pixel/progress smoke on every OS/version, not the
-      # extended fixture suite. No headless or Compatibility rendering fallback.
       - name: Rendered Godot smoke
-        timeout-minutes: 2
+        timeout-minutes: ${{ env.LINUX_EXTENDED == 'true' && 10 || 4 }}
         run: |
+          runner=zig-out/bin/validation-runner
+          prefix=(); display=()
           case "$RUNNER_OS" in
             Linux)
               export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json
@@ -135,84 +136,53 @@ jobs:
               test -f "$VK_DRIVER_FILES"
               export XDG_RUNTIME_DIR="$RUNNER_TEMP/native-video-runtime"
               mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
-              prefix=(xvfb-run -a -e ci-logs/xvfb.log -s '-screen 0 640x480x24 -nolisten tcp')
+              # The runner's 75s deadline can't reach xvfb-run or Xvfb, its parents.
+              prefix=(timeout --kill-after=5 85 xvfb-run -a -e ci-logs/xvfb.log -s '-screen 0 640x480x24 -nolisten tcp')
               driver=vulkan
               display=(--display-driver x11)
               ;;
-            macOS)
-              prefix=(); driver=default; display=()
-              ;;
-            Windows)
-              # DXGI may expose a software adapter. Do not presume a GPU or
-              # invent a force-WARP switch: this required smoke verifies CI.
-              prefix=(); driver=d3d12; display=()
-              ;;
+            macOS) driver=default ;;
+            Windows) runner+=.exe; driver=d3d12 ;;
           esac
-          "${prefix[@]}" python tests/run_smoke.py --driver "$driver" \
-            --log ci-logs/smoke.log -- "${display[@]}"
-
-      # Gyan's static essentials build includes ffprobe and libx264. Pin the
-      # release and archive SHA-256 rather than using a moving package feed.
-      - name: Cache Windows FFmpeg
-        if: runner.os == 'Windows' && matrix.godot == '4.7.2'
-        id: ffmpeg-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.tool_cache }}/ffmpeg-7.1.1-essentials_build
-          key: ffmpeg-Windows-X64-7.1.1-essentials-04861d3339c5ebe38b56c19a15cf2c0cc97f5de4fa8910e4d47e5e6404e4a2d4
-
-      - name: Download Windows FFmpeg
-        if: runner.os == 'Windows' && matrix.godot == '4.7.2' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $archive = Join-Path $env:RUNNER_TEMP 'ffmpeg-7.1.1-essentials_build.zip'
-          Invoke-WebRequest -Uri 'https://github.com/GyanD/codexffmpeg/releases/download/7.1.1/ffmpeg-7.1.1-essentials_build.zip' -OutFile $archive
-          $expected = '04861d3339c5ebe38b56c19a15cf2c0cc97f5de4fa8910e4d47e5e6404e4a2d4'
-          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
-            throw 'FFmpeg archive SHA-256 mismatch'
+          run_rendered() {
+            local name=$1 marker=$2; shift 2
+            local log="ci-logs/$name.log"
+            if ! "${prefix[@]}" "$runner" --godot "$GODOT_PATH" --project project --driver "$driver" \
+                --log "$log" --marker "$marker" -- "${display[@]}" "$@"; then
+              if [[ -f "$log" ]]; then tail -60 "$log" >&2; fi
+              return 1
+            fi
           }
-          Expand-Archive -Path $archive -DestinationPath $env:RUNNER_TOOL_CACHE -Force
-
-      - name: Setup Windows FFmpeg PATH and verify tools
-        if: runner.os == 'Windows' && matrix.godot == '4.7.2'
-        shell: pwsh
-        run: |
-          $bin = Join-Path $env:RUNNER_TOOL_CACHE 'ffmpeg-7.1.1-essentials_build/bin'
-          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$bin/ffmpeg.exe" -version 2>&1 | Tee-Object -FilePath ci-logs/ffmpeg.log
-          if ($LASTEXITCODE -ne 0) { throw 'ffmpeg version check failed' }
-          & "$bin/ffprobe.exe" -version 2>&1 | Tee-Object -FilePath ci-logs/ffprobe.log
-          if ($LASTEXITCODE -ne 0) { throw 'ffprobe version check failed' }
-          $encoders = & "$bin/ffmpeg.exe" -hide_banner -encoders 2>&1
-          $encoders | Out-File -FilePath ci-logs/ffmpeg-encoders.log -Encoding utf8
-          if ($LASTEXITCODE -ne 0 -or -not ($encoders -match '\blibx264\b')) {
-            throw 'FFmpeg libx264 encoder is required for fixtures'
+          transport() {
+            run_rendered "transport-$1" LINUX_TRANSPORT_PASS --script res://linux_transport_test.gd -- \
+              --file="$DECODE_FIXTURES/$2" --expect-audio="$3"
           }
-
-      - name: Generate mandatory Windows native-test fixtures
-        if: runner.os == 'Windows' && matrix.godot == '4.7.2'
-        timeout-minutes: 3
-        run: |
-          bash tools/gen_stress_media.sh --duration 3 2>&1 | tee ci-logs/fixtures.log
-          cp tests/fixtures/stress/bframes.mp4 project/bframes.mp4
-          test -s project/bframes.mp4
-          test -s tests/fixtures/stress/nonmod16_854x480.mp4
+          run_rendered smoke 'SMOKE: PASS' -- --smoke
+          if [[ "$PRIMARY_LINUX" == true ]]; then
+            transport av h264-aac.mp4 1
+          fi
+          if [[ "$LINUX_EXTENDED" == true ]]; then
+            run_rendered presentation-epoch PRESENTATION_EPOCH_PASS --script res://presentation_epoch_test.gd -- \
+              --file="$DECODE_FIXTURES/h264-silent.mp4"
+            run_rendered transport-oracles LINUX_TRANSPORT_ORACLES_PASS --script res://linux_transport_oracles_test.gd
+            transport silent h264-silent.mp4 0
+            transport hevc10 hevc-main10-pq.mp4 0
+          fi
 
       - name: Run native tests (primary Godot only)
         if: matrix.godot == '4.7.2'
         timeout-minutes: 5
         run: zig build test --summary all --test-timeout 120s 2>&1 | tee ci-logs/native-tests.log
 
-      - name: Decode smoke (primary Godot only)
+      - name: Media fixture tests (primary Godot only)
         if: matrix.godot == '4.7.2'
-        timeout-minutes: 2
-        run: |
-          args=()
-          case "$RUNNER_OS" in
-            Linux) args=(-- project/synthetic.mp4);;
-            Windows) args=(-- project/bframes.mp4);;
-          esac
-          zig build decode-smoke "${args[@]}" 2>&1 | tee ci-logs/decode-smoke.log
+        timeout-minutes: 5
+        run: zig build test-media --summary all --test-timeout 30s 2>&1 | tee ci-logs/media-tests.log
+
+      - name: GStreamer AAC seek and input rejection
+        if: env.LINUX_EXTENDED == 'true'
+        timeout-minutes: 5
+        run: zig build test-gst-extended -Doptimize=debug --summary all --test-timeout 30s 2>&1 | tee ci-logs/gstreamer-regressions.log
 
       - name: Upload diagnostics
         if: always()

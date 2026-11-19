@@ -173,12 +173,8 @@ fn structMatchesAbi(comptime T: type, expected_size: usize, expected_offsets: []
     return true;
 }
 
-/// Panics if the shim's actual struct layout has drifted from the
-/// hand-mirrored `c_*` extern structs above. Cheap — a few dozen integer
-/// compares — but only worth paying somewhere drift is actually exercised:
-/// called unconditionally from decode_smoke.zig (which CI runs on every
-/// build) and from `create()` in debug builds; skipped in the release
-/// extension's hot path.
+/// Panics if the Objective-C shim and the mirrored Zig structs disagree.
+/// Run explicitly in tests because release backends skip the check in `create()`.
 pub fn assertAbi() void {
     var probe: AbiProbe = undefined;
     nv_avf_abi_probe_fill(&probe);

@@ -9,11 +9,8 @@ pub fn main(init: std.process.Init) !void {
     const allocator = gpa.allocator();
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const path = if (args.len >= 2) args[1] else return error.MissingPath;
+    const path = if (args.len >= 2) args[1] else @import("media_paths").synthetic_clip;
 
-    // CI builds this in whatever optimize mode the run uses (often not
-    // Debug), so this is the one place the ABI probe always fires,
-    // independent of build.zig's default_optimize.
     avf.assertAbi();
 
     const backend = try avf.create(allocator);
@@ -44,4 +41,8 @@ pub fn main(init: std.process.Init) !void {
     }
     backend.close();
     std.debug.print("DECODE_SMOKE_PASS\n", .{});
+}
+
+test "AVFoundation shim ABI matches the Zig bindings" {
+    avf.assertAbi();
 }
