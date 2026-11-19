@@ -29,7 +29,6 @@ jobs:
     uses: ./.github/workflows/build.yml
 
   test:
-    # Keep the existing check name for branch-protection rules.
     name: Build & Smoke (${{ matrix.os }}, Godot ${{ matrix.godot }})
     needs: build
     runs-on: ${{ matrix.os }}
@@ -193,3 +192,15 @@ jobs:
             ci-logs/*.log
             ci-logs/*.json
           if-no-files-found: warn
+
+  build-smoke-gate:
+    # Branch protection requires an exact check name, independent of matrix versions.
+    name: Build & Smoke (all)
+    needs: [build, test]
+    if: always() # GitHub accepts skipped checks, so run even if a dependency fails.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require build and smoke tests to pass
+        run: |
+          test "${{ needs.build.result }}" = success
+          test "${{ needs.test.result }}" = success
