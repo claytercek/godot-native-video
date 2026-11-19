@@ -54,9 +54,6 @@ Vulkan import. GStreamer doesn't control the playback clock.
   `-Dgodot-path=/path/to/Godot` or `GODOT_PATH`, or put `godot` on `PATH`.
   gdzig resolves it during build configuration, even for steps that don't
   launch Godot. Released binaries don't need this setup.
-- Python 3 on `PATH` (`python` on Windows, `python3` elsewhere) for
-  `zig build smoke` and local validation tools. The released addon doesn't
-  need Python.
 
 On Ubuntu/Debian, install the Linux runtime dependencies:
 
@@ -185,6 +182,10 @@ sample rate; switching to a track with a different rate is refused.
    Godot executable. Every `zig build` step needs it, including tests;
    bindings come from gdzig's vendored API description, not this executable.
 
+   For the demo and media tests, install [Git LFS](https://git-lfs.com/) and
+   run `git lfs install` before cloning. If you already cloned the repository,
+   run `git lfs pull` after setup to download the videos.
+
    On Linux, install the runtime packages above and the development
    dependencies used by CI:
 
@@ -248,10 +249,11 @@ sample rate; switching to a track with a different rate is refused.
    zig build smoke
    ```
 
-   This builds and installs the extension, then runs `tests/run_smoke.py`
-   with the resolved Godot and writes `zig-out/smoke.log`. Unlike
-   `zig build run -- --smoke`, it requires completion within 75 seconds, an
-   exact PASS line, a Forward+ device banner, and no engine errors.
+   This builds and installs the extension and writes Godot's log to
+   `zig-out/smoke.log`, with raw process output in `smoke.log.stdout.log`
+   and `smoke.log.stderr.log` alongside it. Smoke requires a successful exit
+   within 75 seconds, an exact `SMOKE: PASS` line, a Forward+ device banner,
+   and no errors in any of the logs.
 
    Smoke uses dummy audio on every OS, Vulkan on Linux, D3D12 on Windows,
    and the default rendering driver on macOS. It needs a display and a
@@ -267,63 +269,22 @@ with stock Godot 4.7.2 (primary) and 4.6.3 (supported minimum). The shared
 builds all shipped platforms/architectures in safe/debug and fast/release
 modes once per run.
 
-All OS/version combinations run rendered playback smoke with the
-fast/release artifacts and `project/synthetic.mp4`. CI calls
-`tests/run_smoke.py` directly to test downloaded artifacts without
-rebuilding. Unit/backend tests and standalone decode smoke build their own
-harnesses and run only on the primary version. Windows generates the
-fixtures its native tests need.
+Every OS and Godot version runs rendered smoke against the downloaded
+release extension. On the primary Godot version, each OS runs its native
+tests and decodes the media fixtures. Linux also runs rendered transport.
+Select `linux_extended` in a manual **Test** run for the GStreamer
+regressions and more rendered cases. Linux CI uses software Vulkan under
+Xvfb; it does not verify hardware decoding or HDR display output.
 
-### Developer tools
-
-Generate optional fixtures or run local Linux validation with:
-
-```bash
-bash tools/gen_stress_media.sh --output-dir tests/fixtures/stress --duration 6
-bash tools/gen_linux_validation_media.sh /tmp/native-video-fixtures
-bash tools/run_linux_validation.sh --help
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-Generators need FFmpeg with libx264; Linux fixture generation also needs
-FFprobe and Python 3. The Linux runner's `--help` documents backend and
-rendered modes. It requires GNU `timeout` on `PATH`. Python discovery skips
-the Xvfb startup suite without `timeout`; on macOS, install Homebrew
-`coreutils` and add its commands to `PATH` to run it.
-
-To check an existing build without rebuilding:
+Run the [checked-in media fixtures](tests/fixtures/README.md) against your
+native decoder on macOS, Windows, or Linux:
 
 ```bash
-python3 tests/run_smoke.py --godot /path/to/godot --driver vulkan --log zig-out/smoke.log
+zig build test-media --summary all --test-timeout 30s
 ```
 
-Use `--driver d3d12` on Windows or `--driver default` on macOS. Put display
-setup flags after `--`; use `python` on Windows. The shared log checker is
-`tests/check_validation_log.py <log> --marker <success-marker>`. Its
-`LINUX_VALIDATION_LOG_*` labels remain for existing log consumers.
-
-Linux codec, multitrack, seek, lifecycle, input-rejection, and rendered
-transport regressions are local opt-in checks, not CI jobs. Install the
-build dependencies above, FFmpeg, and Python 3, then run:
-
-```bash
-bash tools/gen_linux_validation_media.sh /tmp/native-video-fixtures
-bash tools/run_linux_validation.sh --fixtures /tmp/native-video-fixtures \
-  --results /tmp/native-video-backend-results --backend-only
-```
-
-For rendered checks with software Vulkan and Xvfb on Ubuntu:
-
-```bash
-GNV_LVP_ICD=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
-  bash tools/run_linux_validation.sh --fixtures /tmp/native-video-fixtures \
-  --results /tmp/native-video-rendered-results --rendered-only --renderer software-xvfb
-```
-
-Install Xvfb and Mesa Vulkan drivers and adjust the ICD path for your
-system. Logs go to the chosen results directory. Software rendering doesn't
-certify hardware decoding or HDR display output. Physical AMD RX Vega tests
-also covered transport and reentrant preview teardown.
+On Linux, run the extra GStreamer checks with
+`zig build test-gst-extended --summary all --test-timeout 30s`.
 
 ## Project layout
 
@@ -338,8 +299,8 @@ also covered transport and reentrant preview teardown.
   `src/mf/win/`, and a standalone `decode_smoke.zig` harness.
 - `src/gst/`: Linux GStreamer backend. A C shim handles discovery and
   independent video/audio readers. Includes retained frame payloads,
-  backend tests, `decode_smoke.zig`, the `linux_decode_regression.zig`
-  acceptance harness, and the `linux_fixture_pts.zig` fixture PTS oracle.
+  backend tests, `decode_smoke.zig`, and the `linux_decode_regression.zig`
+  seek and input-rejection checks.
 - `src/godot/`: [gdzig](https://github.com/gdzig/gdzig) class registration
   (`NativeVideoStream` / `NativeVideoStreamPlayback`), NV12-to-RGB
   presentation, and platform importers. macOS uses Metal; Windows uses
@@ -351,12 +312,8 @@ also covered transport and reentrant preview teardown.
 - `addon/`: release `.gdextension` template; see [Releases](#releases).
   `zig build` uses the separate `project/native_video.gdextension`, which
   points to local output.
-- `tests/`: shared smoke/log runners and Python CLI regression tests.
-  Generated stress media lives in `tests/fixtures/`.
-- `tools/`: media generators and `run_linux_validation.sh`. Keep
-  backend-specific Zig tests and harnesses beside their module in `src/`,
-  shared validation and tests in `tests/`, and one-off packaging checks in
-  release workflows.
+- `tests/`: native media tests and checked-in synthetic fixtures.
+- `tools/`: Zig launcher and log checker for rendered validation.
 
 See [EVALUATION.md](EVALUATION.md) for implementation benchmarks and rationale.
 

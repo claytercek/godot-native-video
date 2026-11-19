@@ -1,7 +1,4 @@
-# Public VideoStreamPlayer integration regression; requires a rendered RD.
-# godot --path project --script res://linux_transport_test.gd -- \
-#   --file=/tmp/fixtures/h264-aac.mp4 --expect-audio=1
-# The shell runner supplies an outer timeout and rejects engine/load errors.
+# Public VideoStreamPlayer integration regression; requires a RenderingDevice.
 extends SceneTree
 
 const Oracle = preload("res://linux_transport_oracles.gd")
@@ -335,8 +332,7 @@ func _run() -> void:
 	if not _require(length > 0.5 and length < 4.0, "unexpected fixture duration"):
 		return
 	player.play()
-	# Godot's first update has delta 0; finish the cold first draw before timing
-	# playback progress. The shell's outer timeout still bounds renderer startup.
+	# Godot's first update has delta 0; wait for the first draw before timing playback.
 	await RenderingServer.frame_post_draw
 	if not _require(await _advance_from(0.0, minf(0.2, length * 0.15)), "initial playback clock did not advance"):
 		return

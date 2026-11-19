@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+
 const Build = std.Build;
 const gdzig = @import("gdzig");
 
@@ -29,8 +29,36 @@ pub fn build(b: *Build) !void {
     });
 
     const core_tests = b.addTest(.{ .root_module = core_mod });
-    const test_step = b.step("test", "Run core, platform backend, and pure importer tests (build resolves a Godot binary)");
+    const test_step = b.step("test", "Run core, platform backend, importer, and validation runner tests");
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
+
+    const validation_mod = b.createModule(.{
+        .root_source_file = b.path("tools/validation_runner.zig"),
+        .target = b.graph.host,
+        .optimize = .fast,
+    });
+    const validation_exe = b.addExecutable(.{ .name = "validation-runner", .root_module = validation_mod });
+    const validation_install = b.addInstallArtifact(validation_exe, .{});
+    b.step("validation-runner", "Install the host runner for an existing extension build").dependOn(&validation_install.step);
+    const validation_tests = b.step("test-validation-runner", "Test the host validation runner");
+    validation_tests.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = validation_mod })).step);
+    test_step.dependOn(validation_tests);
+    const fake_engine = b.addExecutable(.{
+        .name = "fake-engine",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fake_validation_engine.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const validation_test_paths = b.addOptions();
+    validation_test_paths.addOptionPath("runner", validation_exe.getEmittedBin());
+    validation_test_paths.addOptionPath("engine", fake_engine.getEmittedBin());
+    const validation_cli_mod = b.createModule(.{
+        .root_source_file = b.path("tests/validation_runner_cli.zig"),
+        .target = b.graph.host,
+    });
+    validation_cli_mod.addOptions("paths", validation_test_paths);
+    validation_tests.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = validation_cli_mod })).step);
 
     const paused_preview_mod = b.createModule(.{
         .root_source_file = b.path("src/core/paused_preview_test.zig"),
@@ -45,16 +73,6 @@ pub fn build(b: *Build) !void {
     const paused_preview_run = b.addRunArtifact(paused_preview_tests);
     b.step("test-paused-preview", "Run focused core paused-seek preview tests").dependOn(&paused_preview_run.step);
     test_step.dependOn(&paused_preview_run.step);
-
-    const fixture_pts_mod = b.createModule(.{
-        .root_source_file = b.path("src/gst/linux_fixture_pts.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const fixture_pts_tests = b.addTest(.{ .root_module = fixture_pts_mod });
-    const fixture_pts_run = b.addRunArtifact(fixture_pts_tests);
-    b.step("test-linux-fixture-pts", "Run indexed Linux fixture PTS oracle tests").dependOn(&fixture_pts_run.step);
-    test_step.dependOn(&fixture_pts_run.step);
 
     // The Windows importer selector is pure Zig despite living in src/godot/;
     // test D3D12/CPU-copy selection without building the extension.
@@ -107,8 +125,18 @@ pub fn build(b: *Build) !void {
         });
         linkMfLibs(m);
         mf_mod = m;
-        const mf_tests = b.addTest(.{ .root_module = m });
-        test_step.dependOn(&b.addRunArtifact(mf_tests).step);
+        // A separate root keeps fixture paths out of the extension's module.
+        const mf_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/mf/mf.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "core", .module = core_mod }},
+        });
+        linkMfLibs(mf_test_mod);
+        const mf_test_run = b.addRunArtifact(b.addTest(.{ .root_module = mf_test_mod }));
+        const mf_fixtures = FixtureInputs.init(mf_test_mod, mf_test_run);
+        mf_fixtures.addSurfaceClips();
+        test_step.dependOn(&mf_test_run.step);
 
         // Standalone decode harness: pumps the MF backend without Godot. Mirrors
         // the macOS decode-smoke step below.
@@ -171,10 +199,22 @@ pub fn build(b: *Build) !void {
             },
         });
         linkGstLibs(regression_mod);
-        const regression_exe = b.addExecutable(.{ .name = "linux-decode-regression", .root_module = regression_mod });
-        const regression_run = b.addRunArtifact(regression_exe);
-        regression_run.addPassthruArgs();
-        b.step("linux-decode-regression", "Run the Linux backend acceptance harness (pass fixture arguments after --)").dependOn(&regression_run.step);
+        const regression_exe = b.addExecutable(.{ .name = "gst-input-regressions", .root_module = regression_mod });
+        const extended = b.step("test-gst-extended", "Check GStreamer AAC seek accuracy and input rejection");
+        const integration_run = b.addRunArtifact(b.addTest(.{ .root_module = regression_mod }));
+        const integration_fixtures = FixtureInputs.init(regression_mod, integration_run);
+        integration_fixtures.add("multitrack", "decode/h264-multitrack.mp4");
+        extended.dependOn(&integration_run.step);
+        const rejection_run = b.addRunArtifact(regression_exe);
+        rejection_run.addArg("--test-rejections");
+        rejection_run.addFileArg(b.path("tests/fixtures/decode/invalid.mp4"));
+        extended.dependOn(&rejection_run.step);
+        const missing_run = b.addRunArtifact(regression_exe);
+        missing_run.addArg("missing-decoder");
+        missing_run.addFileArg(b.path("tests/fixtures/decode/h264-aac.mp4"));
+        // GStreamer reads decoder ranks at initialization, so isolate this case.
+        missing_run.setEnvironmentVariable("GST_PLUGIN_FEATURE_RANK", "avdec_h264:0,openh264dec:0,vah264dec:0,vaapih264dec:0,nvh264dec:0,nvh264sldec:0,v4l2h264dec:0,v4l2slh264dec:0,vulkanh264dec:0");
+        extended.dependOn(&missing_run.step);
     }
 
     // --- Godot extension: gdzig glue + the target's media backend. ---
@@ -210,6 +250,48 @@ pub fn build(b: *Build) !void {
             .{ .name = "core", .module = core_mod },
         },
     });
+
+    if (switch (target.result.os.tag) {
+        .macos => avf_mod,
+        .windows => mf_mod,
+        .linux => gst_mod,
+        else => null,
+    }) |decoder| {
+        const media_mod = b.createModule(.{
+            .root_source_file = b.path("tests/media_decode.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "decoder", .module = decoder },
+                .{ .name = "core", .module = core_mod },
+            },
+        });
+        switch (target.result.os.tag) {
+            .macos => {
+                addAppleSdkPaths(b, media_mod, target);
+                linkAvfShim(b, media_mod);
+            },
+            .windows => linkMfLibs(media_mod),
+            .linux => linkGstLibs(media_mod),
+            else => unreachable,
+        }
+        const media_run = b.addRunArtifact(b.addTest(.{ .root_module = media_mod }));
+        const clips = FixtureInputs.init(media_mod, media_run);
+        clips.addSurfaceClips();
+        clips.add("h264_aac", "decode/h264-aac.mp4");
+        clips.add("h264_silent", "decode/h264-silent.mp4");
+        clips.add("multitrack", "decode/h264-multitrack.mp4");
+        clips.add("surround", "stress/surround51.mp4");
+        clips.add("timecode", "stress/timecode.mov");
+        clips.add("combined", "stress/combined_stress.mov");
+        clips.add("marker", "stress/marker_bframes.mp4");
+        if (target.result.os.tag != .windows) clips.add("hevc_pq", "decode/hevc-main10-pq.mp4");
+        if (target.result.os.tag == .linux) {
+            clips.add("multitrack_mkv", "decode/h264-multitrack.mkv");
+            clips.add("vp9", "decode/vp9-10.webm");
+        }
+        b.step("test-media", "Decode the checked-in fixtures with the native backend").dependOn(&media_run.step);
+    }
 
     // Backend seam: the surface importers and backend-open path resolve their
     // platform module by name. Wire exactly the one the target uses so the
@@ -250,16 +332,20 @@ pub fn build(b: *Build) !void {
             .root_source_file = b.path("src/avf/decode_smoke.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "core", .module = core_mod },
-            },
+            .imports = &.{.{ .name = "core", .module = core_mod }},
         });
+        const media_paths = b.addOptions();
+        media_paths.addOptionPath("synthetic_clip", b.path("project/synthetic.mp4"));
+        smoke_mod.addOptions("media_paths", media_paths);
         addAppleSdkPaths(b, smoke_mod, target);
         linkAvfShim(b, smoke_mod);
         const smoke_exe = b.addExecutable(.{ .name = "decode-smoke", .root_module = smoke_mod });
         const smoke_run = b.addRunArtifact(smoke_exe);
-        smoke_run.addFileArg(b.path("project/synthetic.mp4"));
-        b.step("decode-smoke", "Pump the AVF backend without Godot").dependOn(&smoke_run.step);
+        smoke_run.addPassthruArgs();
+        b.step("decode-smoke", "Pump the AVF backend without Godot (optionally pass -- <path>)").dependOn(&smoke_run.step);
+
+        const abi = b.addTest(.{ .root_module = smoke_mod });
+        test_step.dependOn(&b.addRunArtifact(abi).step);
     }
 
     const install = b.addInstallFileWithDir(extension.output, .{ .custom = "../project/lib" }, extension.filename);
@@ -274,26 +360,47 @@ pub fn build(b: *Build) !void {
     run.step.dependOn(&install.step);
     b.step("run", "Run the demo project in Godot (forwards `-- <args>` to the demo's CLI, e.g. a clip path or --file=<path>)").dependOn(&run.step);
 
-    // Pass/fail presentation smoke. This intentionally uses the real display
-    // driver: Godot's headless driver has no RenderingDevice and therefore
-    // cannot exercise texture import or the conversion shader.
-    const smoke = Build.Step.Run.create(b, "run godot demo smoke test");
-    smoke.addArg(if (builtin.os.tag == .windows) "python" else "python3");
-    smoke.addFileArg(b.path("tests/run_smoke.py"));
+    const smoke = b.addRunArtifact(validation_exe);
     smoke.addArg("--godot");
     smoke.addFileArg(gdzig_dep.namedLazyPath("godot"));
-    smoke.addArgs(&.{ "--driver", switch (target.result.os.tag) {
+    smoke.addArg("--project");
+    smoke.addDirectoryArg(b.path("project"));
+    smoke.addArgs(&.{ "--driver", switch (b.graph.host.result.os.tag) {
         .windows => "d3d12",
         .linux => "vulkan",
         else => "default",
     }, "--log" });
-    // Pass the output path without tracking the not-yet-created log as an input.
     smoke.addDirectoryArg2(b.graph.path(.install_prefix, "smoke.log"), .{});
     smoke.addArg("--");
     smoke.addPassthruArgs();
+    smoke.addArgs(&.{ "--", "--smoke" });
     smoke.step.dependOn(&install.step);
-    b.step("smoke", "Run the strict rendered smoke with a deadline and log checks (requires Python 3 and display/GPU)").dependOn(&smoke.step);
+    b.step("smoke", "Run the rendered Godot smoke with a deadline and log checks").dependOn(&smoke.step);
 }
+
+const FixtureInputs = struct {
+    run: *Build.Step.Run,
+    paths: *Build.Step.Options,
+
+    fn init(mod: *Build.Module, run: *Build.Step.Run) FixtureInputs {
+        const paths = run.step.owner.addOptions();
+        mod.addOptions("fixtures", paths);
+        return .{ .run = run, .paths = paths };
+    }
+
+    fn add(inputs: FixtureInputs, name: []const u8, relative_path: []const u8) void {
+        const b = inputs.run.step.owner;
+        const file = b.path("tests/fixtures").path(b, relative_path);
+        // Clip contents affect the run, not compilation of the path string.
+        inputs.paths.addOptionPathUntracked(name, file);
+        inputs.run.addFileInput(file);
+    }
+
+    fn addSurfaceClips(inputs: FixtureInputs) void {
+        inputs.add("bframes", "stress/bframes.mp4");
+        inputs.add("nonmod16", "stress/nonmod16_854x480.mp4");
+    }
+};
 
 /// Resolve both headers (including @cImport translation) and link flags from
 /// the same pkg-config packages. GStreamer is a system dependency on Linux;

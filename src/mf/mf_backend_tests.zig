@@ -39,44 +39,39 @@ fn hashFrameTexture(tex: *d3d11.ID3D11Texture2D) ?u64 {
     return hasher.final();
 }
 
-fn requireFixture(path: []const u8) !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
-}
+const fixtures = @import("fixtures");
 
 pub fn queuedVideoFrames(createBackend: anytype) !void {
     const t = std.testing;
-    try requireFixture("project/bframes.mp4");
-    const backend = createBackend(t.allocator) catch return error.SkipZigTest;
+    const backend = try createBackend(t.allocator);
     defer backend.deinit();
-    if (!backend.open("project/bframes.mp4")) return error.SkipZigTest;
+    try t.expect(backend.open(fixtures.bframes));
 
     var frames: std.ArrayList(core.VideoFrame) = .empty;
     defer {
         for (frames.items) |frame| frame.release();
         frames.deinit(t.allocator);
     }
-    const first = backend.nextVideoFrame() orelse return error.SkipZigTest;
-    try frames.append(t.allocator, first);
+    try frames.ensureTotalCapacity(t.allocator, 15);
+    const first = backend.nextVideoFrame() orelse return error.NoDecodedVideo;
+    frames.appendAssumeCapacity(first);
     try t.expectEqual(@as(u32, 0), first.plane_slice);
     const texture: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(first.native_handle.?));
-    const before = hashFrameTexture(texture) orelse return error.SkipZigTest;
+    const before = hashFrameTexture(texture) orelse return error.TextureReadbackFailed;
     for (0..14) |_| {
         const frame = backend.nextVideoFrame() orelse break;
-        try frames.append(t.allocator, frame);
+        frames.appendAssumeCapacity(frame);
     }
-    if (frames.items.len < 3) return error.SkipZigTest;
-    try t.expectEqual(before, hashFrameTexture(texture) orelse return error.SkipZigTest);
+    try t.expect(frames.items.len >= 3);
+    try t.expectEqual(before, hashFrameTexture(texture) orelse return error.TextureReadbackFailed);
 }
 
 pub fn displayAperture(createBackend: anytype) !void {
     const t = std.testing;
-    const path = "tests/fixtures/stress/nonmod16_854x480.mp4";
-    try requireFixture(path);
-    const backend = createBackend(t.allocator) catch return error.SkipZigTest;
+    const backend = try createBackend(t.allocator);
     defer backend.deinit();
-    if (!backend.open(path)) return error.SkipZigTest;
-    const frame = backend.nextVideoFrame() orelse return error.SkipZigTest;
+    try t.expect(backend.open(fixtures.nonmod16));
+    const frame = backend.nextVideoFrame() orelse return error.NoDecodedVideo;
     defer frame.release();
 
     const texture: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(frame.native_handle.?));

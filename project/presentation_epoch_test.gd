@@ -64,8 +64,7 @@ func _run() -> void:
 	root.add_child(player)
 	player.stream = stream
 	player.play()
-	# Godot's first update has delta 0; finish the cold first draw before timing
-	# playback progress. The shell's outer timeout still bounds renderer startup.
+	# Godot's first update has delta 0; wait for the first draw before timing playback.
 	await RenderingServer.frame_post_draw
 	var deadline := Time.get_ticks_msec() + 5000
 	while player.stream_position < 0.1 and Time.get_ticks_msec() < deadline:
