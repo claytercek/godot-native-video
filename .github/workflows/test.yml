@@ -24,31 +24,28 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     uses: ./.github/workflows/build.yml
 
-  test:
-    name: Build & Smoke (${{ matrix.os }}, Godot ${{ matrix.godot }})
-    needs: build
+  native:
+    name: Native tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    defaults:
-      run:
-        shell: bash
-    # Bindings target 4.7; rendered smoke also runs on the 4.6 floor and
-    # rejects every engine error. Native tests do not run Godot, so run them
-    # only on the primary version.
+    env:
+      ZIG_LOCAL_PKG_DIR: ${{ github.workspace }}/.zig-cache/packages
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-22.04, windows-latest]
-        godot: ["4.7.2", "4.6.3"]
-    env:
-      PRIMARY_LINUX: ${{ matrix.os == 'ubuntu-22.04' && matrix.godot == '4.7.2' }}
-      LINUX_EXTENDED: ${{ matrix.os == 'ubuntu-22.04' && matrix.godot == '4.7.2' && inputs.linux_extended }}
-      DECODE_FIXTURES: ${{ github.workspace }}/tests/fixtures/decode
-
+        os: &hosts [macos-latest, &linux ubuntu-22.04, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,7 +61,7 @@ jobs:
       - name: Setup stock Godot
         uses: chickensoft-games/setup-godot@v2
         with:
-          version: ${{ matrix.godot }}
+          version: &primary-godot "4.7.2"
           use-dotnet: false
 
       - name: Record versions
@@ -75,9 +72,84 @@ jobs:
           printf 'GODOT_PATH=%s\n' "$godot" >> "$GITHUB_ENV"
           { zig version; "$godot" --version; } 2>&1 | tee ci-logs/versions.log
 
-      - name: Install host validation runner
-        timeout-minutes: 3
-        run: zig build validation-runner 2>&1 | tee ci-logs/validation-runner-build.log
+      - name: Install Linux GStreamer development packages and codecs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # Ubuntu runner's LLVM unwinder conflicts with libunwind-dev.
+          sudo apt-get remove -y libunwind-14-dev
+          sudo apt-get install -y --no-install-recommends pkg-config \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+          pkg-config --modversion gstreamer-1.0 gstreamer-app-1.0 \
+            gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-pbutils-1.0 | tee ci-logs/gstreamer-versions.log
+
+      - name: Run native tests and install the tested smoke runner
+        timeout-minutes: 8
+        run: zig build test validation-runner --summary all --test-timeout 120s 2>&1 | tee ci-logs/native-tests.log
+
+      - name: Media fixture tests
+        timeout-minutes: 5
+        run: zig build test-media --summary all --test-timeout 30s 2>&1 | tee ci-logs/media-tests.log
+
+      - name: GStreamer AAC seek and input rejection
+        if: runner.os == 'Linux' && inputs.linux_extended
+        timeout-minutes: 5
+        run: zig build test-gst-extended -Doptimize=debug --summary all --test-timeout 30s 2>&1 | tee ci-logs/gstreamer-regressions.log
+
+      - name: Upload smoke runner
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-runner-${{ matrix.os }}
+          path: zig-out/bin/validation-runner${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-tests-${{ matrix.os }}
+          path: ci-logs/*.log
+
+  test:
+    name: Build & Smoke (${{ matrix.os }}, Godot ${{ matrix.godot }})
+    needs: [build, native]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: *hosts
+        godot: [*primary-godot, "4.6.3"]
+        include:
+          - os: *linux
+            godot: *primary-godot
+            transport: true
+    env:
+      PRIMARY_LINUX: ${{ matrix.transport }}
+      LINUX_EXTENDED: ${{ matrix.transport && inputs.linux_extended }}
+      DECODE_FIXTURES: ${{ github.workspace }}/tests/fixtures/decode
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup stock Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: ${{ matrix.godot }}
+          use-dotnet: false
+
+      - name: Record Godot version
+        run: |
+          mkdir -p ci-logs
+          godot=$(command -v godot)
+          if [[ "$RUNNER_OS" == Windows ]]; then godot=$(cygpath -am "$godot"); fi
+          printf 'GODOT_PATH=%s\n' "$godot" >> "$GITHUB_ENV"
+          "$godot" --version | tee ci-logs/versions.log
 
       - name: Install Linux GStreamer and software Vulkan
         if: runner.os == 'Linux'
@@ -91,15 +163,11 @@ jobs:
           gst-inspect-1.0 avdec_h264 > ci-logs/h264-decoder.log
           gst-inspect-1.0 avdec_aac > ci-logs/aac-decoder.log
 
-      - name: Install Linux GStreamer development packages
-        if: env.PRIMARY_LINUX == 'true'
-        run: |
-          # Ubuntu runner's LLVM unwinder conflicts with libunwind-dev.
-          sudo apt-get remove -y libunwind-14-dev
-          sudo apt-get install -y --no-install-recommends pkg-config \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-          pkg-config --modversion gstreamer-1.0 gstreamer-app-1.0 \
-            gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-pbutils-1.0 | tee -a ci-logs/gstreamer-versions.log
+      - name: Download smoke runner
+        uses: actions/download-artifact@v4
+        with:
+          name: smoke-runner-${{ matrix.os }}
+          path: smoke-tools
 
       - name: Download platform binaries
         uses: actions/download-artifact@v4
@@ -126,7 +194,7 @@ jobs:
       - name: Rendered Godot smoke
         timeout-minutes: ${{ env.LINUX_EXTENDED == 'true' && 10 || 4 }}
         run: |
-          runner=zig-out/bin/validation-runner
+          runner=smoke-tools/validation-runner
           prefix=(); display=()
           case "$RUNNER_OS" in
             Linux)
@@ -143,6 +211,7 @@ jobs:
             macOS) driver=default ;;
             Windows) runner+=.exe; driver=d3d12 ;;
           esac
+          chmod +x "$runner"
           run_rendered() {
             local name=$1 marker=$2; shift 2
             local log="ci-logs/$name.log"
@@ -168,21 +237,6 @@ jobs:
             transport hevc10 hevc-main10-pq.mp4 0
           fi
 
-      - name: Run native tests (primary Godot only)
-        if: matrix.godot == '4.7.2'
-        timeout-minutes: 5
-        run: zig build test --summary all --test-timeout 120s 2>&1 | tee ci-logs/native-tests.log
-
-      - name: Media fixture tests (primary Godot only)
-        if: matrix.godot == '4.7.2'
-        timeout-minutes: 5
-        run: zig build test-media --summary all --test-timeout 30s 2>&1 | tee ci-logs/media-tests.log
-
-      - name: GStreamer AAC seek and input rejection
-        if: env.LINUX_EXTENDED == 'true'
-        timeout-minutes: 5
-        run: zig build test-gst-extended -Doptimize=debug --summary all --test-timeout 30s 2>&1 | tee ci-logs/gstreamer-regressions.log
-
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -196,11 +250,12 @@ jobs:
   build-smoke-gate:
     # Branch protection requires an exact check name, independent of matrix versions.
     name: Build & Smoke (all)
-    needs: [build, test]
+    needs: [build, native, test]
     if: always() # GitHub accepts skipped checks, so run even if a dependency fails.
     runs-on: ubuntu-latest
     steps:
-      - name: Require build and smoke tests to pass
+      - name: Require builds, native tests, and smoke tests to pass
         run: |
           test "${{ needs.build.result }}" = success
+          test "${{ needs.native.result }}" = success
           test "${{ needs.test.result }}" = success

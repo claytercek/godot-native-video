@@ -135,22 +135,11 @@ jobs:
           ref: ${{ inputs.package-only && (inputs.release-tag || github.sha) || needs.release.outputs.tag_name }}
           persist-credentials: false
 
-      - name: Download macOS binaries
+      - name: Download platform binaries
         uses: actions/download-artifact@v4
         with:
-          name: native-video-macos
-          path: staging
-
-      - name: Download Windows binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: native-video-windows
-          path: staging
-
-      - name: Download Linux binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: native-video-linux
+          pattern: native-video-*
+          merge-multiple: true
           path: staging
 
       - name: Assemble addon
@@ -194,3 +183,4 @@ jobs:
           name: native_video
           path: ${{ env.ZIP_NAME }}
           if-no-files-found: error
+          compression-level: 0

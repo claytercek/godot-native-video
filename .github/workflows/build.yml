@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Zig 0.17 otherwise fetches dependencies into zig-pkg, outside setup-zig's cache.
+  ZIG_LOCAL_PKG_DIR: ${{ github.workspace }}/.zig-cache/packages
+
 defaults:
   run:
     shell: bash
