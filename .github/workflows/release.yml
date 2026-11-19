@@ -38,7 +38,7 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -72,7 +72,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
 
@@ -94,7 +94,7 @@ jobs:
       # A fixed branch maintains one rolling PR, including when its proposed
       # version changes. With no diff this also closes an obsolete release PR.
       - name: Update release PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ github.token }}
           base: main
@@ -130,13 +130,13 @@ jobs:
       RELEASE_TAG: ${{ inputs.package-only && inputs.release-tag || needs.release.outputs.tag_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.package-only && (inputs.release-tag || github.sha) || needs.release.outputs.tag_name }}
           persist-credentials: false
 
       - name: Download platform binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: native-video-*
           merge-multiple: true
@@ -178,7 +178,7 @@ jobs:
 
       - name: Upload workflow artifact (manual runs)
         if: env.RELEASE_TAG == ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native_video
           path: ${{ env.ZIP_NAME }}

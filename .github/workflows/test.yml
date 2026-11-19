@@ -48,7 +48,7 @@ jobs:
         os: &hosts [macos-latest, &linux ubuntu-22.04, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: true
 
@@ -99,7 +99,7 @@ jobs:
         run: zig build test-gst-extended -Doptimize=debug --summary all --test-timeout 30s 2>&1 | tee ci-logs/gstreamer-regressions.log
 
       - name: Upload smoke runner
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-runner-${{ matrix.os }}
           path: zig-out/bin/validation-runner${{ runner.os == 'Windows' && '.exe' || '' }}
@@ -108,7 +108,7 @@ jobs:
 
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: native-tests-${{ matrix.os }}
           path: ci-logs/*.log
@@ -133,7 +133,7 @@ jobs:
       DECODE_FIXTURES: ${{ github.workspace }}/tests/fixtures/decode
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           lfs: true
 
@@ -164,13 +164,13 @@ jobs:
           gst-inspect-1.0 avdec_aac > ci-logs/aac-decoder.log
 
       - name: Download smoke runner
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: smoke-runner-${{ matrix.os }}
           path: smoke-tools
 
       - name: Download platform binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: native-video-${{ runner.os == 'macOS' && 'macos' || runner.os == 'Windows' && 'windows' || 'linux' }}
           path: staging
@@ -239,7 +239,7 @@ jobs:
 
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-${{ matrix.os }}-godot-${{ matrix.godot }}
           path: |
