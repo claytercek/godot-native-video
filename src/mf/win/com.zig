@@ -57,6 +57,7 @@ pub const S_OK: HRESULT = 0;
 pub const S_FALSE: HRESULT = 1;
 // _HRESULT_TYPEDEF_(0xC00D36B3): source-reader stream-enumeration terminator.
 pub const MF_E_INVALIDSTREAMNUMBER: HRESULT = @bitCast(@as(u32, 0xC00D36B3));
+pub const MF_E_ATTRIBUTENOTFOUND: HRESULT = @bitCast(@as(u32, 0xC00D36E6));
 // CoInitializeEx returns this when the thread already has an incompatible
 // COM apartment (e.g. STA) set on it.
 pub const RPC_E_CHANGED_MODE: HRESULT = @bitCast(@as(u32, 0x80010106));

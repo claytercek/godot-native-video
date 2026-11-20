@@ -62,7 +62,7 @@ fn expectVideoFrame(frame: VideoFrame, index: usize, checks: VideoChecks) !void 
     if (checks.size) |size| try testing.expectEqual(size, [2]i32{ frame.width, frame.height });
     if (checks.format) |format| {
         try testing.expectEqual(format, frame.pixel_format);
-        if (format == .x420) try testing.expectEqual(@as(i32, 10), frame.color.bit_depth);
+        try testing.expectEqual(@as(i32, if (format == .x420) 10 else 8), frame.color.bit_depth);
     }
     if (checks.transfer) |transfer| try testing.expectEqual(transfer, frame.color.transfer);
 }
@@ -127,10 +127,10 @@ fn expectPcm(backend: Backend, comptime channels: usize, tone_hz: ?f64) !void {
     }
 }
 
-fn expectAacEos(backend: Backend) !void {
+fn expectStereoEos(backend: Backend) !void {
     try expectPcmFormat(backend, 2);
     const expected_frames = 3 * pcm_rate;
-    // Allow two AAC packets of priming or tail padding.
+    // Allow up to two AAC or 20 ms Opus packets of priming or tail padding.
     const padding = 2 * 1024;
     var frames: usize = 0;
     var energy: [2]f64 = @splat(0);
@@ -178,13 +178,22 @@ fn expectReplay(path: []const u8, count: usize, checks: VideoChecks, comptime wi
         try testing.expectEqual(@as(i32, 1), backend.audioTrackCount());
         try expectTrackFormat(backend, 0, 2);
     }
-    const expectAudio = if (with_audio) expectAacEos else expectSilent;
+    const expectAudio = if (with_audio) expectStereoEos else expectSilent;
 
     // Either stream can stall if the other stream's queue fills up. Seeking
     // before the first drain once deadlocked GStreamer's paired readers.
     try testing.expect(backend.seek(0));
     try expectVideoFrames(backend, count, checks);
     try expectAudio(backend);
+    if (checks.format) |format| try testing.expectEqual(@as(i32, if (format == .x420) 10 else 8), backend.colorimetry().bit_depth);
+    if (with_audio) {
+        // Native seeks may land on a preceding keyframe. These clips have one at 1 s.
+        try testing.expect(backend.seek(1));
+        const frame = backend.nextVideoFrame() orelse return error.NoVideoAfterSeek;
+        defer frame.release();
+        try expectVideoFrame(frame, @intFromFloat(checks.fps.?), checks);
+        try expectPcm(backend, 2, 440);
+    }
     try testing.expect(backend.seek(0));
     try expectAudio(backend);
     try expectVideoFrames(backend, count, checks);
@@ -253,15 +262,31 @@ test "media: HEVC Main10 preserves 10-bit PQ video through EOS and replay" {
     }, false);
 }
 
-test "media: VP9 Profile 2 WebM preserves 10-bit frames on GStreamer" {
-    if (!gstreamer) return error.SkipZigTest;
-    const backend = try openFixture(fixtures.vp9);
-    defer backend.deinit();
+const codec_8: VideoChecks = .{ .fps = 30, .size = .{ 320, 240 }, .format = .nv12 };
+const codec_10: VideoChecks = .{ .fps = 2, .pts_tolerance = 0.001, .size = .{ 320, 240 }, .format = .x420 };
 
-    try expectVideoFrames(backend, 2, .{ .fps = 2, .pts_tolerance = 0.001, .size = .{ 320, 240 }, .format = .x420 });
-    try testing.expectEqual(@as(i32, 10), backend.colorimetry().bit_depth);
-    try expectSilent(backend);
-    try closeBounded(backend);
+test "media: VP9 Profile 0 with AAC and silent Profile 2 in MP4" {
+    if (!fixtures.expect_vp9) return error.SkipZigTest;
+    try expectReplay(fixtures.vp9_8_mp4, 90, codec_8, true);
+    try expectReplay(fixtures.vp9_10_mp4, 2, codec_10, false);
+}
+
+test "media: AV1 Main with AAC and silent 10-bit Main in MP4" {
+    if (!fixtures.expect_av1) return error.SkipZigTest;
+    try expectReplay(fixtures.av1_8_mp4, 90, codec_8, true);
+    try expectReplay(fixtures.av1_10_mp4, 2, codec_10, false);
+}
+
+test "media: VP9 Profile 0 with Opus and silent Profile 2 in WebM" {
+    if (!gstreamer) return error.SkipZigTest;
+    try expectReplay(fixtures.vp9_8_webm, 90, codec_8, true);
+    try expectReplay(fixtures.vp9_10_webm, 2, codec_10, false);
+}
+
+test "media: AV1 Main with Opus and silent 10-bit Main in WebM" {
+    if (!gstreamer) return error.SkipZigTest;
+    try expectReplay(fixtures.av1_8_webm, 90, codec_8, true);
+    try expectReplay(fixtures.av1_10_webm, 2, codec_10, false);
 }
 
 test "media: Matroska preserves track titles and the second-track default on GStreamer" {

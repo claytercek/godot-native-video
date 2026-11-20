@@ -287,9 +287,25 @@ pub fn build(b: *Build) !void {
         clips.add("combined", "stress/combined_stress.mov");
         clips.add("marker", "stress/marker_bframes.mp4");
         if (target.result.os.tag != .windows) clips.add("hevc_pq", "decode/hevc-main10-pq.mp4");
-        if (target.result.os.tag == .linux) {
+        const linux = target.result.os.tag == .linux;
+        const test_vp9 = b.option(bool, "test-vp9", "Require native VP9 MP4 decode in test-media (always on for Linux)") orelse false;
+        const test_av1 = b.option(bool, "test-av1", "Require native AV1 MP4 decode in test-media (always on for Linux)") orelse false;
+        clips.paths.addOption(bool, "expect_vp9", linux or test_vp9);
+        clips.paths.addOption(bool, "expect_av1", linux or test_av1);
+        if (linux or test_vp9) {
+            clips.add("vp9_8_mp4", "decode/vp9-8.mp4");
+            clips.add("vp9_10_mp4", "decode/vp9-10.mp4");
+        }
+        if (linux or test_av1) {
+            clips.add("av1_8_mp4", "decode/av1-8.mp4");
+            clips.add("av1_10_mp4", "decode/av1-10.mp4");
+        }
+        if (linux) {
             clips.add("multitrack_mkv", "decode/h264-multitrack.mkv");
-            clips.add("vp9", "decode/vp9-10.webm");
+            clips.add("vp9_8_webm", "decode/vp9-8.webm");
+            clips.add("vp9_10_webm", "decode/vp9-10.webm");
+            clips.add("av1_8_webm", "decode/av1-8.webm");
+            clips.add("av1_10_webm", "decode/av1-10.webm");
         }
         b.step("test-media", "Decode the checked-in fixtures with the native backend").dependOn(&media_run.step);
     }
@@ -362,21 +378,28 @@ pub fn build(b: *Build) !void {
     b.step("run", "Run the demo project in Godot (forwards `-- <args>` to the demo's CLI, e.g. a clip path or --file=<path>)").dependOn(&run.step);
 
     const smoke = b.addRunArtifact(validation_exe);
-    smoke.addArg("--godot");
-    smoke.addFileArg(gdzig_dep.namedLazyPath("godot"));
-    smoke.addArg("--project");
-    smoke.addDirectoryArg(b.path("project"));
-    smoke.addArgs(&.{ "--driver", switch (b.graph.host.result.os.tag) {
-        .windows => "d3d12",
-        .linux => "vulkan",
-        else => "default",
-    }, "--log" });
-    smoke.addDirectoryArg2(b.graph.path(.install_prefix, "smoke.log"), .{});
+    const codec_smoke = b.addRunArtifact(validation_exe);
+    inline for (.{ smoke, codec_smoke }, .{ "smoke.log", "smoke-codecs.log" }) |check, log| {
+        check.addArg("--godot");
+        check.addFileArg(gdzig_dep.namedLazyPath("godot"));
+        check.addArg("--project");
+        check.addDirectoryArg(b.path("project"));
+        check.addArgs(&.{ "--driver", switch (b.graph.host.result.os.tag) {
+            .windows => "d3d12",
+            .linux => "vulkan",
+            else => "default",
+        }, "--log" });
+        check.addDirectoryArg2(b.graph.path(.install_prefix, log), .{});
+        check.step.dependOn(&install.step);
+    }
     smoke.addArg("--");
     smoke.addPassthruArgs();
     smoke.addArgs(&.{ "--", "--smoke" });
-    smoke.step.dependOn(&install.step);
     b.step("smoke", "Run the rendered Godot smoke with a deadline and log checks").dependOn(&smoke.step);
+
+    codec_smoke.addArgs(&.{ "--marker", "CODEC_SMOKE_PASS", "--", "--script", "res://codec_smoke.gd", "--" });
+    codec_smoke.addPassthruArgs();
+    b.step("smoke-codecs", "Render and seek VP9 MP4 (also AV1 WebM on Linux) through the Godot loader").dependOn(&codec_smoke.step);
 }
 
 const FixtureInputs = struct {
@@ -436,6 +459,7 @@ fn linkMfLibs(mod: *Build.Module) void {
 /// here — only the presenting extension needs it.
 fn linkAvfShim(b: *Build, mod: *Build.Module) void {
     mod.addCSourceFile(.{ .file = b.path("src/avf/avf_shim.m"), .flags = &.{"-fobjc-arc"} });
+    if (mod.resolved_target.?.result.os.tag == .macos) mod.linkFramework("VideoToolbox", .{});
     for ([_][]const u8{ "Foundation", "AVFoundation", "CoreMedia", "CoreVideo" }) |fw| {
         mod.linkFramework(fw, .{});
     }

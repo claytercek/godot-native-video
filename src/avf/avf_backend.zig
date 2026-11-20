@@ -97,7 +97,7 @@ const AbiProbe = extern struct {
 };
 extern fn nv_avf_abi_probe_fill(out: *AbiProbe) void;
 
-extern fn nv_avf_create() ?*Shim;
+extern fn nv_avf_create(logger: ?*const fn ([*:0]const u8) callconv(.c) void) ?*Shim;
 extern fn nv_avf_destroy(h: ?*Shim) void;
 // Produces .ok or .none — never .fail.
 extern fn nv_avf_open(h: *Shim, url_or_path: [*:0]const u8, info: *c_open_info) Result;
@@ -503,13 +503,17 @@ fn logAudioNegotiation(track_index: i32, declared_channels: i32, declared_rate: 
     );
 }
 
+fn logNativeError(message: [*:0]const u8) callconv(.c) void {
+    log.err("{s}", .{std.mem.span(message)});
+}
+
 /// Construct an AVFoundation backend and return it as the core.Backend
 /// ptr+vtable interface. The returned Backend owns its heap allocation and the
 /// shim handle; Backend.deinit() releases both.
 pub fn create(allocator: std.mem.Allocator) !core.Backend {
     if (builtin.mode == .debug) assertAbi();
 
-    const shim = nv_avf_create() orelse return error.ShimCreateFailed;
+    const shim = nv_avf_create(&logNativeError) orelse return error.ShimCreateFailed;
     errdefer nv_avf_destroy(shim);
 
     const self = try allocator.create(AvfBackend);

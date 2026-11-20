@@ -138,7 +138,9 @@ typedef struct {
 void nv_avf_abi_probe_fill(nv_avf_abi_probe *out);
 
 // --- Lifecycle ---
-nv_avf_backend *nv_avf_create(void);
+// The callback borrows UTF-8 text for the call only. NULL uses the native log.
+typedef void (*nv_avf_error_logger)(const char *message);
+nv_avf_backend *nv_avf_create(nv_avf_error_logger logger);
 void nv_avf_destroy(nv_avf_backend *h);
 
 // Open the asset, resolve tracks, parse negotiated colorimetry, and

@@ -35,6 +35,8 @@ pub const LONGLONG = i64;
 pub const MF_MT_MAJOR_TYPE = GUID.parse("{48EBA18E-F8C9-4687-BF11-0A74C9F96A8F}");
 pub const MF_MT_SUBTYPE = GUID.parse("{F7E34C9A-42E8-4714-B74B-CB29D72C35E5}");
 pub const MF_MT_MPEG2_PROFILE = GUID.parse("{AD76A80B-2D5C-4E0B-B375-64E520137036}");
+pub const MF_MT_MPEG4_SAMPLE_DESCRIPTION = GUID.parse("{261E9D83-9529-4B8F-A111-8B9C950A81A9}");
+pub const MF_MT_MPEG4_CURRENT_SAMPLE_ENTRY = GUID.parse("{9AA7E155-B64A-4C1D-A500-455D600B6560}");
 pub const MF_MT_YUV_MATRIX = GUID.parse("{3E23D450-2C75-4D25-A00E-B91670D12327}");
 pub const MF_MT_VIDEO_PRIMARIES = GUID.parse("{DBFBE4D7-0740-4EE0-8192-850AB0E21935}");
 pub const MF_MT_TRANSFER_FUNCTION = GUID.parse("{5FB0FCE9-BE5C-4935-A811-EC838F8EED93}");
@@ -52,6 +54,10 @@ pub const MF_MT_AUDIO_SAMPLES_PER_SECOND = GUID.parse("{5FAEEAE7-0290-4C31-9E8A-
 // --- Major-type and subtype value GUIDs (resolved from FOURCC/WAVE_FORMAT) ---
 pub const MFMediaType_Video = GUID.parse("{73646976-0000-0010-8000-00AA00389B71}");
 pub const MFMediaType_Audio = GUID.parse("{73647561-0000-0010-8000-00AA00389B71}");
+pub const MFVideoFormat_HEVC = GUID.parse("{43564548-0000-0010-8000-00AA00389B71}");
+pub const MFVideoFormat_HEVC_ES = GUID.parse("{53564548-0000-0010-8000-00AA00389B71}");
+pub const MFVideoFormat_VP90 = GUID.parse("{30395056-0000-0010-8000-00AA00389B71}");
+pub const MFVideoFormat_AV1 = GUID.parse("{31305641-0000-0010-8000-00AA00389B71}");
 pub const MFVideoFormat_NV12 = GUID.parse("{3231564E-0000-0010-8000-00AA00389B71}"); // FCC('NV12')
 pub const MFVideoFormat_P010 = GUID.parse("{30313050-0000-0010-8000-00AA00389B71}"); // FCC('P010')
 pub const MFAudioFormat_Float = GUID.parse("{00000003-0000-0010-8000-00AA00389B71}"); // WAVE_FORMAT_IEEE_FLOAT
@@ -113,6 +119,7 @@ pub const MF_SOURCE_READER_FIRST_AUDIO_STREAM: DWORD = 0xFFFFFFFD;
 pub const MF_SOURCE_READER_FIRST_VIDEO_STREAM: DWORD = 0xFFFFFFFC;
 pub const MF_SOURCE_READER_MEDIASOURCE: DWORD = 0xFFFFFFFF;
 
+pub const MF_SOURCE_READERF_ERROR: DWORD = 0x1;
 pub const MF_SOURCE_READERF_ENDOFSTREAM: DWORD = 0x2;
 
 // ===========================================================================
@@ -144,7 +151,7 @@ pub const IMFAttributes = extern struct {
         GetStringLength: *const fn (*Self, *const GUID, *UINT32) callconv(.winapi) HRESULT,
         GetString: *const fn (*Self, *const GUID, [*]u16, UINT32, ?*UINT32) callconv(.winapi) HRESULT,
         GetAllocatedString: *const fn (*Self, *const GUID, *?[*:0]u16, *UINT32) callconv(.winapi) HRESULT,
-        GetBlobSize: *const anyopaque,
+        GetBlobSize: *const fn (*Self, *const GUID, *UINT32) callconv(.winapi) HRESULT,
         GetBlob: *const fn (*Self, *const GUID, [*]u8, UINT32, ?*UINT32) callconv(.winapi) HRESULT,
         GetAllocatedBlob: *const anyopaque,
         GetUnknown: *const fn (*Self, *const GUID, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,

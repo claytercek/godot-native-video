@@ -14,6 +14,7 @@ test {
     // pipeline decls so all run under `zig build test`.
     _ = @import("win.zig");
     _ = @import("colorimetry.zig");
+    _ = @import("sample_description.zig");
     _ = @import("pipeline.zig");
     _ = @import("com_executor.zig");
     _ = @import("mf_backend.zig");
