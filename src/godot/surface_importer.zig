@@ -82,6 +82,13 @@ pub const PlaneTextures = struct {
     /// exactly once (the retire-ring does this after N frames).
     release: Closure = .{},
 
+    // Borrowed until release. Optional readback keeps external resources alive
+    // through completion of the RD frame that samples these planes.
+    completion: ?struct {
+        buffer: Rid,
+        callback: godot.builtin.Callable,
+    } = null,
+
     pub fn valid(self: PlaneTextures) bool {
         return self.luma.isValid() and self.chroma.isValid();
     }

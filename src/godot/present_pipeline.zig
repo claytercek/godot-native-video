@@ -445,6 +445,17 @@ pub const PresentPipeline = struct {
         }
         self.packPushConstants(planes);
 
+        // Arm before dispatch so scheduling failure can abandon the frame.
+        // RD invokes the callback after the entire frame completes, including
+        // commands recorded after the readback was queued.
+        if (planes.completion) |completion| {
+            if (rd.bufferGetDataAsync(completion.buffer, completion.callback, .{}) != .ok) {
+                rd.freeRid(uniform_set);
+                planes.discard();
+                return .failed;
+            }
+        }
+
         // Retain resources and frame before dispatch or Texture2DRD.changed.
         // Synchronous handlers may replace the stream or free the player;
         // the binding keeps playback alive until this call returns.
@@ -587,9 +598,6 @@ pub const PresentPipeline = struct {
 
     /// Tear down all RD resources and drain the retire-ring.
     pub fn shutdown(self: *PresentPipeline) void {
-        // Teardown is immediate. RD defers RID destruction, but drain is not
-        // a GPU fence for native allocations, notably borrowed D3D12 resources.
-        // Safe deferred destruction of those allocations remains unresolved.
         self.retire.drain();
         self.freeResources();
         if (self.importer) |*imp| {

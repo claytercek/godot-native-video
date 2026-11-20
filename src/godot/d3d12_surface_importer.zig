@@ -24,9 +24,9 @@
 //! on its D3D12 side before exporting or wrapping the planes. Neither success
 //! nor failure paths may sample or destroy a plane while D3D11 is writing it.
 //! Each output is exported as an NT handle, opened as an ID3D12Resource, and
-//! passed to texture_create_from_extension. The retire ring later destroys it.
-//! Outputs are single-use, so no keyed mutex or release-sync is needed to return
-//! access to D3D11.
+//! passed to texture_create_from_extension. Godot borrows those native planes;
+//! a readback callback pins them through GPU completion even if playback ends
+//! before the render frame is submitted.
 
 const std = @import("std");
 
@@ -35,6 +35,9 @@ const core = @import("core");
 const godot = @import("godot");
 const RenderingDevice = godot.class.RenderingDevice;
 const Rid = godot.builtin.Rid;
+const Callable = godot.builtin.Callable;
+const PackedByteArray = godot.builtin.PackedByteArray;
+const gdext = godot.c;
 
 const win = @import("mf").win;
 const com = win.com;
@@ -123,23 +126,51 @@ comptime {
     std.debug.assert(@sizeOf(PlaneSplitParams) == 48);
 }
 
-/// Per-frame release payload: free the RD RIDs, then release the D3D12
-/// resources holding the shared allocation alive. The D3D11-side transients are
-/// released at the end of import(); the shared memory survives via these.
+const NativePlanes = struct {
+    allocator: std.mem.Allocator,
+    luma: *d3d12.ID3D12Resource,
+    chroma: *d3d12.ID3D12Resource,
+
+    fn makeCallable(self: *NativePlanes) Callable {
+        var callable: Callable = undefined;
+        var info = std.mem.zeroes(gdext.GDExtensionCallableCustomInfo2);
+        info.callable_userdata = self;
+        info.token = godot.raw.library;
+        info.call_func = &complete;
+        info.free_func = &destroy;
+        godot.raw.callableCustomCreate2.?(@ptrCast(&callable), &info);
+        return callable;
+    }
+
+    fn complete(
+        _: ?*anyopaque,
+        _: [*c]const gdext.GDExtensionConstVariantPtr,
+        _: gdext.GDExtensionInt,
+        _: gdext.GDExtensionVariantPtr,
+        call_error: [*c]gdext.GDExtensionCallError,
+    ) callconv(.c) void {
+        call_error.* = .{ .@"error" = gdext.GDEXTENSION_CALL_OK, .argument = 0, .expected = 0 };
+    }
+
+    fn destroy(ctx: ?*anyopaque) callconv(.c) void {
+        const self: *NativePlanes = @ptrCast(@alignCast(ctx.?));
+        com.release(self.luma);
+        com.release(self.chroma);
+        self.allocator.destroy(self);
+    }
+};
+
 const ReleaseValue = struct {
     rd: *RenderingDevice,
     luma: Rid,
     chroma: Rid,
-    d3d12_luma: *d3d12.ID3D12Resource,
-    d3d12_chroma: *d3d12.ID3D12Resource,
+    completion: Callable,
 };
 
 fn releaseTeardown(v: *ReleaseValue) void {
     si.freePlaneRids(v.rd, v.luma, v.chroma);
-    // @alignCast: ID3D12Resource is an opaque (align-1) handle, but a live COM
-    // pointer is vtable-aligned, so the upcast to *IUnknown is sound.
-    com.release(@as(*com.IUnknown, @ptrCast(@alignCast(v.d3d12_luma))));
-    com.release(@as(*com.IUnknown, @ptrCast(@alignCast(v.d3d12_chroma))));
+    // The readback request holds its own callable ref until the RD frame fence.
+    v.completion.deinit();
 }
 
 fn waitForSignal(fence: *d3d12.ID3D12Fence, event: com.HANDLE, signal_value: u64) bool {
@@ -157,6 +188,7 @@ fn waitForSignal(fence: *d3d12.ID3D12Fence, event: com.HANDLE, signal_value: u64
 pub const D3D12SurfaceImporter = struct {
     allocator: std.mem.Allocator,
     rd: ?*RenderingDevice = null,
+    completion_buffer: Rid = si.rid_invalid,
 
     // Godot's D3D12 device (borrowed but COM-retained while we hold it).
     d3d12_device: ?*d3d12.ID3D12Device = null,
@@ -213,6 +245,19 @@ pub const D3D12SurfaceImporter = struct {
         const d3d12_device: *d3d12.ID3D12Device = @ptrFromInt(@as(usize, @intCast(dev_handle)));
         _ = @as(*com.IUnknown, @ptrCast(d3d12_device)).AddRef();
         self.d3d12_device = d3d12_device;
+
+        var marker = PackedByteArray.init();
+        defer marker.deinit();
+        if (marker.resize(4) != 0) return false;
+        marker.fill(0);
+        // gdzig generates invalid flag defaults for storageBufferCreate.
+        const method = godot.builtin.StringName.fromComptimeLatin1("storage_buffer_create");
+        var data = godot.builtin.Variant.init(PackedByteArray, marker);
+        defer data.deinit();
+        var buffer = rd.call(method, .{ @as(i64, 4), data });
+        defer buffer.deinit();
+        self.completion_buffer = buffer.as(Rid) orelse return false;
+        if (!self.completion_buffer.isValid()) return false;
 
         self.initialized = true;
         return true;
@@ -513,21 +558,26 @@ pub const D3D12SurfaceImporter = struct {
             return if (self.imported_once) .transient_failure else .capability_unavailable;
         }
 
-        // Transfer D3D12 resources into the release box. They retain shared
-        // memory after the defers release the D3D11 transients.
+        const native = self.allocator.create(NativePlanes) catch {
+            si.freePlaneRids(rd, luma, chroma);
+            return .transient_failure;
+        };
+        native.* = .{
+            .allocator = self.allocator,
+            .luma = d3d12_luma.take().?,
+            .chroma = d3d12_chroma.take().?,
+        };
+        var completion = native.makeCallable();
         const release = si.boxClosure(self.allocator, ReleaseValue{
             .rd = rd,
             .luma = luma,
             .chroma = chroma,
-            .d3d12_luma = d3d12_luma.get().?,
-            .d3d12_chroma = d3d12_chroma.get().?,
+            .completion = completion,
         }, releaseTeardown) catch {
             si.freePlaneRids(rd, luma, chroma);
+            completion.deinit();
             return .transient_failure;
         };
-
-        _ = d3d12_luma.take(); // ownership handed to the release box
-        _ = d3d12_chroma.take();
 
         out.luma = luma;
         out.chroma = chroma;
@@ -535,6 +585,7 @@ pub const D3D12SurfaceImporter = struct {
         out.height = @intCast(rc.luma_height);
         out.metadata = si.PresentationMetadata.fromFrame(frame_info, submission);
         out.release = release;
+        out.completion = .{ .buffer = self.completion_buffer, .callback = completion };
         self.imported_once = true;
         return .{ .success = out };
     }
@@ -589,6 +640,11 @@ pub const D3D12SurfaceImporter = struct {
     /// Release every owned COM object / handle. Idempotent; used both by the
     /// initialize() failure paths and by deinit().
     fn teardown(self: *D3D12SurfaceImporter) void {
+        if (self.completion_buffer.isValid()) {
+            self.rd.?.freeRid(self.completion_buffer);
+            self.completion_buffer = si.rid_invalid;
+        }
+        self.rd = null;
         self.resetDecoderPipeline();
         if (self.d3d12_device) |p| {
             com.release(p);
