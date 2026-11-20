@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.2](https://github.com/claytercek/godot-native-video/compare/v0.4.1...v0.4.2) (2026-11-20)
+
+### Fixed
+* Prevent D3D12 device loss when closing a playing video by keeping its imported textures alive until the GPU finishes using them.
+
 ## [0.4.1](https://github.com/claytercek/godot-native-video/compare/v0.4.0...v0.4.1) (2026-11-10)
 
 ### Fixed
