@@ -192,7 +192,7 @@ jobs:
           if grep -E 'undefined symbol|not found' ci-logs/ldd.log; then exit 1; fi
 
       - name: Rendered Godot smoke
-        timeout-minutes: ${{ env.LINUX_EXTENDED == 'true' && 10 || 4 }}
+        timeout-minutes: ${{ env.LINUX_EXTENDED == 'true' && 10 || env.PRIMARY_LINUX == 'true' && 5 || 4 }}
         run: |
           runner=smoke-tools/validation-runner
           prefix=(); display=()
@@ -227,6 +227,7 @@ jobs:
           }
           run_rendered smoke 'SMOKE: PASS' -- --smoke
           if [[ "$PRIMARY_LINUX" == true ]]; then
+            run_rendered codec-smoke CODEC_SMOKE_PASS --script res://codec_smoke.gd
             transport av h264-aac.mp4 1
           fi
           if [[ "$LINUX_EXTENDED" == true ]]; then
