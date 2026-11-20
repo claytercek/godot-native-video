@@ -11,6 +11,7 @@ const win = @import("win.zig");
 const com = win.com;
 const mf = win.mf;
 const d3d11 = win.d3d11;
+const log = std.log.scoped(.mf_pipeline);
 
 /// Interleaved-float PCM format read back off a negotiated audio media type.
 pub const PcmFormat = struct {
@@ -111,7 +112,9 @@ pub const MfPipeline = struct {
         _ = a.SetUINT32(&mf.MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1);
 
         var reader: ?*mf.IMFSourceReader = null;
-        if (com.FAILED(mf.MFCreateSourceReaderFromURL(path16.ptr, a, &reader)) or reader == null) {
+        const hr = mf.MFCreateSourceReaderFromURL(path16.ptr, a, &reader);
+        if (com.FAILED(hr) or reader == null) {
+            log.warn("cannot open media source/container (MFCreateSourceReaderFromURL HRESULT 0x{x:0>8})", .{@as(u32, @bitCast(hr))});
             return error.Reader;
         }
         return .{ .reader = reader.? };
@@ -142,9 +145,16 @@ pub const MfPipeline = struct {
         if (com.FAILED(mf.MFCreateMediaType(&out_type)) or out_type == null) return false;
         defer com.release(out_type.?);
         const ot = out_type.?.asAttributes();
-        _ = ot.SetGUID(&mf.MF_MT_MAJOR_TYPE, &mf.MFMediaType_Video);
-        _ = ot.SetGUID(&mf.MF_MT_SUBTYPE, &subtype);
-        return com.SUCCEEDED(reader.SetCurrentMediaType(vidx, null, out_type.?));
+        if (com.FAILED(ot.SetGUID(&mf.MF_MT_MAJOR_TYPE, &mf.MFMediaType_Video))) return false;
+        if (com.FAILED(ot.SetGUID(&mf.MF_MT_SUBTYPE, &subtype))) return false;
+        const hr = reader.SetCurrentMediaType(vidx, null, out_type.?);
+        if (com.FAILED(hr)) {
+            log.warn("decoder negotiation failed for stream {d}, output {s} (SetCurrentMediaType HRESULT 0x{x:0>8})", .{
+                vidx, if (std.meta.eql(subtype, mf.MFVideoFormat_P010)) "P010" else "NV12", @as(u32, @bitCast(hr)),
+            });
+            return false;
+        }
+        return true;
     }
 
     // Build a dedicated audio-only source reader for `mf_stream_index`, primed

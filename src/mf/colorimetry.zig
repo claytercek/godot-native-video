@@ -1,4 +1,4 @@
-//! Pure MF colorimetry, source bit-depth, and 100ns tick/second conversion.
+//! MF colorimetry, native source bit depth, and 100ns tick/second conversion.
 //! Translate MF_MT_YUV_MATRIX, _VIDEO_PRIMARIES, _TRANSFER_FUNCTION, and
 //! _VIDEO_NOMINAL_RANGE without backend state or live MF objects.
 
@@ -64,16 +64,58 @@ pub fn parseRange(v: u32) core.ColorRange {
     };
 }
 
-// Detect the source's bit depth from the native (pre-conversion) video media
-// type. MF_MT_MPEG2_PROFILE carries the demuxer-parsed HEVC general_profile_idc;
-// profile 2 (eAVEncH265VProfile_Main_420_10) identifies a 10-bit 4:2:0 source.
-// Absent or any other value defaults to 8-bit.
-pub fn detectBitDepth(native: *mf.IMFMediaType) i32 {
-    var profile: u32 = 0;
-    if (com.SUCCEEDED(native.asAttributes().GetUINT32(&mf.MF_MT_MPEG2_PROFILE, &profile))) {
-        if (profile == mf.eAVEncH265VProfile_Main_420_10) return 10;
-    }
-    return 8;
+const sample_description = @import("sample_description.zig");
+
+pub fn mp4Codec(subtype: com.GUID) ?sample_description.Codec {
+    if (std.meta.eql(subtype, mf.MFVideoFormat_VP90)) return .vp9;
+    if (std.meta.eql(subtype, mf.MFVideoFormat_AV1)) return .av1;
+    return null;
+}
+
+fn isHevc(subtype: com.GUID) bool {
+    return std.meta.eql(subtype, mf.MFVideoFormat_HEVC) or std.meta.eql(subtype, mf.MFVideoFormat_HEVC_ES);
+}
+
+fn hevcDepth(profile: u32) ?i32 {
+    return switch (profile) {
+        1 => 8,
+        mf.eAVEncH265VProfile_Main_420_10 => 10,
+        else => null,
+    };
+}
+
+pub fn detectBitDepth(allocator: std.mem.Allocator, attrs: *mf.IMFAttributes, subtype: com.GUID) !?i32 {
+    const codec = mp4Codec(subtype) orelse {
+        if (!isHevc(subtype)) return null;
+        var profile: u32 = 0;
+        if (com.FAILED(attrs.GetUINT32(&mf.MF_MT_MPEG2_PROFILE, &profile))) return null;
+        return hevcDepth(profile);
+    };
+
+    // AV1 Main can be 8 or 10 bit, and VP9 profile 2 can be 10 or 12 bit.
+    // Read the active MP4 entry instead of treating a profile as a depth.
+    const key = &mf.MF_MT_MPEG4_SAMPLE_DESCRIPTION;
+    var size: u32 = 0;
+    if (com.FAILED(attrs.lpVtbl.GetBlobSize(attrs, key, &size))) return error.MissingSampleDescription;
+    const max_sample_description_bytes = 1024 * 1024;
+    if (size == 0 or size > max_sample_description_bytes) return error.InvalidSampleDescription;
+    const blob = try allocator.alloc(u8, size);
+    defer allocator.free(blob);
+    var copied: u32 = 0;
+    if (com.FAILED(attrs.lpVtbl.GetBlob(attrs, key, blob.ptr, size, &copied)) or copied != size) return error.InvalidSampleDescription;
+
+    var index: u32 = 0;
+    const hr = attrs.GetUINT32(&mf.MF_MT_MPEG4_CURRENT_SAMPLE_ENTRY, &index);
+    if (com.FAILED(hr) and hr != com.MF_E_ATTRIBUTENOTFOUND) return error.InvalidSampleEntryIndex;
+    return sample_description.bitDepth(codec, blob, if (com.SUCCEEDED(hr)) index else null) orelse error.UnsupportedSampleDescription;
+}
+
+test "only HEVC uses the HEVC Main10 profile number" {
+    try std.testing.expect(isHevc(mf.MFVideoFormat_HEVC));
+    try std.testing.expect(isHevc(mf.MFVideoFormat_HEVC_ES));
+    try std.testing.expect(!isHevc(mf.MFVideoFormat_VP90));
+    try std.testing.expect(!isHevc(mf.MFVideoFormat_AV1));
+    try std.testing.expectEqual(@as(?i32, 10), hevcDepth(2));
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,11 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <TargetConditionals.h>
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 110000
+#import <VideoToolbox/VTUtilities.h>
+#import <dispatch/dispatch.h>
+#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +40,9 @@ typedef struct {
 	AVAssetReaderTrackOutput *audio_out;
 
 	AVAssetTrack *video_track;
+	nv_avf_error_logger log_error;
+	BOOL logged_video_failure;
+	BOOL logged_audio_failure;
 
 	// All audio track objects, indexed by position in the `tracks` array.
 	NSArray<AVAssetTrack *> *all_audio_tracks;
@@ -105,11 +113,7 @@ static int parse_transfer_function(CFStringRef val) {
 }
 
 // -----------------------------------------------------------------------
-// Biplanar 4:2:0 pixel format knowledge — single source of truth for which
-// OSType corresponds to which (bit depth, range) pair. Indexed
-// [bit_depth >= 10][range == full]; is_10bit_biplanar, is_full_range, and
-// biplanar_pixel_format all derive from this table instead of each
-// open-coding the same four-constant comparison.
+// Biplanar 4:2:0 formats indexed by [bit_depth >= 10][range == full].
 // -----------------------------------------------------------------------
 static const OSType kBiplanarPixelFormats[2][2] = {
 	// range: video,                                     full
@@ -123,9 +127,10 @@ static OSType biplanar_pixel_format(BOOL bit10, BOOL full_range) {
 	return kBiplanarPixelFormats[bit10 ? 1 : 0][full_range ? 1 : 0];
 }
 
-// Whether `fmt` is one of the two 10-bit biplanar formats.
-static bool is_10bit_biplanar(OSType fmt) {
-	return fmt == kBiplanarPixelFormats[1][0] || fmt == kBiplanarPixelFormats[1][1];
+static int pixel_format_tag(OSType fmt) {
+	if (fmt == kBiplanarPixelFormats[0][0] || fmt == kBiplanarPixelFormats[0][1]) return NV_AVF_PIXFMT_NV12;
+	if (fmt == kBiplanarPixelFormats[1][0] || fmt == kBiplanarPixelFormats[1][1]) return NV_AVF_PIXFMT_X420;
+	return NV_AVF_PIXFMT_UNKNOWN;
 }
 
 // Whether `fmt` is one of the two full-range biplanar formats (8- or 10-bit).
@@ -133,9 +138,43 @@ static bool is_full_range(OSType fmt) {
 	return fmt == kBiplanarPixelFormats[0][1] || fmt == kBiplanarPixelFormats[1][1];
 }
 
+static int vp9_config_bit_depth(CMVideoFormatDescriptionRef format) {
+	if (CMFormatDescriptionGetMediaSubType(format) != kCMVideoCodecType_VP9) return 0;
+	CFDictionaryRef atoms = CMFormatDescriptionGetExtension(format,
+			kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+	if (!atoms || CFGetTypeID(atoms) != CFDictionaryGetTypeID()) return 0;
+	CFTypeRef atom = CFDictionaryGetValue(atoms, CFSTR("vpcC"));
+	if (atom && CFGetTypeID(atom) == CFArrayGetTypeID()) {
+		if (CFArrayGetCount(atom) != 1) return 0;
+		atom = CFArrayGetValueAtIndex(atom, 0);
+	}
+	// VP9 uses a version-1 FullBox with no initialization data. CoreMedia strips its size and type.
+	if (!atom || CFGetTypeID(atom) != CFDataGetTypeID() || CFDataGetLength(atom) != 12) return 0;
+
+	const UInt8 *p = CFDataGetBytePtr(atom);
+	if (p[0] != 1 || p[1] || p[2] || p[3] || p[10] || p[11]) return 0;
+	int profile = p[4], depth = p[6] >> 4, chroma = (p[6] >> 1) & 7;
+	if (profile > 3 || chroma > 3 || ((profile & 1) != (chroma >= 2))) return 0;
+	if (p[9] == 0 && chroma != 3) return 0; // RGB requires 4:4:4.
+	if (profile < 2) return depth == 8 ? depth : 0;
+	return depth == 10 || depth == 12 ? depth : 0;
+}
+
+static int output_bit_depth(CMVideoFormatDescriptionRef format) {
+	int depth;
+	if (@available(macOS 12.0, iOS 15.0, *)) {
+		CFNumberRef bpc = CMFormatDescriptionGetExtension(format, kCMFormatDescriptionExtension_BitsPerComponent);
+		if (bpc && CFGetTypeID(bpc) == CFNumberGetTypeID() && CFNumberGetValue(bpc, kCFNumberIntType, &depth)) {
+			return depth >= 10 ? 10 : 8;
+		}
+	}
+	// Some VP9 sample descriptions expose depth only in vpcC; requesting NV12 loses precision.
+	return vp9_config_bit_depth(format) >= 10 ? 10 : 8;
+}
+
 // Read colorimetry from a CVPixelBuffer's CV attachment dictionary — the most
 // reliable per-frame source (set by the decoder from the encoded metadata).
-static void populate_frame_colorimetry(CVPixelBufferRef pb, nv_avf_colorimetry *out) {
+static void populate_frame_colorimetry(CVPixelBufferRef pb, OSType fmt, int tag, nv_avf_colorimetry *out) {
 	out->matrix = NV_AVF_MATRIX_UNSPECIFIED;
 	out->primaries = NV_AVF_PRIM_UNSPECIFIED;
 	out->transfer = NV_AVF_TRANSFER_UNSPECIFIED;
@@ -158,9 +197,8 @@ static void populate_frame_colorimetry(CVPixelBufferRef pb, nv_avf_colorimetry *
 	}
 	// Range and bit depth from the pixel format type (covers 8- and 10-bit
 	// biplanar formats).
-	OSType fmt = CVPixelBufferGetPixelFormatType(pb);
 	out->range = is_full_range(fmt) ? NV_AVF_RANGE_FULL : NV_AVF_RANGE_VIDEO;
-	out->bit_depth = is_10bit_biplanar(fmt) ? 10 : 8;
+	out->bit_depth = tag == NV_AVF_PIXFMT_X420 ? 10 : 8;
 }
 
 // -----------------------------------------------------------------------
@@ -222,6 +260,8 @@ static void teardown_combined(NvAvfState *s) {
 	s->reader = nil;
 	s->video_out = nil;
 	s->audio_out = nil;
+	s->logged_video_failure = NO;
+	s->logged_audio_failure = NO;
 }
 
 static void free_tracks(NvAvfState *s) {
@@ -292,8 +332,17 @@ void nv_avf_abi_probe_fill(nv_avf_abi_probe *out) {
 // -----------------------------------------------------------------------
 // Lifecycle.
 // -----------------------------------------------------------------------
-nv_avf_backend *nv_avf_create(void) {
+nv_avf_backend *nv_avf_create(nv_avf_error_logger logger) {
+#if TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 110000
+	if (@available(macOS 11.0, *)) {
+		static dispatch_once_t once;
+		dispatch_once(&once, ^{
+			VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+		});
+	}
+#endif
 	NvAvfState *s = [[NvAvfState alloc] init];
+	s->log_error = logger;
 	reset_media_state(s);
 	return (__bridge_retained nv_avf_backend *)s;
 }
@@ -317,6 +366,24 @@ void nv_avf_destroy(nv_avf_backend *h) {
 	nv_avf_close(h);
 	NvAvfState *s = (__bridge_transfer NvAvfState *)h; // ARC releases
 	(void)s;
+}
+
+static void log_failure(NvAvfState *s, NSString *operation, NSError *error) {
+	NSString *message = operation;
+	if (error) {
+		NSMutableString *detail = [NSMutableString stringWithFormat:@"%@: %@ (%ld)",
+				operation, error.domain, (long)error.code];
+		NSError *cause = error.userInfo[NSUnderlyingErrorKey];
+		if (cause) [detail appendFormat:@"; underlying %@ (%ld)", cause.domain, (long)cause.code];
+		[detail appendFormat:@": %@", error.localizedDescription];
+		if (error.localizedFailureReason) [detail appendFormat:@" — %@", error.localizedFailureReason];
+		message = detail;
+	}
+	if (s->log_error) {
+		s->log_error(message.UTF8String ?: "AVFoundation operation failed");
+	} else {
+		NSLog(@"[native_video/avf] %@", message);
+	}
 }
 
 nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_open_info *info) {
@@ -391,16 +458,7 @@ nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_ope
 					s->color.transfer = parse_transfer_function(val);
 				}
 
-				// Bit depth from BitsPerComponent (8 default; HEVC Main10 → 10).
-				s->color.bit_depth = 8;
-				CFNumberRef bpc_ref = (CFNumberRef)CMFormatDescriptionGetExtension(vfd,
-						kCMFormatDescriptionExtension_BitsPerComponent);
-				if (bpc_ref) {
-					int32_t bpc;
-					if (CFNumberGetValue(bpc_ref, kCFNumberSInt32Type, &bpc)) {
-						s->color.bit_depth = (bpc >= 10) ? 10 : 8;
-					}
-				}
+				s->color.bit_depth = output_bit_depth(vfd);
 				// Range from FullRangeVideo (default video range).
 				CFBooleanRef full_range = (CFBooleanRef)CMFormatDescriptionGetExtension(vfd,
 						kCMFormatDescriptionExtension_FullRangeVideo);
@@ -449,6 +507,9 @@ nv_avf_result nv_avf_open(nv_avf_backend *h, const char *url_or_path, nv_avf_ope
 		}
 
 		if (!s->has_video && acount == 0) {
+			NSError *error = nil;
+			[asset statusOfValueForKey:@"tracks" error:&error];
+			log_failure(s, @"No video or audio tracks resolved", error);
 			return NV_AVF_NONE;
 		}
 
@@ -509,7 +570,7 @@ static void cancel_started_reader(started_reader_t *started) {
 // output that's rejected is silently dropped (out->*_attached stays NO)
 // and the reader still starts — this is how the combined reader tolerates
 // a track it can't back without failing video or audio outright.
-static nv_avf_result create_started_reader(AVURLAsset *asset, double start_time,
+static nv_avf_result create_started_reader(NvAvfState *s, double start_time,
 		AVAssetReaderTrackOutput *video_output, BOOL video_required,
 		AVAssetReaderTrackOutput *audio_output, BOOL audio_required,
 		started_reader_t *out) {
@@ -518,8 +579,9 @@ static nv_avf_result create_started_reader(AVURLAsset *asset, double start_time,
 	out->audio_attached = NO;
 
 	NSError *err = nil;
-	AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
+	AVAssetReader *r = [AVAssetReader assetReaderWithAsset:s->asset error:&err];
 	if (!r || err) {
+		log_failure(s, @"Could not create asset reader", err);
 		return NV_AVF_FAIL;
 	}
 	if (start_time > 0.0) {
@@ -535,6 +597,7 @@ static nv_avf_result create_started_reader(AVURLAsset *asset, double start_time,
 			[r addOutput:video_output];
 			out->video_attached = YES;
 		} else if (video_required) {
+			log_failure(s, @"Reader rejected video output", r.error);
 			return NV_AVF_NONE;
 		}
 	}
@@ -544,11 +607,13 @@ static nv_avf_result create_started_reader(AVURLAsset *asset, double start_time,
 			[r addOutput:audio_output];
 			out->audio_attached = YES;
 		} else if (audio_required) {
+			log_failure(s, @"Reader rejected audio output", r.error);
 			return NV_AVF_NONE;
 		}
 	}
 
 	if (![r startReading]) {
+		log_failure(s, @"Could not start asset reader", r.error);
 		return NV_AVF_FAIL;
 	}
 	out->reader = r;
@@ -579,7 +644,7 @@ nv_avf_result nv_avf_build_reader(nv_avf_backend *h, double start_time, int audi
 		// those streams: the Zig backend would otherwise publish metadata for an
 		// output that can never produce samples.
 		started_reader_t started;
-		nv_avf_result rc = create_started_reader(s->asset, start_time,
+		nv_avf_result rc = create_started_reader(s, start_time,
 				vo, s->video_track != nil, ao, use_audio != nil, &started);
 		if (rc != NV_AVF_OK) {
 			return rc;
@@ -614,7 +679,7 @@ static nv_avf_result prepare_audio_reader(NvAvfState *s, int track_index,
 		AVAssetReaderTrackOutput *ao = make_audio_output(use_audio);
 		if (!ao) return NV_AVF_NONE;
 
-		nv_avf_result rc = create_started_reader(s->asset, start_time, nil, NO, ao, YES, started);
+		nv_avf_result rc = create_started_reader(s, start_time, nil, NO, ao, YES, started);
 		if (rc != NV_AVF_OK) {
 			return rc;
 		}
@@ -636,7 +701,7 @@ static nv_avf_result prepare_video_reader(NvAvfState *s, double start_time,
 	@autoreleasepool {
 		AVAssetReaderTrackOutput *vo = make_video_output(s->video_track, &s->color);
 
-		nv_avf_result rc = create_started_reader(s->asset, start_time, vo, YES, nil, NO, started);
+		nv_avf_result rc = create_started_reader(s, start_time, vo, YES, nil, NO, started);
 		if (rc != NV_AVF_OK) {
 			return rc;
 		}
@@ -682,6 +747,14 @@ nv_avf_result nv_avf_reselect_audio_track(nv_avf_backend *h, int track_index, do
 // -----------------------------------------------------------------------
 // Decode pump.
 // -----------------------------------------------------------------------
+static nv_avf_result sample_failure(NvAvfState *s, BOOL *logged, NSString *operation, NSError *error) {
+	if (!*logged) {
+		log_failure(s, operation, error);
+		*logged = YES;
+	}
+	return NV_AVF_FAIL;
+}
+
 nv_avf_result nv_avf_next_video_frame(nv_avf_backend *h, nv_avf_video_frame *out) {
 	NvAvfState *s = state_of(h);
 	if (!s->reader || !s->video_out) {
@@ -690,29 +763,35 @@ nv_avf_result nv_avf_next_video_frame(nv_avf_backend *h, nv_avf_video_frame *out
 	@autoreleasepool {
 		CMSampleBufferRef sample = [s->video_out copyNextSampleBuffer];
 		if (!sample) {
-			return (s->reader.status == AVAssetReaderStatusFailed) ? NV_AVF_FAIL : NV_AVF_NONE;
+			if (s->reader.status != AVAssetReaderStatusFailed) return NV_AVF_NONE;
+			return sample_failure(s, &s->logged_video_failure, @"Video sample decode failed", s->reader.error);
 		}
 
 		CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
-		CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample);
-		if (!image) {
+		CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sample);
+		if (!pb) {
 			CFRelease(sample);
-			return NV_AVF_FAIL;
+			return sample_failure(s, &s->logged_video_failure, @"Decoded video sample has no image buffer", s->reader.error);
+		}
+		OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+		int tag = pixel_format_tag(fmt);
+		size_t planes = CVPixelBufferGetPlaneCount(pb);
+		if (tag == NV_AVF_PIXFMT_UNKNOWN || planes != 2) {
+			CFRelease(sample);
+			NSString *message = [NSString stringWithFormat:@"Unsupported decoded video layout: FourCC 0x%08x, %zu planes",
+					(unsigned)fmt, planes];
+			return sample_failure(s, &s->logged_video_failure, message, nil);
 		}
 
-		// Adopt a +1 retain on the pixel buffer for the caller; the sample
-		// buffer is released immediately, the pixel buffer outlives it.
-		CVPixelBufferRef pb = (CVPixelBufferRef)image;
+		// The returned pixel buffer outlives its sample.
 		CVPixelBufferRetain(pb);
 
 		out->pixel_buffer = (void *)pb;
 		out->pts_seconds = CMTimeGetSeconds(pts);
 		out->width = (int)CVPixelBufferGetWidth(pb);
 		out->height = (int)CVPixelBufferGetHeight(pb);
-		OSType pb_fmt = CVPixelBufferGetPixelFormatType(pb);
-		out->pixel_format = is_10bit_biplanar(pb_fmt) ? NV_AVF_PIXFMT_X420 : NV_AVF_PIXFMT_NV12;
-		// Per-frame colorimetry from CVImageBuffer attachments (most reliable).
-		populate_frame_colorimetry(pb, &out->color);
+		out->pixel_format = tag;
+		populate_frame_colorimetry(pb, fmt, tag, &out->color);
 
 		CFRelease(sample);
 		return NV_AVF_OK;
@@ -733,7 +812,8 @@ nv_avf_result nv_avf_next_audio_chunk(nv_avf_backend *h, nv_avf_audio_chunk *out
 	@autoreleasepool {
 		CMSampleBufferRef sample = [active_out copyNextSampleBuffer];
 		if (!sample) {
-			return (active_reader.status == AVAssetReaderStatusFailed) ? NV_AVF_FAIL : NV_AVF_NONE;
+			if (active_reader.status != AVAssetReaderStatusFailed) return NV_AVF_NONE;
+			return sample_failure(s, &s->logged_audio_failure, @"Audio sample decode failed", active_reader.error);
 		}
 
 		CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);

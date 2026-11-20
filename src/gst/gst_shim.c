@@ -49,6 +49,16 @@ static void set_error(gchar **dest, const char *message) {
     g_free(*dest);
     *dest = g_strdup(message ? message : "unknown GStreamer failure");
 }
+static void set_pipeline_error(gchar **dest, GstMessage *message) {
+    GError *error = NULL;
+    gchar *debug = NULL;
+    gst_message_parse_error(message, &error, &debug);
+    g_free(*dest);
+    *dest = g_strdup_printf("%s%s%s", error ? error->message : "pipeline error",
+        debug ? ": " : "", debug ? debug : "");
+    g_clear_error(&error);
+    g_free(debug);
+}
 static nv_gst_color color_from_info(const GstVideoInfo *info) {
     const GstVideoColorimetry *c = &info->colorimetry;
     nv_gst_color out = {0,0,0,0, GST_VIDEO_INFO_COMP_DEPTH(info, 0)};
@@ -142,7 +152,8 @@ static gboolean probe_raw_format(nv_gst_asset *a) {
     gst_object_unref(bus);
     gboolean ok = state != GST_STATE_CHANGE_FAILURE && state != GST_STATE_CHANGE_ASYNC &&
         !message && !p.failed && (!a->public_info.width || p.got_video);
-    if (!ok) set_error(&a->error, "native decoded precision/stream metadata probe failed or exceeded deadline");
+    if (message) set_pipeline_error(&a->error, message);
+    else if (!ok) set_error(&a->error, "native decoded precision/stream metadata probe failed or exceeded deadline");
     if (message) gst_message_unref(message);
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
@@ -186,7 +197,22 @@ nv_gst_asset *nv_gst_discover(const char *path) {
     if (!d) goto fail;
     a->info = gst_discoverer_discover_uri(d, a->uri, &error);
     g_object_unref(d);
-    if (!a->info || gst_discoverer_info_get_result(a->info) != GST_DISCOVERER_OK) goto fail;
+    if (!a->info) goto fail;
+    GstDiscovererResult result = gst_discoverer_info_get_result(a->info);
+    if (result == GST_DISCOVERER_MISSING_PLUGINS) {
+        const gchar * const *details = gst_discoverer_info_get_missing_elements_installer_details(a->info);
+        if (details && details[0]) {
+            GString *missing = g_string_new("Missing GStreamer plugins: ");
+            for (size_t i = 0; details[i]; ++i) {
+                if (i) g_string_append(missing, "; ");
+                g_string_append(missing, details[i]);
+            }
+            a->error = g_string_free(missing, FALSE);
+            g_clear_error(&error);
+            return a;
+        }
+    }
+    if (result != GST_DISCOVERER_OK) goto fail;
     a->public_info.duration = GST_CLOCK_TIME_IS_VALID(gst_discoverer_info_get_duration(a->info))
         ? (double)gst_discoverer_info_get_duration(a->info) / GST_SECOND : 0;
     a->public_info.color = (nv_gst_color){1,1,1,1,8};
@@ -246,24 +272,22 @@ static gboolean bus_error(nv_gst_reader *r) {
     GstMessage *message = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR);
     gst_object_unref(bus);
     if (!message) return FALSE;
-    GError *error = NULL; gchar *debug = NULL;
-    gst_message_parse_error(message, &error, &debug);
-    set_error(&r->error, error ? error->message : "pipeline error");
-    g_clear_error(&error); g_free(debug); gst_message_unref(message);
+    set_pipeline_error(&r->error, message);
+    gst_message_unref(message);
     r->terminal = TRUE;
     return TRUE;
 }
 static gboolean autoplug_continue(GstElement *decodebin, GstPad *pad, GstCaps *caps, gpointer data) {
     (void)decodebin; (void)pad;
     nv_gst_reader *r = data;
-    if (!caps || gst_caps_is_empty(caps)) return TRUE;
+    if (!caps || !gst_caps_get_size(caps)) return TRUE;
     const char *type = gst_structure_get_name(gst_caps_get_structure(caps, 0));
     /* Expose the unused encoded stream without constructing its decoder.
      * Playbin's disabled stream flag discards that output. */
     if (r->video_only && g_str_has_prefix(type, "audio/")) return FALSE;
-    /* video/quicktime and video/mpegts are containers, not video elementary
-     * streams: audio-only graphs must still demux those. */
+    /* Containers such as video/webm and video/quicktime still need a demuxer. */
     if (!r->video_only && (g_str_equal(type, "video/x-h264") || g_str_equal(type, "video/x-h265") ||
+        g_str_equal(type, "video/x-vp9") || g_str_equal(type, "video/x-av1") ||
         g_str_equal(type, "video/x-raw") || g_str_has_prefix(type, "image/"))) return FALSE;
     return TRUE;
 }
@@ -274,7 +298,8 @@ static void decoder_added(GstBin *bin, GstBin *sub, GstElement *element, gpointe
     GstElementFactory *f = gst_element_get_factory(element);
     const char *klass = f ? gst_element_factory_get_metadata(f, GST_ELEMENT_METADATA_KLASS) : NULL;
     if (klass && strstr(klass, "Codec/Decoder"))
-        g_printerr("[gst_backend] actual decoder: %s (%s)\n", gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(f)), klass);
+        g_printerr("[gst_backend] %s reader decoder: %s (%s)\n",
+            ((nv_gst_reader *)data)->video_only ? "video" : "audio", gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(f)), klass);
 }
 static gboolean wait_ready(nv_gst_reader *r) {
     GstStateChangeReturn result = gst_element_get_state(r->pipeline, NULL, NULL, DEADLINE);

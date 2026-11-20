@@ -1,0 +1,3 @@
+kind: added
+body: Use available system decoders for VP9 and AV1 in MP4. On macOS the addon opts in to the supplemental VP9 decoder. On Linux, Godot can also load WebM clips through GStreamer.
+time: 2026-11-20T13:49:51.652625-05:00

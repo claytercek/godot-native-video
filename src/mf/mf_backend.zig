@@ -1,5 +1,5 @@
 //! Windows Media Foundation decoder using IMFSourceReader and a DXGI device
-//! manager. Video uses D3D11 NV12 (8-bit) or P010 (HEVC Main10); audio uses
+//! manager. Video uses D3D11 NV12 (8-bit) or P010 (10-bit); audio uses
 //! interleaved float32 PCM. No Godot or RenderingDevice dependencies.
 //!
 //! This file owns reader state, track selection, EOS/errors, and translation
@@ -59,10 +59,13 @@ pub const MfBackend = struct {
     video_stream_index: i32 = -1,
     audio_stream_index: i32 = -1,
 
-    // Negotiated colorimetry (read from the video stream's NATIVE media type at
-    // open — the video-processor MFT strips these attributes off its negotiated
-    // output type). Defaults to BT.709 video range 8-bit; bit_depth is set to
-    // 10 when P010 negotiation succeeds.
+    video_subtype: com.GUID = mf.GUID_NULL,
+    source_depth: ?i32 = null,
+    expect_first_frame: bool = true,
+    logged_frame_failure: bool = false,
+
+    // The video-processor MFT can strip native color metadata. Only bit_depth
+    // describes the negotiated output rather than the source.
     color: core.Colorimetry = core.Colorimetry.bt709_defaults,
 
     // Display-aperture crop within the decoder's (possibly macroblock-aligned)
@@ -130,19 +133,25 @@ pub const MfBackend = struct {
             var native: ?*mf.IMFMediaType = null;
             const hr = reader.GetNativeMediaType(i, 0, &native);
             if (hr == com.MF_E_INVALIDSTREAMNUMBER) break; // no more streams
+            // Auxiliary tracks such as MOV timecode need not expose a usable media type.
             if (com.FAILED(hr) or native == null) continue;
             const nt = native.?;
             defer com.release(nt);
 
             var major: com.GUID = std.mem.zeroes(com.GUID);
-            _ = nt.asAttributes().GetGUID(&mf.MF_MT_MAJOR_TYPE, &major);
+            if (com.FAILED(nt.asAttributes().GetGUID(&mf.MF_MT_MAJOR_TYPE, &major))) continue;
 
             if (std.meta.eql(major, mf.MFMediaType_Video) and self.video_stream_index < 0) {
                 self.video_stream_index = @intCast(i);
                 // Colorimetry + bit depth live on the native (pre-conversion)
                 // type; the NV12/P010 output type does not carry them forward.
                 self.readColorimetry(nt);
-                self.color.bit_depth = colorimetry.detectBitDepth(nt);
+                const attrs = nt.asAttributes();
+                if (com.FAILED(attrs.GetGUID(&mf.MF_MT_SUBTYPE, &self.video_subtype))) self.video_subtype = mf.GUID_NULL;
+                self.source_depth = colorimetry.detectBitDepth(self.allocator, attrs, self.video_subtype) catch |err| unknown: {
+                    log.warn("video stream {d} ({s}): source depth unknown ({s}); trying NV12 first", .{ i, self.codecLabel(), @errorName(err) });
+                    break :unknown null;
+                };
             } else if (std.meta.eql(major, mf.MFMediaType_Audio)) {
                 var ch: u32 = 0;
                 var rate: u32 = 0;
@@ -177,42 +186,45 @@ pub const MfBackend = struct {
         self.reorderAudioTracksByContainerOrder();
     }
 
-    // Negotiate the first discovered video stream's output subtype and display
-    // geometry. Returns false for audio-only media or an unusable video stream.
-    fn configureVideoStream(self: *MfBackend) bool {
-        if (self.video_stream_index < 0) return false;
+    fn codecLabel(self: *const MfBackend) []const u8 {
+        return if (colorimetry.mp4Codec(self.video_subtype)) |codec| @tagName(codec) else "native";
+    }
 
+    fn configureVideoStream(self: *MfBackend) !void {
         const reader = self.pipeline.reader.?;
         const vidx: com.DWORD = @intCast(self.video_stream_index);
-        // Request the output subtype matching detected bit depth; fall back to
-        // NV12 (correcting bit_depth) if the P010 request fails.
-        var ok = self.pipeline.requestSubtype(vidx, if (self.color.bit_depth >= 10) mf.MFVideoFormat_P010 else mf.MFVideoFormat_NV12);
-        if (!ok and self.color.bit_depth >= 10) {
-            self.color.bit_depth = 8;
-            ok = self.pipeline.requestSubtype(vidx, mf.MFVideoFormat_NV12);
-        }
-        if (!ok) {
-            self.video_stream_index = -1;
-            return false;
-        }
-
-        if (com.FAILED(reader.SetStreamSelection(vidx, com.TRUE))) {
-            self.video_stream_index = -1;
-            return false;
-        }
-
-        var current: ?*mf.IMFMediaType = null;
-        if (com.SUCCEEDED(reader.GetCurrentMediaType(vidx, &current)) and current != null) {
-            defer com.release(current.?);
-            var w: u32 = 0;
-            var h: u32 = 0;
-            if (com.SUCCEEDED(current.?.asAttributes().getFrameSize(&w, &h))) {
-                self.width = @intCast(w);
-                self.height = @intCast(h);
+        var output = if (self.source_depth == 10) mf.MFVideoFormat_P010 else mf.MFVideoFormat_NV12;
+        if (!self.pipeline.requestSubtype(vidx, output)) {
+            output = if (self.source_depth == 10) mf.MFVideoFormat_NV12 else mf.MFVideoFormat_P010;
+            if (!self.pipeline.requestSubtype(vidx, output)) {
+                log.warn("no compatible video decoder/output for stream {d} ({s}, {f})", .{ vidx, self.codecLabel(), self.video_subtype });
+                return error.VideoNegotiation;
             }
-            self.readDisplayAperture(current.?);
+            if (self.source_depth == 10) log.warn("video stream {d} ({s}): P010 unavailable; reducing 10-bit video to NV12", .{ vidx, self.codecLabel() });
         }
-        return true;
+
+        try com.check(reader.SetStreamSelection(vidx, com.TRUE));
+        var current: ?*mf.IMFMediaType = null;
+        try com.check(reader.GetCurrentMediaType(vidx, &current));
+        const mt = current orelse return error.MissingVideoMediaType;
+        defer com.release(mt);
+        const attrs = mt.asAttributes();
+        var actual: com.GUID = undefined;
+        try com.check(attrs.GetGUID(&mf.MF_MT_SUBTYPE, &actual));
+        if (!std.meta.eql(actual, output)) return error.UnexpectedVideoSubtype;
+
+        var w: u32 = 0;
+        var h: u32 = 0;
+        try com.check(attrs.getFrameSize(&w, &h));
+        if (w == 0 or h == 0) return error.InvalidVideoSize;
+        self.width = std.math.cast(i32, w) orelse return error.InvalidVideoSize;
+        self.height = std.math.cast(i32, h) orelse return error.InvalidVideoSize;
+        self.color.bit_depth = if (std.meta.eql(actual, mf.MFVideoFormat_P010)) 10 else 8;
+        self.readDisplayAperture(mt);
+        const format: []const u8 = if (self.color.bit_depth == 10) "P010" else "NV12";
+        log.info("video stream {d} ({s}, {f}): source depth {?d}, negotiated {s} {d}x{d}", .{
+            vidx, self.codecLabel(), self.video_subtype, self.source_depth, format, w, h,
+        });
     }
 
     // Read the current media type's MF_MT_MINIMUM_DISPLAY_APERTURE (used by
@@ -496,10 +508,9 @@ pub const MfBackend = struct {
         _ = self.pipeline.reader.?.SetStreamSelection(mf.MF_SOURCE_READER_ALL_STREAMS, com.FALSE);
 
         try self.discoverStreams();
-        const has_video = self.configureVideoStream();
+        if (self.video_stream_index >= 0) try self.configureVideoStream();
         const has_audio = self.configureAudioStream();
-        // Match AVF: fail only if there is neither usable audio nor video.
-        if (!has_video and !has_audio) return error.NoStreams;
+        if (self.video_stream_index < 0 and !has_audio) return error.NoUsableMediaStreams;
         self.readDuration();
     }
 
@@ -544,6 +555,10 @@ pub const MfBackend = struct {
         self.selected_audio_track = 0;
         self.applied_audio_track = 0;
         self.color = core.Colorimetry.bt709_defaults;
+        self.video_subtype = mf.GUID_NULL;
+        self.source_depth = null;
+        self.expect_first_frame = true;
+        self.logged_frame_failure = false;
     }
 
     fn seekImpl(self: *MfBackend, pts_seconds: f64) bool {
@@ -553,6 +568,8 @@ pub const MfBackend = struct {
         self.executor.run(PrepareSeekJob.thunk, &job);
         var prepared = job.prepared orelse return false;
         self.commitSeek(&prepared);
+        // A seek past the last sample can legitimately yield immediate EOS.
+        self.expect_first_frame = target == 0;
         return true;
     }
 
@@ -616,6 +633,12 @@ pub const MfBackend = struct {
         return true;
     }
 
+    fn frameFailure(self: *MfBackend, comptime reason: []const u8, args: anytype) void {
+        if (self.logged_frame_failure) return;
+        self.logged_frame_failure = true;
+        log.warn("video stream {d} ({s}, {f}): " ++ reason, .{ self.video_stream_index, self.codecLabel(), self.video_subtype } ++ args);
+    }
+
     fn nextVideoFrameImpl(self: *MfBackend) ?core.VideoFrame {
         if (self.pipeline.reader == null or self.video_stream_index < 0) return null;
         const vidx: com.DWORD = @intCast(self.video_stream_index);
@@ -625,21 +648,33 @@ pub const MfBackend = struct {
             var timestamp: mf.LONGLONG = 0;
             var sample: ?*mf.IMFSample = null;
             const hr = self.pipeline.reader.?.ReadSample(vidx, 0, null, &stream_flags, &timestamp, &sample);
-            if (com.FAILED(hr)) return null;
-            if ((stream_flags & mf.MF_SOURCE_READERF_ENDOFSTREAM) != 0) return null; // clean EOS
-            // No sample this call (stream tick / native-type change): loop.
-            // Known limitation preserved from the C++: a mid-stream native type
-            // change does not re-probe colorimetry.
-            const s = sample orelse continue;
-            defer com.release(s);
+            defer if (sample) |s| com.release(s);
+            if (com.FAILED(hr) or stream_flags & mf.MF_SOURCE_READERF_ERROR != 0) {
+                self.frameFailure("ReadSample failed (HRESULT 0x{x:0>8}, flags 0x{x})", .{ @as(u32, @bitCast(hr)), stream_flags });
+                return null;
+            }
+            if (stream_flags & mf.MF_SOURCE_READERF_ENDOFSTREAM != 0) {
+                if (self.expect_first_frame) self.frameFailure("end of stream before the decoder delivered a frame", .{});
+                return null;
+            }
+            const s = sample orelse {
+                // Stream ticks and media-type changes do not carry frames.
+                if (stream_flags != 0) continue;
+                self.frameFailure("ReadSample returned neither a sample nor a stream event", .{});
+                return null;
+            };
 
             var media_buffer: ?*mf.IMFMediaBuffer = null;
-            if (com.FAILED(s.GetBufferByIndex(0, &media_buffer)) or media_buffer == null) return null;
+            const buffer_hr = s.GetBufferByIndex(0, &media_buffer);
+            if (com.FAILED(buffer_hr) or media_buffer == null) {
+                self.frameFailure("decoded sample has no media buffer (HRESULT 0x{x:0>8})", .{@as(u32, @bitCast(buffer_hr))});
+                return null;
+            }
             const mb = media_buffer.?;
             defer com.release(mb);
 
             const dxgi_buffer = com.queryInterface(mf.IMFDXGIBuffer, mb) orelse {
-                // Not a D3D11-backed sample — the DXGI device manager wasn't honored.
+                self.frameFailure("decoder returned a non-DXGI buffer; a D3D11 surface is required", .{});
                 return null;
             };
             defer com.release(dxgi_buffer);
@@ -649,16 +684,25 @@ pub const MfBackend = struct {
             // including with an earlier B-frame. Copy it while the sample still
             // pins it; never send a pooled slice downstream.
             var raw: ?*anyopaque = null;
-            if (com.FAILED(dxgi_buffer.GetResource(&d3d11.ID3D11Texture2D.IID, &raw)) or raw == null) return null;
+            const texture_hr = dxgi_buffer.GetResource(&d3d11.ID3D11Texture2D.IID, &raw);
+            if (com.FAILED(texture_hr) or raw == null) {
+                self.frameFailure("DXGI buffer has no D3D11 texture (HRESULT 0x{x:0>8})", .{@as(u32, @bitCast(texture_hr))});
+                return null;
+            }
             const pooled: *d3d11.ID3D11Texture2D = @ptrCast(@alignCast(raw.?));
             defer com.release(pooled);
 
             // Which array slice of the pooled texture this frame decoded into —
             // the source subresource for the snapshot copy.
             var subresource: com.UINT = 0;
-            _ = dxgi_buffer.GetSubresourceIndex(&subresource);
+            const slice_hr = dxgi_buffer.GetSubresourceIndex(&subresource);
+            if (com.FAILED(slice_hr)) {
+                self.frameFailure("cannot identify the decoder texture slice (HRESULT 0x{x:0>8})", .{@as(u32, @bitCast(slice_hr))});
+                return null;
+            }
 
             const owned = self.snapshotFrame(pooled, subresource) orelse return null;
+            self.expect_first_frame = false;
 
             return .{
                 .pts_seconds = colorimetry.ticksToSeconds(timestamp),
@@ -669,8 +713,6 @@ pub const MfBackend = struct {
                 .plane_slice = 0,
                 .width = self.width,
                 .height = self.height,
-                // 8-bit -> NV12; 10-bit HEVC Main10 -> P010 tagged x420, the
-                // same logical tag the AVF backend uses for 10-bit surfaces.
                 .pixel_format = if (self.color.bit_depth >= 10) .x420 else .nv12,
                 .color = self.color,
                 .crop = self.crop,
@@ -690,6 +732,11 @@ pub const MfBackend = struct {
 
         var desc: d3d11.D3D11_TEXTURE2D_DESC = undefined;
         pooled.GetDesc(&desc);
+        const expected_format = if (self.color.bit_depth == 10) win.dxgi.DXGI_FORMAT_P010 else win.dxgi.DXGI_FORMAT_NV12;
+        if (desc.Format != expected_format) {
+            self.frameFailure("got DXGI format {d}, expected {d}", .{ desc.Format, expected_format });
+            return null;
+        }
         // A private, single-slice copy: no array, no decoder/sharing flags. Bind
         // as a shader resource (the same NV12/P010 + SHADER_RESOURCE combo the
         // importers create their intermediates with, so it is known-good on this
@@ -702,7 +749,11 @@ pub const MfBackend = struct {
         desc.MiscFlags = 0;
 
         var out: ?*d3d11.ID3D11Texture2D = null;
-        if (com.FAILED(device.CreateTexture2D(&desc, null, &out)) or out == null) return null;
+        const hr = device.CreateTexture2D(&desc, null, &out);
+        if (com.FAILED(hr) or out == null) {
+            self.frameFailure("cannot snapshot decoder texture (HRESULT 0x{x:0>8})", .{@as(u32, @bitCast(hr))});
+            return null;
+        }
         context.CopySubresourceRegion(out.?.asResource(), 0, 0, 0, 0, pooled.asResource(), slice, null);
         return out.?;
     }

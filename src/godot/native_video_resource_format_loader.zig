@@ -1,8 +1,8 @@
-//! ResourceLoader for MP4/MOV/M4V clips. Creates a NativeVideoStream holding
-//! the file path; the playback opens the decoder lazily.
+//! Resource loading records the path; playback opens the decoder lazily.
 
 const NativeVideoResourceFormatLoader = @This();
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -42,8 +42,6 @@ pub fn destroy(self: *NativeVideoResourceFormatLoader, allocator: *Allocator) vo
     allocator.destroy(self);
 }
 
-/// Containers AVFoundation decodes on macOS. v1 contract is 8-bit SDR
-/// H.264/HEVC in MP4/MOV.
 pub fn _getRecognizedExtensions(self: *NativeVideoResourceFormatLoader) PackedStringArray {
     _ = self;
     var exts = PackedStringArray.init();
@@ -100,4 +98,8 @@ pub fn _load(
     return v;
 }
 
-const recognized_extensions = [_][:0]const u8{ "mp4", "mov", "m4v" };
+const shared_extensions = [_][:0]const u8{ "mp4", "mov", "m4v" };
+const recognized_extensions = if (builtin.os.tag == .linux)
+    shared_extensions ++ [_][:0]const u8{"webm"}
+else
+    shared_extensions;

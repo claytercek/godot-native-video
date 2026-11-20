@@ -1,10 +1,9 @@
 # Native video for Godot
 
-MP4/MOV playback (H.264/HEVC) for stock Godot 4.6+ on macOS, Windows, and
-Linux. Works with `VideoStreamPlayer` without engine changes. The extension
-controls playback timing and decodes through AVFoundation, Media Foundation,
-or GStreamer. macOS and Windows/D3D12 support presentation without CPU
-copies; Linux uploads CPU-readable planes, with optional hardware decoding.
+Play video in stock Godot 4.6+ with `VideoStreamPlayer` and the decoders
+installed on macOS, Windows, or Linux. Use H.264 with AAC in MP4 for the widest desktop coverage.
+VP9 and AV1 playback depends on the [container and native backend](#scope).
+The addon doesn't bundle or install codecs.
 
 ## Architecture
 
@@ -25,8 +24,8 @@ apartment) executor for the lifetime of the open media. Godot's main thread
 runs in an STA, which can't create the required Media Foundation objects.
 
 On macOS, `RenderingDevice.texture_create_from_extension` imports the
-hardware-decoded NV12 surface as a `Texture2DRD`. A Metal compute pass
-converts NV12 to RGB in an engine-owned texture returned by
+decoder surface as a `Texture2DRD`. A Metal compute pass
+converts its YCbCr planes to RGB in an engine-owned texture returned by
 `VideoStreamPlayback._get_texture()`. Godot never samples the decoder
 surface directly. This path needs no CPU copy, BGRA-to-RGBA swizzle, or GPU
 round-trip. Windows/D3D12 uses a similar zero-copy path; see
@@ -42,8 +41,9 @@ Vulkan import. GStreamer doesn't control the playback clock.
 ## Requirements
 
 - macOS (Apple Silicon or Intel), Windows, or Linux. The extension links
-  AVFoundation, CoreMedia, CoreVideo, and Metal on macOS; Media Foundation
-  and D3D11/D3D12 on Windows; system GStreamer libraries on Linux.
+  AVFoundation, VideoToolbox, CoreMedia, CoreVideo, and Metal on macOS;
+  Media Foundation and D3D11/D3D12 on Windows; system GStreamer libraries
+  on Linux.
 - Stock Godot 4.6+ with Forward+ on Linux (Vulkan). macOS and Windows also
   support Mobile. Compatibility/OpenGL is unsupported: even CPU uploads
   require a RenderingDevice and compute shaders.
@@ -138,11 +138,11 @@ hardware decoding but adds a readback before presentation. See
 
 ## Diagnostics
 
-Logs from every backend and thread go to stderr and Godot's Output panel.
-Errors and warnings use `push_error` / `push_warning`; info/debug lines
-print there too. Failed `load()` calls report the resolved OS path and
-underlying error, including bad paths, backend failures, and unsupported
-content.
+Godot's resource loader recognizes files by extension. A successful
+`load()` creates a stream; it doesn't open the decoder until Godot
+instantiates playback. If playback fails, check the backend messages in
+Godot's Output panel or stderr. To test a file outside Godot, run
+`zig build decode-smoke -- /path/to/clip.mp4` from a source checkout.
 
 Call `get_cpu_copy_count()` on a live `VideoStreamPlayback` to count frames
 that used Windows' CPU-copy fallback or Linux's plane upload this session.
@@ -151,11 +151,34 @@ copies.
 
 ## Scope
 
-- Codecs: H.264 and HEVC (Main and Main10).
-- Containers: MP4 and MOV; the loader registers `.mp4`, `.mov`, and `.m4v`.
+The loader recognizes `.mp4`, `.mov`, and `.m4v` on all desktop platforms.
+H.264 and HEVC Main/Main10 in MP4/MOV are the baseline. For VP9 and AV1,
+start with MP4 and test on the machines you ship to. A system decoder must
+be able to handle the clip's profile and deliver frames the addon can use;
+hardware acceleration is optional.
+
+| Backend | VP9 and AV1 |
+| --- | --- |
+| macOS (AVFoundation) | VP9 and AV1 MP4 passed the 8- and 10-bit decode tests on an M4 Pro. The addon opts in to Apple's VP9 decoder when available. The loader doesn't accept WebM on macOS. |
+| Windows (Media Foundation) | VP9 and AV1 MP4 are conditional on a decoder that can deliver a D3D11 surface. The [VP9](https://apps.microsoft.com/detail/9n4d0msmp0pt) or [AV1](https://apps.microsoft.com/detail/9mvzqvxjbq9v) Video Extension may be needed. Run the [MP4 fixture tests](tests/fixtures/README.md) on the target machine. The loader doesn't accept WebM on Windows. |
+| Linux (GStreamer) | Use MP4 or `.webm`. The 10-bit VP9 WebM fixture has passed on Ubuntu 22.04. GStreamer needs installed plugins for the container and each track, including Opus for WebM clips with Opus audio. |
+
+To use a WebM clip on macOS or Windows, remux its video into MP4 without
+re-encoding it. For a clip with sound, this example converts the audio to AAC:
+
+```sh
+ffmpeg -i input.webm -map 0:v:0 -map '0:a:0?' -c:v copy -c:a aac output.mp4
+```
+
+Remuxing changes the container. The target machine still needs to decode
+that VP9 or AV1 stream. FFmpeg is an asset preparation tool in this
+example; players don't need it.
+
+### Output formats
+
 - Pixel formats: NV12 (8-bit) and 10-bit biplanar x420 (macOS) or P010
-  (Windows/Linux), negotiated to match source bit depth. Conversion
-  normalizes 10-bit payloads in 16-bit GPU words.
+  (Windows/Linux). Windows prefers the source bit depth when known and
+  logs a warning if a 10-bit source must use NV12.
 - Colorimetry: BT.709, BT.601, and BT.2020 YCbCr matrices; BT.709, BT.601,
   BT.2020, and DCI-P3 primaries; BT.709, PQ (ST 2084 / HDR10), and HLG
   transfer functions; video and full range. Unspecified fields default to
@@ -163,23 +186,27 @@ copies.
 - HDR: PQ/HLG clips tone-map to SDR by default. Set the stream's
   `output_mode` to HDR for scene-linear RGBA16F output, where 1.0 equals
   203-nit Reference White per BT.2408.
-- Audio: AAC decoded to interleaved float32 PCM. Mono, stereo, and 5.1
-  sources are mixed to the clip's canonical output format.
+- Audio: the native backend decodes the selected track to interleaved
+  float32 PCM. The addon mixes mono, stereo, and 5.1 sources to the
+  clip's canonical output format.
 - Multi-track audio: enumerate with `NativeVideoStream.get_audio_tracks()`
   and select with `VideoStreamPlayer.audio_track` before `play()` or during
   playback.
 
-Only this matrix is tested and supported. Other content may play if the
-backend can decode it and its container has a registered extension. VP9/AV1
-is out of scope. For mixed-sample-rate clips, the first audio track sets the
-sample rate; switching to a track with a different rate is refused.
+The [fixtures](tests/fixtures/README.md) cover VP9 Profile 0 (8-bit),
+VP9 Profile 2 (10-bit), and AV1 Main (8- and 10-bit), all 4:2:0.
+These cases do not cover 12-bit, 4:4:4, alpha, or hardware acceleration.
+Other codecs in recognized containers may also play.
+
+For mixed-sample-rate clips, the first audio track sets the sample rate;
+the addon refuses a switch to a track with a different rate.
 
 ## Building from source
 
 1. Install Zig 0.17.0 and make Godot available through `-Dgodot-path=`,
-   `GODOT_PATH`, or `PATH`, in that resolution order. For example, with gdvm:
-   `export GODOT_PATH="$(gdvm show 4.7.2)"`. You can also use your installed
-   Godot executable. Every `zig build` step needs it, including tests;
+   `GODOT_PATH`, or `PATH`, in that resolution order. With mise, run
+   `mise exec zig@0.17.0 godot@4.7.2-stable -- zig build`. Every
+   `zig build` step needs Godot, including tests;
    bindings come from gdzig's vendored API description, not this executable.
 
    For the demo and media tests, install [Git LFS](https://git-lfs.com/) and
@@ -283,7 +310,15 @@ native decoder on macOS, Windows, or Linux:
 zig build test-media --summary all --test-timeout 30s
 ```
 
-On Linux, run the extra GStreamer checks with
+On Linux, `test-media` requires VP9 and AV1 in MP4 and WebM. On macOS
+and Windows, add `-Dtest-vp9=true` or `-Dtest-av1=true` to require that
+codec's 8- and 10-bit MP4 cases. Enable both on a machine with both
+decoders. A decode failure on an enabled case fails the test.
+
+Run `zig build smoke-codecs` on a machine with a display to check Godot
+resource loading and rendered pixels. It plays VP9 MP4, seeks while
+paused, and reads the frame number from the texture. On Linux it also
+checks AV1 WebM. For additional GStreamer checks, run
 `zig build test-gst-extended --summary all --test-timeout 30s`.
 
 ## Project layout
