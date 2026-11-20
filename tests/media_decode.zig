@@ -187,11 +187,22 @@ fn expectReplay(path: []const u8, count: usize, checks: VideoChecks, comptime wi
     try expectAudio(backend);
     if (checks.format) |format| try testing.expectEqual(@as(i32, if (format == .x420) 10 else 8), backend.colorimetry().bit_depth);
     if (with_audio) {
-        // Native seeks may land on a preceding keyframe. These clips have one at 1 s.
         try testing.expect(backend.seek(1));
-        const frame = backend.nextVideoFrame() orelse return error.NoVideoAfterSeek;
-        defer frame.release();
-        try expectVideoFrame(frame, @intFromFloat(checks.fps.?), checks);
+        const fps = checks.fps.?;
+        const tolerance = checks.pts_tolerance orelse 0.25 / fps;
+        {
+            var frame = backend.nextVideoFrame() orelse return error.NoVideoAfterSeek;
+            // These clips have a keyframe at 1 s. The MP4 demuxer can align to the
+            // preceding AAC packet, exposing the tail of one video frame first.
+            if (frame.pts_seconds < 1 - tolerance) {
+                const early_pts = frame.pts_seconds;
+                frame.release();
+                try testing.expect(early_pts >= 1 - 1 / fps);
+                frame = backend.nextVideoFrame() orelse return error.NoVideoAfterSeek;
+            }
+            defer frame.release();
+            try expectVideoFrame(frame, @intFromFloat(fps), checks);
+        }
         try expectPcm(backend, 2, 440);
     }
     try testing.expect(backend.seek(0));
