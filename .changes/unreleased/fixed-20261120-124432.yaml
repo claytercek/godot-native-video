@@ -1,3 +1,0 @@
-kind: fixed
-body: Prevent D3D12 device loss when closing a playing video by keeping its imported textures alive until the GPU finishes using them.
-time: 2026-11-20T12:44:32-05:00
